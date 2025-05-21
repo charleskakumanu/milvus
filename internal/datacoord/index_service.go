@@ -19,23 +19,30 @@ package datacoord
 import (
 	"context"
 	"fmt"
-	"strconv"
-	"time"
+	"math"
+	"strings"
 
+	"github.com/cockroachdb/errors"
 	"github.com/samber/lo"
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/metastore/model"
-	"github.com/milvus-io/milvus/internal/proto/indexpb"
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/metrics"
-	"github.com/milvus-io/milvus/pkg/util/indexparamcheck"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/metautil"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/internal/parser/planparserv2"
+	"github.com/milvus-io/milvus/internal/util/indexparamcheck"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	pkgcommon "github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/metrics"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/planpb"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/metautil"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 // serverID return the session serverID
@@ -47,121 +54,8 @@ func (s *Server) serverID() int64 {
 	return 0
 }
 
-func (s *Server) startIndexService(ctx context.Context) {
-	s.serverLoopWg.Add(1)
-	go s.createIndexForSegmentLoop(ctx)
-}
-
-func (s *Server) createIndexForSegment(segment *SegmentInfo, indexID UniqueID) error {
-	log.Info("create index for segment", zap.Int64("segmentID", segment.ID), zap.Int64("indexID", indexID))
-	buildID, err := s.allocator.allocID(context.Background())
-	if err != nil {
-		return err
-	}
-	segIndex := &model.SegmentIndex{
-		SegmentID:    segment.ID,
-		CollectionID: segment.CollectionID,
-		PartitionID:  segment.PartitionID,
-		NumRows:      segment.NumOfRows,
-		IndexID:      indexID,
-		BuildID:      buildID,
-		CreateTime:   uint64(segment.ID),
-		WriteHandoff: false,
-	}
-	if err = s.meta.indexMeta.AddSegmentIndex(segIndex); err != nil {
-		return err
-	}
-	s.taskScheduler.enqueue(&indexBuildTask{
-		buildID: buildID,
-		taskInfo: &indexpb.IndexTaskInfo{
-			BuildID: buildID,
-			State:   commonpb.IndexState_Unissued,
-		},
-	})
-	return nil
-}
-
-func (s *Server) createIndexesForSegment(segment *SegmentInfo) error {
-	indexes := s.meta.indexMeta.GetIndexesForCollection(segment.CollectionID, "")
-	indexIDToSegIndexes := s.meta.indexMeta.GetSegmentIndexes(segment.CollectionID, segment.ID)
-	for _, index := range indexes {
-		if _, ok := indexIDToSegIndexes[index.IndexID]; !ok {
-			if err := s.createIndexForSegment(segment, index.IndexID); err != nil {
-				log.Warn("create index for segment fail", zap.Int64("segmentID", segment.ID),
-					zap.Int64("indexID", index.IndexID))
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func (s *Server) getUnIndexTaskSegments() []*SegmentInfo {
-	flushedSegments := s.meta.SelectSegments(SegmentFilterFunc(func(seg *SegmentInfo) bool {
-		return isFlush(seg)
-	}))
-
-	unindexedSegments := make([]*SegmentInfo, 0)
-	for _, segment := range flushedSegments {
-		if s.meta.indexMeta.IsUnIndexedSegment(segment.CollectionID, segment.GetID()) {
-			unindexedSegments = append(unindexedSegments, segment)
-		}
-	}
-	return unindexedSegments
-}
-
-func (s *Server) createIndexForSegmentLoop(ctx context.Context) {
-	log.Info("start create index for segment loop...")
-	defer s.serverLoopWg.Done()
-
-	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			log.Warn("DataCoord context done, exit...")
-			return
-		case <-ticker.C:
-			segments := s.getUnIndexTaskSegments()
-			for _, segment := range segments {
-				if err := s.createIndexesForSegment(segment); err != nil {
-					log.Warn("create index for segment fail, wait for retry", zap.Int64("segmentID", segment.ID))
-					continue
-				}
-			}
-		case collectionID := <-s.notifyIndexChan:
-			log.Info("receive create index notify", zap.Int64("collectionID", collectionID))
-			segments := s.meta.SelectSegments(WithCollection(collectionID), SegmentFilterFunc(func(info *SegmentInfo) bool {
-				return isFlush(info)
-			}))
-			for _, segment := range segments {
-				if err := s.createIndexesForSegment(segment); err != nil {
-					log.Warn("create index for segment fail, wait for retry", zap.Int64("segmentID", segment.ID))
-					continue
-				}
-			}
-		case segID := <-s.buildIndexCh:
-			log.Info("receive new flushed segment", zap.Int64("segmentID", segID))
-			segment := s.meta.GetSegment(segID)
-			if segment == nil {
-				log.Warn("segment is not exist, no need to build index", zap.Int64("segmentID", segID))
-				continue
-			}
-			if err := s.createIndexesForSegment(segment); err != nil {
-				log.Warn("create index for segment fail, wait for retry", zap.Int64("segmentID", segment.ID))
-				continue
-			}
-		}
-	}
-}
-
-func (s *Server) getFieldNameByID(ctx context.Context, collID, fieldID int64) (string, error) {
-	resp, err := s.broker.DescribeCollectionInternal(ctx, collID)
-	if err != nil {
-		return "", err
-	}
-
-	for _, field := range resp.GetSchema().GetFields() {
+func (s *Server) getFieldNameByID(schema *schemapb.CollectionSchema, fieldID int64) (string, error) {
+	for _, field := range schema.GetFields() {
 		if field.FieldID == fieldID {
 			return field.Name, nil
 		}
@@ -169,10 +63,77 @@ func (s *Server) getFieldNameByID(ctx context.Context, collID, fieldID int64) (s
 	return "", nil
 }
 
+func (s *Server) getSchema(ctx context.Context, collID int64) (*schemapb.CollectionSchema, error) {
+	resp, err := s.broker.DescribeCollectionInternal(ctx, collID)
+	if err != nil {
+		return nil, err
+	}
+	return resp.GetSchema(), nil
+}
+
+func isJsonField(schema *schemapb.CollectionSchema, fieldID int64) (bool, error) {
+	for _, f := range schema.Fields {
+		if f.FieldID == fieldID {
+			return typeutil.IsJSONType(f.DataType), nil
+		}
+	}
+	return false, merr.WrapErrFieldNotFound(fieldID)
+}
+
+func getIndexParam(indexParams []*commonpb.KeyValuePair, key string) (string, error) {
+	for _, p := range indexParams {
+		if p.Key == key {
+			return p.Value, nil
+		}
+	}
+	return "", merr.WrapErrParameterInvalidMsg("%s not found", key)
+}
+
+func setIndexParam(indexParams []*commonpb.KeyValuePair, key, value string) {
+	for _, p := range indexParams {
+		if p.Key == key {
+			p.Value = value
+		}
+	}
+}
+
+func (s *Server) parseAndVerifyNestedPath(identifier string, schema *schemapb.CollectionSchema, fieldID int64) (string, error) {
+	helper, err := typeutil.CreateSchemaHelper(schema)
+	if err != nil {
+		return "", err
+	}
+
+	var identifierExpr *planpb.Expr
+	err = planparserv2.ParseIdentifier(helper, identifier, func(expr *planpb.Expr) error {
+		identifierExpr = expr
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	if identifierExpr.GetColumnExpr().GetInfo().GetFieldId() != fieldID {
+		return "", errors.New("fieldID not match with field name")
+	}
+
+	nestedPath := identifierExpr.GetColumnExpr().GetInfo().GetNestedPath()
+	// escape the nested path to avoid the path being interpreted as a JSON Pointer
+	nestedPath = lo.Map(nestedPath, func(path string, _ int) string {
+		s := strings.ReplaceAll(path, "~", "~0")
+		s = strings.ReplaceAll(s, "/", "~1")
+		return s
+	})
+	if len(nestedPath) == 0 {
+		// if nested path is empty, it means the json path is the field name.
+		// Dont return "/" here, it not a valid json path for simdjson.
+		return "", nil
+	}
+	return "/" + strings.Join(nestedPath, "/"), nil
+}
+
 // CreateIndex create an index on collection.
 // Index building is asynchronous, so when an index building request comes, an IndexID is assigned to the task and
 // will get all flushed segments from DataCoord and record tasks with these segments. The background process
-// indexBuilder will find this task and assign it to IndexNode for execution.
+// indexBuilder will find this task and assign it to DataNode for execution.
 func (s *Server) CreateIndex(ctx context.Context, req *indexpb.CreateIndexRequest) (*commonpb.Status, error) {
 	log := log.Ctx(ctx).With(
 		zap.Int64("collectionID", req.GetCollectionID()),
@@ -181,6 +142,7 @@ func (s *Server) CreateIndex(ctx context.Context, req *indexpb.CreateIndexReques
 		zap.String("IndexName", req.GetIndexName()), zap.Int64("fieldID", req.GetFieldID()),
 		zap.Any("TypeParams", req.GetTypeParams()),
 		zap.Any("IndexParams", req.GetIndexParams()),
+		zap.Any("UserIndexParams", req.GetUserIndexParams()),
 	)
 
 	if err := merr.CheckHealthy(s.GetStateCode()); err != nil {
@@ -189,68 +151,67 @@ func (s *Server) CreateIndex(ctx context.Context, req *indexpb.CreateIndexReques
 	}
 	metrics.IndexRequestCounter.WithLabelValues(metrics.TotalLabel).Inc()
 
+	schema, err := s.getSchema(ctx, req.GetCollectionID())
+	if err != nil {
+		return merr.Status(err), nil
+	}
+	isJson, err := isJsonField(schema, req.GetFieldID())
+	if err != nil {
+		return merr.Status(err), nil
+	}
+
+	if isJson {
+		jsonPath, err := getIndexParam(req.GetIndexParams(), common.JSONPathKey)
+		if err != nil {
+			log.Error("get json path from index params failed", zap.Error(err))
+			return merr.Status(err), nil
+		}
+		nestedPath, err := s.parseAndVerifyNestedPath(jsonPath, schema, req.GetFieldID())
+		if err != nil {
+			log.Error("parse nested path failed", zap.Error(err))
+			return merr.Status(err), nil
+		}
+		setIndexParam(req.GetIndexParams(), common.JSONPathKey, nestedPath)
+	}
+
 	if req.GetIndexName() == "" {
 		indexes := s.meta.indexMeta.GetFieldIndexes(req.GetCollectionID(), req.GetFieldID(), req.GetIndexName())
-		if len(indexes) == 0 {
-			fieldName, err := s.getFieldNameByID(ctx, req.GetCollectionID(), req.GetFieldID())
+		fieldName, err := s.getFieldNameByID(schema, req.GetFieldID())
+		if err != nil {
+			log.Warn("get field name from schema failed", zap.Int64("fieldID", req.GetFieldID()))
+			return merr.Status(err), nil
+		}
+		defaultIndexName := fieldName
+		if isJson {
+			jsonPath, err := getIndexParam(req.GetIndexParams(), common.JSONPathKey)
 			if err != nil {
-				log.Warn("get field name from schema failed", zap.Int64("fieldID", req.GetFieldID()))
 				return merr.Status(err), nil
 			}
-			req.IndexName = fieldName
+
+			indexes = lo.Filter(indexes, func(index *model.Index, i int) bool {
+				path, err := getIndexParam(index.IndexParams, common.JSONPathKey)
+				return err == nil && path == jsonPath
+			})
+
+			defaultIndexName += jsonPath
+		}
+
+		if len(indexes) == 0 {
+			req.IndexName = defaultIndexName
 		} else if len(indexes) == 1 {
 			req.IndexName = indexes[0].IndexName
 		}
 	}
 
-	indexID, err := s.meta.indexMeta.CanCreateIndex(req)
+	allocateIndexID, err := s.allocator.AllocID(ctx)
 	if err != nil {
-		metrics.IndexRequestCounter.WithLabelValues(metrics.FailLabel).Inc()
-		return merr.Status(err), nil
-	}
-
-	// merge with previous params because create index would not pass mmap params
-	indexes := s.meta.indexMeta.GetFieldIndexes(req.GetCollectionID(), req.GetFieldID(), req.GetIndexName())
-	if len(indexes) == 1 {
-		req.UserIndexParams = UpdateParams(indexes[0], indexes[0].UserIndexParams, req.GetUserIndexParams())
-		req.IndexParams = UpdateParams(indexes[0], indexes[0].IndexParams, req.GetIndexParams())
-	}
-
-	if indexID == 0 {
-		indexID, err = s.allocator.allocID(ctx)
-		if err != nil {
-			log.Warn("failed to alloc indexID", zap.Error(err))
-			metrics.IndexRequestCounter.WithLabelValues(metrics.FailLabel).Inc()
-			return merr.Status(err), nil
-		}
-		if GetIndexType(req.GetIndexParams()) == indexparamcheck.IndexDISKANN && !s.indexNodeManager.ClientSupportDisk() {
-			errMsg := "all IndexNodes do not support disk indexes, please verify"
-			log.Warn(errMsg)
-			err = merr.WrapErrIndexNotSupported(indexparamcheck.IndexDISKANN)
-			metrics.IndexRequestCounter.WithLabelValues(metrics.FailLabel).Inc()
-			return merr.Status(err), nil
-		}
-	}
-
-	index := &model.Index{
-		CollectionID:    req.GetCollectionID(),
-		FieldID:         req.GetFieldID(),
-		IndexID:         indexID,
-		IndexName:       req.GetIndexName(),
-		TypeParams:      req.GetTypeParams(),
-		IndexParams:     req.GetIndexParams(),
-		CreateTime:      req.GetTimestamp(),
-		IsAutoIndex:     req.GetIsAutoIndex(),
-		UserIndexParams: req.GetUserIndexParams(),
-	}
-
-	if err := ValidateIndexParams(index); err != nil {
+		log.Warn("failed to alloc indexID", zap.Error(err))
 		metrics.IndexRequestCounter.WithLabelValues(metrics.FailLabel).Inc()
 		return merr.Status(err), nil
 	}
 
 	// Get flushed segments and create index
-	err = s.meta.indexMeta.CreateIndex(index)
+	indexID, err := s.meta.indexMeta.CreateIndex(ctx, req, allocateIndexID, isJson)
 	if err != nil {
 		log.Error("CreateIndex fail",
 			zap.Int64("fieldID", req.GetFieldID()), zap.String("indexName", req.GetIndexName()), zap.Error(err))
@@ -271,22 +232,41 @@ func (s *Server) CreateIndex(ctx context.Context, req *indexpb.CreateIndexReques
 }
 
 func ValidateIndexParams(index *model.Index) error {
-	for _, paramSet := range [][]*commonpb.KeyValuePair{index.IndexParams, index.UserIndexParams} {
-		for _, param := range paramSet {
-			switch param.GetKey() {
-			case common.MmapEnabledKey:
-				indexType := GetIndexType(index.IndexParams)
-				if !indexparamcheck.IsMmapSupported(indexType) {
-					return merr.WrapErrParameterInvalidMsg("index type %s does not support mmap", indexType)
-				}
-
-				if _, err := strconv.ParseBool(param.GetValue()); err != nil {
-					return merr.WrapErrParameterInvalidMsg("invalid %s value: %s, expected: true, false", param.GetKey(), param.GetValue())
-				}
-			}
-		}
+	if err := CheckDuplidateKey(index.IndexParams, "indexParams"); err != nil {
+		return err
 	}
+	if err := CheckDuplidateKey(index.UserIndexParams, "userIndexParams"); err != nil {
+		return err
+	}
+	if err := CheckDuplidateKey(index.TypeParams, "typeParams"); err != nil {
+		return err
+	}
+	indexType := GetIndexType(index.IndexParams)
+	indexParams := funcutil.KeyValuePair2Map(index.IndexParams)
+	userIndexParams := funcutil.KeyValuePair2Map(index.UserIndexParams)
+	if err := indexparamcheck.ValidateMmapIndexParams(indexType, indexParams); err != nil {
+		return merr.WrapErrParameterInvalidMsg("invalid mmap index params: %s", err.Error())
+	}
+	if err := indexparamcheck.ValidateMmapIndexParams(indexType, userIndexParams); err != nil {
+		return merr.WrapErrParameterInvalidMsg("invalid mmap user index params: %s", err.Error())
+	}
+	if err := indexparamcheck.ValidateOffsetCacheIndexParams(indexType, indexParams); err != nil {
+		return merr.WrapErrParameterInvalidMsg("invalid offset cache index params: %s", err.Error())
+	}
+	if err := indexparamcheck.ValidateOffsetCacheIndexParams(indexType, userIndexParams); err != nil {
+		return merr.WrapErrParameterInvalidMsg("invalid offset cache index params: %s", err.Error())
+	}
+	return nil
+}
 
+func CheckDuplidateKey(kvs []*commonpb.KeyValuePair, tag string) error {
+	keySet := typeutil.NewSet[string]()
+	for _, kv := range kvs {
+		if keySet.Contain(kv.GetKey()) {
+			return merr.WrapErrParameterInvalidMsg("duplicate %s key in %s params", kv.GetKey(), tag)
+		}
+		keySet.Insert(kv.GetKey())
+	}
 	return nil
 }
 
@@ -309,12 +289,33 @@ func UpdateParams(index *model.Index, from []*commonpb.KeyValuePair, updates []*
 	})
 }
 
+func DeleteParams(from []*commonpb.KeyValuePair, deletes []string) []*commonpb.KeyValuePair {
+	params := make(map[string]string)
+	for _, param := range from {
+		params[param.GetKey()] = param.GetValue()
+	}
+
+	// delete the params
+	for _, key := range deletes {
+		delete(params, key)
+	}
+
+	return lo.MapToSlice(params, func(k string, v string) *commonpb.KeyValuePair {
+		return &commonpb.KeyValuePair{
+			Key:   k,
+			Value: v,
+		}
+	})
+}
+
 func (s *Server) AlterIndex(ctx context.Context, req *indexpb.AlterIndexRequest) (*commonpb.Status, error) {
 	log := log.Ctx(ctx).With(
 		zap.Int64("collectionID", req.GetCollectionID()),
 		zap.String("indexName", req.GetIndexName()),
 	)
-	log.Info("received AlterIndex request", zap.Any("params", req.GetParams()))
+	log.Info("received AlterIndex request",
+		zap.Any("params", req.GetParams()),
+		zap.Any("deletekeys", req.GetDeleteKeys()))
 
 	if req.IndexName == "" {
 		return merr.Status(merr.WrapErrParameterInvalidMsg("index name is empty")), nil
@@ -331,29 +332,76 @@ func (s *Server) AlterIndex(ctx context.Context, req *indexpb.AlterIndexRequest)
 		return merr.Status(err), nil
 	}
 
-	for _, index := range indexes {
-		// update user index params
-		newUserIndexParams := UpdateParams(index, index.UserIndexParams, req.GetParams())
-		log.Info("alter index user index params",
-			zap.String("indexName", index.IndexName),
-			zap.Any("params", newUserIndexParams),
-		)
-		index.UserIndexParams = newUserIndexParams
+	if len(req.GetDeleteKeys()) > 0 && len(req.GetParams()) > 0 {
+		return merr.Status(merr.WrapErrParameterInvalidMsg("cannot provide both DeleteKeys and ExtraParams")), nil
+	}
 
-		// update index params
-		newIndexParams := UpdateParams(index, index.IndexParams, req.GetParams())
-		log.Info("alter index user index params",
-			zap.String("indexName", index.IndexName),
-			zap.Any("params", newIndexParams),
-		)
-		index.IndexParams = newIndexParams
+	collInfo, err := s.handler.GetCollection(ctx, req.GetCollectionID())
+	if err != nil {
+		log.Warn("failed to get collection", zap.Error(err))
+		return merr.Status(err), nil
+	}
+	schemaHelper, err := typeutil.CreateSchemaHelper(collInfo.Schema)
+	if err != nil {
+		log.Warn("failed to create schema helper", zap.Error(err))
+		return merr.Status(err), nil
+	}
+
+	reqIndexParamMap := funcutil.KeyValuePair2Map(req.GetParams())
+
+	for _, index := range indexes {
+		if len(req.GetParams()) > 0 {
+			fieldSchema, err := schemaHelper.GetFieldFromID(index.FieldID)
+			if err != nil {
+				log.Warn("failed to get field schema", zap.Error(err))
+				return merr.Status(err), nil
+			}
+			isVecIndex := typeutil.IsVectorType(fieldSchema.DataType)
+			err = pkgcommon.ValidateAutoIndexMmapConfig(Params.AutoIndexConfig.Enable.GetAsBool(), isVecIndex, reqIndexParamMap)
+			if err != nil {
+				log.Warn("failed to validate auto index mmap config", zap.Error(err))
+				return merr.Status(err), nil
+			}
+
+			// update user index params
+			newUserIndexParams := UpdateParams(index, index.UserIndexParams, req.GetParams())
+			log.Info("alter index user index params",
+				zap.String("indexName", index.IndexName),
+				zap.Any("params", newUserIndexParams),
+			)
+			index.UserIndexParams = newUserIndexParams
+
+			// update index params
+			newIndexParams := UpdateParams(index, index.IndexParams, req.GetParams())
+			log.Info("alter index index params",
+				zap.String("indexName", index.IndexName),
+				zap.Any("params", newIndexParams),
+			)
+			index.IndexParams = newIndexParams
+		} else if len(req.GetDeleteKeys()) > 0 {
+			// delete user index params
+			newUserIndexParams := DeleteParams(index.UserIndexParams, req.GetDeleteKeys())
+			log.Info("alter index user deletekeys",
+				zap.String("indexName", index.IndexName),
+				zap.Any("params", newUserIndexParams),
+			)
+			index.UserIndexParams = newUserIndexParams
+
+			// delete index params
+			newIndexParams := DeleteParams(index.IndexParams, req.GetDeleteKeys())
+			log.Info("alter index index deletekeys",
+				zap.String("indexName", index.IndexName),
+				zap.Any("params", newIndexParams),
+			)
+			index.IndexParams = newIndexParams
+		}
 
 		if err := ValidateIndexParams(index); err != nil {
 			return merr.Status(err), nil
 		}
 	}
 
-	err := s.meta.indexMeta.AlterIndex(ctx, indexes...)
+	err = s.meta.indexMeta.AlterIndex(ctx, indexes...)
 	if err != nil {
 		log.Warn("failed to alter index", zap.Error(err))
 		return merr.Status(err), nil
@@ -400,8 +448,8 @@ func (s *Server) GetIndexState(ctx context.Context, req *indexpb.GetIndexStateRe
 
 	indexInfo := &indexpb.IndexInfo{}
 	// The total rows of all indexes should be based on the current perspective
-	segments := s.selectSegmentIndexesStats(WithCollection(req.GetCollectionID()), SegmentFilterFunc(func(info *SegmentInfo) bool {
-		return (isFlush(info) || info.GetState() == commonpb.SegmentState_Dropped)
+	segments := s.selectSegmentIndexesStats(ctx, WithCollection(req.GetCollectionID()), SegmentFilterFunc(func(info *SegmentInfo) bool {
+		return info.GetLevel() != datapb.SegmentLevel_L0 && (isFlush(info) || info.GetState() == commonpb.SegmentState_Dropped)
 	}))
 
 	s.completeIndexInfo(indexInfo, indexes[0], segments, false, indexes[0].CreateTime)
@@ -452,10 +500,10 @@ func (s *Server) GetSegmentIndexState(ctx context.Context, req *indexpb.GetSegme
 	return ret, nil
 }
 
-func (s *Server) selectSegmentIndexesStats(filters ...SegmentFilter) map[int64]*indexStats {
+func (s *Server) selectSegmentIndexesStats(ctx context.Context, filters ...SegmentFilter) map[int64]*indexStats {
 	ret := make(map[int64]*indexStats)
 
-	segments := s.meta.SelectSegments(filters...)
+	segments := s.meta.SelectSegments(ctx, filters...)
 	segmentIDs := lo.Map(segments, func(info *SegmentInfo, i int) int64 {
 		return info.GetID()
 	})
@@ -543,6 +591,9 @@ func (s *Server) completeIndexInfo(indexInfo *indexpb.IndexInfo, index *model.In
 		pendingIndexRows = int64(0)
 	)
 
+	minIndexVersion := int32(math.MaxInt32)
+	maxIndexVersion := int32(math.MinInt32)
+
 	for segID, seg := range segments {
 		if seg.state != commonpb.SegmentState_Flushed && seg.state != commonpb.SegmentState_Flushing {
 			continue
@@ -579,6 +630,12 @@ func (s *Server) completeIndexInfo(indexInfo *indexpb.IndexInfo, index *model.In
 		case commonpb.IndexState_Finished:
 			cntFinished++
 			indexedRows += seg.numRows
+			if segIdx.IndexVersion < minIndexVersion {
+				minIndexVersion = segIdx.IndexVersion
+			}
+			if segIdx.IndexVersion > maxIndexVersion {
+				maxIndexVersion = segIdx.IndexVersion
+			}
 		case commonpb.IndexState_Failed:
 			cntFailed++
 			failReason += fmt.Sprintf("%d: %s;", segID, segIdx.FailReason)
@@ -592,6 +649,8 @@ func (s *Server) completeIndexInfo(indexInfo *indexpb.IndexInfo, index *model.In
 	}
 	indexInfo.TotalRows = totalRows
 	indexInfo.PendingIndexRows = pendingIndexRows
+	indexInfo.MinIndexVersion = minIndexVersion
+	indexInfo.MaxIndexVersion = maxIndexVersion
 	switch {
 	case cntFailed > 0:
 		indexInfo.State = commonpb.IndexState_Failed
@@ -607,7 +666,8 @@ func (s *Server) completeIndexInfo(indexInfo *indexpb.IndexInfo, index *model.In
 	log.RatedInfo(60, "completeIndexInfo success", zap.Int64("collectionID", index.CollectionID), zap.Int64("indexID", index.IndexID),
 		zap.Int64("totalRows", indexInfo.TotalRows), zap.Int64("indexRows", indexInfo.IndexedRows),
 		zap.Int64("pendingIndexRows", indexInfo.PendingIndexRows),
-		zap.String("state", indexInfo.State.String()), zap.String("failReason", indexInfo.IndexStateFailReason))
+		zap.String("state", indexInfo.State.String()), zap.String("failReason", indexInfo.IndexStateFailReason),
+		zap.Int32("minIndexVersion", indexInfo.MinIndexVersion), zap.Int32("maxIndexVersion", indexInfo.MaxIndexVersion))
 }
 
 // GetIndexBuildProgress get the index building progress by num rows.
@@ -651,8 +711,8 @@ func (s *Server) GetIndexBuildProgress(ctx context.Context, req *indexpb.GetInde
 	}
 
 	// The total rows of all indexes should be based on the current perspective
-	segments := s.selectSegmentIndexesStats(WithCollection(req.GetCollectionID()), SegmentFilterFunc(func(info *SegmentInfo) bool {
-		return (isFlush(info) || info.GetState() == commonpb.SegmentState_Dropped)
+	segments := s.selectSegmentIndexesStats(ctx, WithCollection(req.GetCollectionID()), SegmentFilterFunc(func(info *SegmentInfo) bool {
+		return info.GetLevel() != datapb.SegmentLevel_L0 && (isFlush(info) || info.GetState() == commonpb.SegmentState_Dropped)
 	}))
 
 	s.completeIndexInfo(indexInfo, indexes[0], segments, false, indexes[0].CreateTime)
@@ -701,8 +761,8 @@ func (s *Server) DescribeIndex(ctx context.Context, req *indexpb.DescribeIndexRe
 	}
 
 	// The total rows of all indexes should be based on the current perspective
-	segments := s.selectSegmentIndexesStats(WithCollection(req.GetCollectionID()), SegmentFilterFunc(func(info *SegmentInfo) bool {
-		return isFlush(info) || info.GetState() == commonpb.SegmentState_Dropped
+	segments := s.selectSegmentIndexesStats(ctx, WithCollection(req.GetCollectionID()), SegmentFilterFunc(func(info *SegmentInfo) bool {
+		return info.GetLevel() != datapb.SegmentLevel_L0 && (isFlush(info) || info.GetState() == commonpb.SegmentState_Dropped)
 	}))
 
 	indexInfos := make([]*indexpb.IndexInfo, 0)
@@ -759,8 +819,8 @@ func (s *Server) GetIndexStatistics(ctx context.Context, req *indexpb.GetIndexSt
 	}
 
 	// The total rows of all indexes should be based on the current perspective
-	segments := s.selectSegmentIndexesStats(WithCollection(req.GetCollectionID()), SegmentFilterFunc(func(info *SegmentInfo) bool {
-		return (isFlush(info) || info.GetState() == commonpb.SegmentState_Dropped)
+	segments := s.selectSegmentIndexesStats(ctx, WithCollection(req.GetCollectionID()), SegmentFilterFunc(func(info *SegmentInfo) bool {
+		return info.GetLevel() != datapb.SegmentLevel_L0 && (isFlush(info) || info.GetState() == commonpb.SegmentState_Dropped)
 	}))
 
 	indexInfos := make([]*indexpb.IndexInfo, 0)
@@ -825,7 +885,7 @@ func (s *Server) DropIndex(ctx context.Context, req *indexpb.DropIndexRequest) (
 	// from being dropped at the same time when dropping_partition in version 2.1
 	if len(req.GetPartitionIDs()) == 0 {
 		// drop collection index
-		err := s.meta.indexMeta.MarkIndexAsDeleted(req.GetCollectionID(), indexIDs)
+		err := s.meta.indexMeta.MarkIndexAsDeleted(ctx, req.GetCollectionID(), indexIDs)
 		if err != nil {
 			log.Warn("DropIndex fail", zap.String("indexName", req.IndexName), zap.Error(err))
 			return merr.Status(err), nil
@@ -854,8 +914,9 @@ func (s *Server) GetIndexInfos(ctx context.Context, req *indexpb.GetIndexInfoReq
 		SegmentInfo: map[int64]*indexpb.SegmentInfo{},
 	}
 
+	segmentsIndexes := s.meta.indexMeta.GetSegmentsIndexes(req.GetCollectionID(), req.GetSegmentIDs())
 	for _, segID := range req.GetSegmentIDs() {
-		segIdxes := s.meta.indexMeta.GetSegmentIndexes(req.GetCollectionID(), segID)
+		segIdxes := segmentsIndexes[segID]
 		ret.SegmentInfo[segID] = &indexpb.SegmentInfo{
 			CollectionID: req.GetCollectionID(),
 			SegmentID:    segID,
@@ -879,7 +940,8 @@ func (s *Server) GetIndexInfos(ctx context.Context, req *indexpb.GetIndexInfoReq
 							IndexName:           s.meta.indexMeta.GetIndexNameByID(segIdx.CollectionID, segIdx.IndexID),
 							IndexParams:         indexParams,
 							IndexFilePaths:      indexFilePaths,
-							SerializedSize:      segIdx.IndexSize,
+							SerializedSize:      segIdx.IndexSerializedSize,
+							MemSize:             segIdx.IndexMemSize,
 							IndexVersion:        segIdx.IndexVersion,
 							NumRows:             segIdx.NumRows,
 							CurrentIndexVersion: segIdx.CurrentIndexVersion,

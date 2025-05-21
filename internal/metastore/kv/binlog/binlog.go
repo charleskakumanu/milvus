@@ -21,12 +21,12 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/storage"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/metautil"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/metautil"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 func CompressSaveBinlogPaths(req *datapb.SaveBinlogPathsRequest) error {
@@ -39,6 +39,10 @@ func CompressSaveBinlogPaths(req *datapb.SaveBinlogPathsRequest) error {
 		return err
 	}
 	err = CompressFieldBinlogs(req.GetField2StatslogPaths())
+	if err != nil {
+		return err
+	}
+	err = CompressFieldBinlogs(req.GetField2Bm25LogPaths())
 	if err != nil {
 		return err
 	}
@@ -56,6 +60,10 @@ func CompressCompactionBinlogs(binlogs []*datapb.CompactionSegment) error {
 			return err
 		}
 		err = CompressFieldBinlogs(binlog.GetField2StatslogPaths())
+		if err != nil {
+			return err
+		}
+		err = CompressFieldBinlogs(binlog.GetBm25Logs())
 		if err != nil {
 			return err
 		}
@@ -133,6 +141,11 @@ func DecompressBinLogs(s *datapb.SegmentInfo) error {
 	if err != nil {
 		return err
 	}
+
+	err = DecompressBinLog(storage.BM25Binlog, collectionID, partitionID, segmentID, s.GetBm25Statslogs())
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -154,12 +167,38 @@ func DecompressBinLog(binlogType storage.BinlogType, collectionID, partitionID,
 	return nil
 }
 
+func DecompressBinLogWithRootPath(rootPath string, binlogType storage.BinlogType, collectionID, partitionID,
+	segmentID typeutil.UniqueID, fieldBinlogs []*datapb.FieldBinlog,
+) error {
+	for _, fieldBinlog := range fieldBinlogs {
+		for _, binlog := range fieldBinlog.Binlogs {
+			if binlog.GetLogPath() == "" {
+				path, err := BuildLogPathWithRootPath(rootPath, binlogType, collectionID, partitionID,
+					segmentID, fieldBinlog.GetFieldID(), binlog.GetLogID())
+				if err != nil {
+					return err
+				}
+				binlog.LogPath = path
+			}
+		}
+	}
+	return nil
+}
+
+func GetRootPath() string {
+	if paramtable.Get().CommonCfg.StorageType.GetValue() == "local" {
+		return paramtable.Get().LocalStorageCfg.Path.GetValue()
+	}
+	return paramtable.Get().MinioCfg.RootPath.GetValue()
+}
+
 // build a binlog path on the storage by metadata
 func BuildLogPath(binlogType storage.BinlogType, collectionID, partitionID, segmentID, fieldID, logID typeutil.UniqueID) (string, error) {
-	chunkManagerRootPath := paramtable.Get().MinioCfg.RootPath.GetValue()
-	if paramtable.Get().CommonCfg.StorageType.GetValue() == "local" {
-		chunkManagerRootPath = paramtable.Get().LocalStorageCfg.Path.GetValue()
-	}
+	chunkManagerRootPath := GetRootPath()
+	return BuildLogPathWithRootPath(chunkManagerRootPath, binlogType, collectionID, partitionID, segmentID, fieldID, logID)
+}
+
+func BuildLogPathWithRootPath(chunkManagerRootPath string, binlogType storage.BinlogType, collectionID, partitionID, segmentID, fieldID, logID typeutil.UniqueID) (string, error) {
 	switch binlogType {
 	case storage.InsertBinlog:
 		return metautil.BuildInsertLogPath(chunkManagerRootPath, collectionID, partitionID, segmentID, fieldID, logID), nil
@@ -167,6 +206,8 @@ func BuildLogPath(binlogType storage.BinlogType, collectionID, partitionID, segm
 		return metautil.BuildDeltaLogPath(chunkManagerRootPath, collectionID, partitionID, segmentID, logID), nil
 	case storage.StatsBinlog:
 		return metautil.BuildStatsLogPath(chunkManagerRootPath, collectionID, partitionID, segmentID, fieldID, logID), nil
+	case storage.BM25Binlog:
+		return metautil.BuildBm25LogPath(chunkManagerRootPath, collectionID, partitionID, segmentID, fieldID, logID), nil
 	}
 	// should not happen
 	return "", merr.WrapErrParameterInvalidMsg("invalid binlog type")

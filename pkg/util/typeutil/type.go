@@ -48,6 +48,12 @@ const (
 	IndexNodeRole = "indexnode"
 	// MixtureRole is a constant represents Mixture running modtoe
 	MixtureRole = "mixture"
+	// StreamingCoord is a constant represent StreamingCoord
+	StreamingCoordRole = "streamingcoord"
+	// StreamingNode is a constant represent StreamingNode
+	StreamingNodeRole = "streamingnode"
+	// MixCoordRole is a constant represent MixCoord
+	MixCoordRole = "mixcoord"
 )
 
 var (
@@ -60,6 +66,8 @@ var (
 		IndexNodeRole,
 		DataCoordRole,
 		DataNodeRole,
+		StreamingNodeRole,
+		MixCoordRole,
 	)
 	serverTypeList = serverTypeSet.Collect()
 )

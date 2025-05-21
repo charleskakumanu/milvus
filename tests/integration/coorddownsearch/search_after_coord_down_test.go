@@ -24,21 +24,19 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/stretchr/testify/suite"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	grpcdatacoord "github.com/milvus-io/milvus/internal/distributed/datacoord"
-	grpcquerycoord "github.com/milvus-io/milvus/internal/distributed/querycoord"
-	grpcrootcoord "github.com/milvus-io/milvus/internal/distributed/rootcoord"
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/metric"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/internal/util/testutil"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/metric"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/tests/integration"
 )
 
@@ -277,27 +275,15 @@ func (s *CoordDownSearch) setupData() {
 }
 
 func (s *CoordDownSearch) searchAfterCoordDown() float64 {
-	var err error
 	c := s.Cluster
 
 	params := paramtable.Get()
 	paramtable.Init()
 
 	start := time.Now()
-	log.Info("=========================Data Coordinators stopped=========================")
-	c.DataCoord.Stop()
-	s.search(searchCollectionName, Dim, commonpb.ConsistencyLevel_Eventually)
-	s.search(searchCollectionName, Dim, commonpb.ConsistencyLevel_Bounded)
-	s.search(searchCollectionName, Dim, commonpb.ConsistencyLevel_Strong)
-
-	log.Info("=========================Query Coordinators stopped=========================")
-	c.QueryCoord.Stop()
-	s.search(searchCollectionName, Dim, commonpb.ConsistencyLevel_Eventually)
-	s.search(searchCollectionName, Dim, commonpb.ConsistencyLevel_Bounded)
-	s.search(searchCollectionName, Dim, commonpb.ConsistencyLevel_Strong)
 
 	log.Info("=========================Root Coordinators stopped=========================")
-	c.RootCoord.Stop()
+	c.StopMixCoord()
 	params.Save(params.CommonCfg.GracefulTime.Key, "60000")
 	s.search(searchCollectionName, Dim, commonpb.ConsistencyLevel_Bounded)
 	s.search(searchCollectionName, Dim, commonpb.ConsistencyLevel_Eventually)
@@ -306,29 +292,10 @@ func (s *CoordDownSearch) searchAfterCoordDown() float64 {
 	s.searchFailed(searchCollectionName, Dim, commonpb.ConsistencyLevel_Strong)
 	log.Info(fmt.Sprintf("=========================Failed search cost: %fs=========================", time.Since(failedStart).Seconds()))
 
+	testutil.ResetEnvironment()
+
 	log.Info("=========================restart Root Coordinators=========================")
-	c.RootCoord, err = grpcrootcoord.NewServer(context.TODO(), c.GetFactory())
-	s.NoError(err)
-	err = c.RootCoord.Run()
-	s.NoError(err)
-	s.search(searchCollectionName, Dim, commonpb.ConsistencyLevel_Eventually)
-	s.search(searchCollectionName, Dim, commonpb.ConsistencyLevel_Bounded)
-	s.search(searchCollectionName, Dim, commonpb.ConsistencyLevel_Strong)
-
-	log.Info("=========================restart Data Coordinators=========================")
-	c.DataCoord = grpcdatacoord.NewServer(context.TODO(), c.GetFactory())
-	s.NoError(err)
-	err = c.DataCoord.Run()
-	s.NoError(err)
-	s.search(searchCollectionName, Dim, commonpb.ConsistencyLevel_Eventually)
-	s.search(searchCollectionName, Dim, commonpb.ConsistencyLevel_Bounded)
-	s.search(searchCollectionName, Dim, commonpb.ConsistencyLevel_Strong)
-
-	log.Info("=========================restart Query Coordinators=========================")
-	c.QueryCoord, err = grpcquerycoord.NewServer(context.TODO(), c.GetFactory())
-	s.NoError(err)
-	err = c.QueryCoord.Run()
-	s.NoError(err)
+	c.StartMixCoord()
 	s.search(searchCollectionName, Dim, commonpb.ConsistencyLevel_Eventually)
 	s.search(searchCollectionName, Dim, commonpb.ConsistencyLevel_Bounded)
 	s.search(searchCollectionName, Dim, commonpb.ConsistencyLevel_Strong)

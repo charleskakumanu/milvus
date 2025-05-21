@@ -23,9 +23,9 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/util/streamrpc"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
 )
 
 var _ querypb.QueryNodeClient = &GrpcQueryNodeClient{}
@@ -127,6 +127,14 @@ func (m *GrpcQueryNodeClient) UnsubDmChannel(ctx context.Context, req *querypb.U
 }
 
 func (m *GrpcQueryNodeClient) Delete(ctx context.Context, in *querypb.DeleteRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+	return &commonpb.Status{}, m.Err
+}
+
+func (m *GrpcQueryNodeClient) DeleteBatch(ctx context.Context, in *querypb.DeleteBatchRequest, opts ...grpc.CallOption) (*querypb.DeleteBatchResponse, error) {
+	return &querypb.DeleteBatchResponse{}, m.Err
+}
+
+func (m *GrpcQueryNodeClient) UpdateSchema(ctx context.Context, in *querypb.UpdateSchemaRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	return &commonpb.Status{}, m.Err
 }
 

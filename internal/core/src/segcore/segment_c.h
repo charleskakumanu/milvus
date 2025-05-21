@@ -33,7 +33,8 @@ CStatus
 NewSegment(CCollection collection,
            SegmentType seg_type,
            int64_t segment_id,
-           CSegmentInterface* newSegment);
+           CSegmentInterface* newSegment,
+           bool is_sorted_by_pk);
 
 void
 DeleteSegment(CSegmentInterface c_segment);
@@ -49,7 +50,8 @@ AsyncSearch(CTraceContext c_trace,
             CSegmentInterface c_segment,
             CSearchPlan c_plan,
             CPlaceholderGroup c_placeholder_group,
-            uint64_t timestamp);
+            uint64_t timestamp,
+            int32_t consistency_level);
 
 void
 DeleteRetrieveResult(CRetrieveResult* retrieve_result);
@@ -60,7 +62,8 @@ AsyncRetrieve(CTraceContext c_trace,
               CRetrievePlan c_plan,
               uint64_t timestamp,
               int64_t limit_size,
-              bool ignore_non_pk);
+              bool ignore_non_pk,
+              int32_t consistency_level);
 
 CFuture*  // Future<CRetrieveResult>
 AsyncRetrieveByOffsets(CTraceContext c_trace,
@@ -103,16 +106,6 @@ LoadFieldData(CSegmentInterface c_segment,
               CLoadFieldDataInfo load_field_data_info);
 
 CStatus
-LoadFieldDataV2(CSegmentInterface c_segment,
-                CLoadFieldDataInfo load_field_data_info);
-
-CStatus
-LoadFieldRawData(CSegmentInterface c_segment,
-                 int64_t field_id,
-                 const void* data,
-                 int64_t row_count);
-
-CStatus
 LoadDeletedRecord(CSegmentInterface c_segment,
                   CLoadDeletedRecordInfo deleted_record_info);
 
@@ -121,11 +114,24 @@ UpdateSealedSegmentIndex(CSegmentInterface c_segment,
                          CLoadIndexInfo c_load_index_info);
 
 CStatus
+LoadTextIndex(CSegmentInterface c_segment,
+              const uint8_t* serialized_load_text_index_info,
+              const uint64_t len);
+
+CStatus
+LoadJsonKeyIndex(CTraceContext c_trace,
+                 CSegmentInterface c_segment,
+                 const uint8_t* serialied_load_json_key_index_info,
+                 const uint64_t len);
+
+CStatus
 UpdateFieldRawDataSize(CSegmentInterface c_segment,
                        int64_t field_id,
                        int64_t num_rows,
                        int64_t field_data_size);
 
+// This function is currently used only in test.
+// Current implement supports only dropping of non-system fields.
 CStatus
 DropFieldData(CSegmentInterface c_segment, int64_t field_id);
 
@@ -136,9 +142,6 @@ CStatus
 AddFieldDataInfoForSealed(CSegmentInterface c_segment,
                           CLoadFieldDataInfo c_load_field_data_info);
 
-CStatus
-WarmupChunkCache(CSegmentInterface c_segment, int64_t field_id);
-
 //////////////////////////////    interfaces for SegmentInterface    //////////////////////////////
 CStatus
 ExistPk(CSegmentInterface c_segment,
@@ -148,7 +151,6 @@ ExistPk(CSegmentInterface c_segment,
 
 CStatus
 Delete(CSegmentInterface c_segment,
-       int64_t reserved_offset,
        int64_t size,
        const uint8_t* ids,
        const uint64_t ids_size,
@@ -156,6 +158,12 @@ Delete(CSegmentInterface c_segment,
 
 void
 RemoveFieldFile(CSegmentInterface c_segment, int64_t field_id);
+
+CStatus
+CreateTextIndex(CSegmentInterface c_segment, int64_t field_id);
+
+CStatus
+FinishLoad(CSegmentInterface c_segment);
 
 #ifdef __cplusplus
 }

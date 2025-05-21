@@ -20,22 +20,26 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/errors"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
+	"github.com/milvus-io/milvus/internal/distributed/utils"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/grpcclient"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/commonpbutil"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
+
+var Params *paramtable.ComponentParam = paramtable.Get()
 
 // Client is the grpc client of QueryNode.
 type Client struct {
@@ -43,17 +47,18 @@ type Client struct {
 	addr       string
 	sess       *sessionutil.Session
 	nodeID     int64
+	ctx        context.Context
 }
 
 // NewClient creates a new QueryNode client.
 func NewClient(ctx context.Context, addr string, nodeID int64) (types.QueryNodeClient, error) {
 	if addr == "" {
-		return nil, fmt.Errorf("addr is empty")
+		return nil, errors.New("addr is empty")
 	}
 	sess := sessionutil.NewSession(ctx)
 	if sess == nil {
-		err := fmt.Errorf("new session error, maybe can not connect to etcd")
-		log.Debug("QueryNodeClient NewClient failed", zap.Error(err))
+		err := errors.New("new session error, maybe can not connect to etcd")
+		log.Ctx(ctx).Debug("QueryNodeClient NewClient failed", zap.Error(err))
 		return nil, err
 	}
 	config := &paramtable.Get().QueryNodeGrpcClientCfg
@@ -62,6 +67,7 @@ func NewClient(ctx context.Context, addr string, nodeID int64) (types.QueryNodeC
 		grpcClient: grpcclient.NewClientBase[querypb.QueryNodeClient](config, "milvus.proto.query.QueryNode"),
 		sess:       sess,
 		nodeID:     nodeID,
+		ctx:        ctx,
 	}
 	// node shall specify node id
 	client.grpcClient.SetRole(fmt.Sprintf("%s-%d", typeutil.QueryNodeRole, nodeID))
@@ -70,6 +76,16 @@ func NewClient(ctx context.Context, addr string, nodeID int64) (types.QueryNodeC
 	client.grpcClient.SetNodeID(nodeID)
 	client.grpcClient.SetSession(sess)
 
+	if Params.InternalTLSCfg.InternalTLSEnabled.GetAsBool() {
+		client.grpcClient.EnableEncryption()
+		cp, err := utils.CreateCertPoolforClient(Params.InternalTLSCfg.InternalTLSCaPemPath.GetValue(), "QueryNode")
+		if err != nil {
+			log.Ctx(ctx).Error("Failed to create cert pool for QueryNode client")
+			return nil, err
+		}
+		client.grpcClient.SetInternalTLSCertPool(cp)
+		client.grpcClient.SetInternalTLSServerName(Params.InternalTLSCfg.InternalTLSSNI.GetValue())
+	}
 	return client, nil
 }
 
@@ -330,5 +346,29 @@ func (c *Client) Delete(ctx context.Context, req *querypb.DeleteRequest, _ ...gr
 	)
 	return wrapGrpcCall(ctx, c, func(client querypb.QueryNodeClient) (*commonpb.Status, error) {
 		return client.Delete(ctx, req)
+	})
+}
+
+// DeleteBatch is the API to apply same delete data into multiple segments.
+// it's basically same as `Delete` but cost less memory pressure.
+func (c *Client) DeleteBatch(ctx context.Context, req *querypb.DeleteBatchRequest, _ ...grpc.CallOption) (*querypb.DeleteBatchResponse, error) {
+	req = typeutil.Clone(req)
+	commonpbutil.UpdateMsgBase(
+		req.GetBase(),
+		commonpbutil.FillMsgBaseFromClient(c.nodeID),
+	)
+	return wrapGrpcCall(ctx, c, func(client querypb.QueryNodeClient) (*querypb.DeleteBatchResponse, error) {
+		return client.DeleteBatch(ctx, req)
+	})
+}
+
+func (c *Client) UpdateSchema(ctx context.Context, req *querypb.UpdateSchemaRequest, _ ...grpc.CallOption) (*commonpb.Status, error) {
+	req = typeutil.Clone(req)
+	commonpbutil.UpdateMsgBase(
+		req.GetBase(),
+		commonpbutil.FillMsgBaseFromClient(c.nodeID),
+	)
+	return wrapGrpcCall(ctx, c, func(client querypb.QueryNodeClient) (*commonpb.Status, error) {
+		return client.UpdateSchema(ctx, req)
 	})
 }

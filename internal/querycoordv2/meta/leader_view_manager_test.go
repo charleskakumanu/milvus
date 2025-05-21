@@ -19,10 +19,17 @@ package meta
 import (
 	"testing"
 
+	"github.com/cockroachdb/errors"
 	"github.com/samber/lo"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
 
-	"github.com/milvus-io/milvus/internal/proto/querypb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus/internal/json"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 type LeaderViewManagerSuite struct {
@@ -248,18 +255,146 @@ func (suite *LeaderViewManagerSuite) TestNotifyDelegatorChanges() {
 		},
 	}
 
-	updateCollections := make([]int64, 0)
+	retSet := typeutil.NewUniqueSet()
 	mgr.SetNotifyFunc(func(collectionIDs ...int64) {
-		updateCollections = append(updateCollections, collectionIDs...)
+		retSet.Insert(collectionIDs...)
 	})
 
 	mgr.Update(1, newViews...)
+	suite.Equal(2, retSet.Len())
+	suite.True(retSet.Contain(100))
+	suite.True(retSet.Contain(103))
 
-	suite.Equal(2, len(updateCollections))
-	suite.Contains(updateCollections, int64(100))
-	suite.Contains(updateCollections, int64(103))
+	newViews1 := []*LeaderView{
+		{
+			ID:                 1,
+			CollectionID:       101,
+			Channel:            "test-channel-2",
+			UnServiceableError: errors.New("test error"),
+		},
+		{
+			ID:                 1,
+			CollectionID:       102,
+			Channel:            "test-channel-3",
+			UnServiceableError: errors.New("test error"),
+		},
+		{
+			ID:                 1,
+			CollectionID:       103,
+			Channel:            "test-channel-4",
+			UnServiceableError: errors.New("test error"),
+		},
+	}
+
+	retSet.Clear()
+	mgr.Update(1, newViews1...)
+	suite.Equal(3, len(retSet))
+	suite.True(retSet.Contain(101))
+	suite.True(retSet.Contain(102))
+	suite.True(retSet.Contain(103))
+
+	newViews2 := []*LeaderView{
+		{
+			ID:                 1,
+			CollectionID:       101,
+			Channel:            "test-channel-2",
+			UnServiceableError: errors.New("test error"),
+		},
+		{
+			ID:           1,
+			CollectionID: 102,
+			Channel:      "test-channel-3",
+		},
+		{
+			ID:           1,
+			CollectionID: 103,
+			Channel:      "test-channel-4",
+		},
+	}
+
+	retSet.Clear()
+	mgr.Update(1, newViews2...)
+	suite.Equal(2, len(retSet))
+	suite.True(retSet.Contain(102))
+	suite.True(retSet.Contain(103))
 }
 
 func TestLeaderViewManager(t *testing.T) {
 	suite.Run(t, new(LeaderViewManagerSuite))
+}
+
+func TestGetLeaderView(t *testing.T) {
+	manager := NewLeaderViewManager()
+	leaderView1 := &LeaderView{
+		ID:           1,
+		CollectionID: 100,
+		Channel:      "channel-1",
+		Version:      1,
+		Segments:     map[int64]*querypb.SegmentDist{1: {NodeID: 1}},
+		GrowingSegments: map[int64]*Segment{
+			1: {SegmentInfo: &datapb.SegmentInfo{ID: 1, CollectionID: 100, PartitionID: 10, InsertChannel: "channel-1", NumOfRows: 1000, State: commonpb.SegmentState_Growing}, Node: 1},
+		},
+		TargetVersion:      1,
+		NumOfGrowingRows:   1000,
+		UnServiceableError: nil,
+	}
+
+	leaderView2 := &LeaderView{
+		ID:           2,
+		CollectionID: 200,
+		Channel:      "channel-2",
+		Version:      1,
+		Segments:     map[int64]*querypb.SegmentDist{2: {NodeID: 2}},
+		GrowingSegments: map[int64]*Segment{
+			2: {SegmentInfo: &datapb.SegmentInfo{ID: 2, CollectionID: 200, PartitionID: 20, InsertChannel: "channel-2", NumOfRows: 2000, State: commonpb.SegmentState_Growing}, Node: 2},
+		},
+		TargetVersion:      1,
+		NumOfGrowingRows:   2000,
+		UnServiceableError: nil,
+	}
+
+	manager.Update(1, leaderView1)
+	manager.Update(2, leaderView2)
+
+	// Call GetLeaderView
+	leaderViews := manager.GetLeaderView(0)
+	jsonOutput, err := json.Marshal(leaderViews)
+	assert.NoError(t, err)
+
+	var result []*metricsinfo.LeaderView
+	err = json.Unmarshal(jsonOutput, &result)
+	assert.NoError(t, err)
+	assert.Len(t, result, 2)
+
+	checkResult := func(lv *metricsinfo.LeaderView) {
+		if lv.LeaderID == 1 {
+			assert.Equal(t, int64(100), lv.CollectionID)
+			assert.Equal(t, "channel-1", lv.Channel)
+			assert.Equal(t, int64(1), lv.Version)
+			assert.Len(t, lv.SealedSegments, 1)
+			assert.Len(t, lv.GrowingSegments, 1)
+			assert.Equal(t, int64(1), lv.SealedSegments[0].SegmentID)
+			assert.Equal(t, int64(1), lv.GrowingSegments[0].SegmentID)
+		} else if lv.LeaderID == 2 {
+			assert.Equal(t, int64(200), lv.CollectionID)
+			assert.Equal(t, "channel-2", lv.Channel)
+			assert.Equal(t, int64(1), lv.Version)
+			assert.Len(t, lv.SealedSegments, 1)
+			assert.Len(t, lv.GrowingSegments, 1)
+			assert.Equal(t, int64(2), lv.SealedSegments[0].SegmentID)
+			assert.Equal(t, int64(2), lv.GrowingSegments[0].SegmentID)
+		} else {
+			assert.Failf(t, "unexpected leader id", "unexpected leader id %d", lv.LeaderID)
+		}
+	}
+
+	for _, lv := range result {
+		checkResult(lv)
+	}
+
+	leaderViews = manager.GetLeaderView(1)
+	assert.Len(t, leaderViews, 0)
+
+	leaderViews = manager.GetLeaderView(100)
+	assert.Len(t, leaderViews, 1)
 }

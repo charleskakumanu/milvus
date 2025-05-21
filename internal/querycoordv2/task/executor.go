@@ -29,19 +29,19 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
-	"github.com/milvus-io/milvus/internal/proto/indexpb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	. "github.com/milvus-io/milvus/internal/querycoordv2/params"
 	"github.com/milvus-io/milvus/internal/querycoordv2/session"
 	"github.com/milvus-io/milvus/internal/querycoordv2/utils"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/commonpbutil"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/util/indexparams"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/tsoutil"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/indexparams"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/tsoutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 // segmentsVersion is used for the flushed segments should not be included in the watch dm channel request
@@ -57,7 +57,7 @@ type Executor struct {
 	meta      *meta.Meta
 	dist      *meta.DistributionManager
 	broker    meta.Broker
-	targetMgr *meta.TargetManager
+	targetMgr meta.TargetManagerInterface
 	cluster   session.Cluster
 	nodeMgr   *session.NodeManager
 
@@ -69,7 +69,7 @@ type Executor struct {
 func NewExecutor(meta *meta.Meta,
 	dist *meta.DistributionManager,
 	broker meta.Broker,
-	targetMgr *meta.TargetManager,
+	targetMgr meta.TargetManagerInterface,
 	cluster session.Cluster,
 	nodeMgr *session.NodeManager,
 ) *Executor {
@@ -156,7 +156,7 @@ func (ex *Executor) removeTask(task Task, step int) {
 
 func (ex *Executor) executeSegmentAction(task *SegmentTask, step int) {
 	switch task.Actions()[step].Type() {
-	case ActionTypeGrow, ActionTypeUpdate:
+	case ActionTypeGrow, ActionTypeUpdate, ActionTypeStatsUpdate:
 		ex.loadSegment(task, step)
 
 	case ActionTypeReduce:
@@ -192,7 +192,7 @@ func (ex *Executor) loadSegment(task *SegmentTask, step int) error {
 		return err
 	}
 
-	loadInfo, indexInfos, err := ex.getLoadInfo(ctx, task.CollectionID(), action.SegmentID(), channel)
+	loadInfo, indexInfos, err := ex.getLoadInfo(ctx, task.CollectionID(), action.SegmentID, channel)
 	if err != nil {
 		return err
 	}
@@ -208,14 +208,14 @@ func (ex *Executor) loadSegment(task *SegmentTask, step int) error {
 	)
 
 	// get segment's replica first, then get shard leader by replica
-	replica := ex.meta.ReplicaManager.GetByCollectionAndNode(task.CollectionID(), action.Node())
+	replica := ex.meta.ReplicaManager.GetByCollectionAndNode(ctx, task.CollectionID(), action.Node())
 	if replica == nil {
 		msg := "node doesn't belong to any replica"
 		err := merr.WrapErrNodeNotAvailable(action.Node())
 		log.Warn(msg, zap.Error(err))
 		return err
 	}
-	view := ex.dist.LeaderViewManager.GetLatestShardLeaderByFilter(meta.WithReplica2LeaderView(replica), meta.WithChannelName2LeaderView(action.Shard()))
+	view := ex.dist.LeaderViewManager.GetLatestShardLeaderByFilter(meta.WithReplica2LeaderView(replica), meta.WithChannelName2LeaderView(action.Shard))
 	if view == nil {
 		msg := "no shard leader for the segment to execute loading"
 		err = merr.WrapErrChannelNotFound(task.Shard(), "shard delegator not found")
@@ -259,39 +259,40 @@ func (ex *Executor) releaseSegment(task *SegmentTask, step int) {
 	dstNode := action.Node()
 
 	req := packReleaseSegmentRequest(task, action)
-	channel := ex.targetMgr.GetDmChannel(task.CollectionID(), task.Shard(), meta.CurrentTarget)
+	channel := ex.targetMgr.GetDmChannel(ctx, task.CollectionID(), task.Shard(), meta.CurrentTarget)
 	if channel != nil {
 		// if channel exists in current target, set cp to ReleaseSegmentRequest, need to use it as growing segment's exclude ts
 		req.Checkpoint = channel.GetSeekPosition()
 	}
 
-	if action.Scope() == querypb.DataScope_Streaming {
+	if action.Scope == querypb.DataScope_Streaming {
 		// Any modification to the segment distribution have to set NeedTransfer true,
 		// to protect the version, which serves search/query
 		req.NeedTransfer = true
 	} else {
 		req.Shard = task.shard
 
-		if ex.meta.CollectionManager.Exist(task.CollectionID()) {
+		if ex.meta.CollectionManager.Exist(ctx, task.CollectionID()) {
 			// get segment's replica first, then get shard leader by replica
-			replica := ex.meta.ReplicaManager.GetByCollectionAndNode(task.CollectionID(), action.Node())
+			replica := ex.meta.ReplicaManager.GetByCollectionAndNode(ctx, task.CollectionID(), action.Node())
 			if replica == nil {
-				msg := "node doesn't belong to any replica"
+				msg := "node doesn't belong to any replica, try to send release to worker"
 				err := merr.WrapErrNodeNotAvailable(action.Node())
 				log.Warn(msg, zap.Error(err))
-				return
+				dstNode = action.Node()
+				req.NeedTransfer = false
+			} else {
+				view := ex.dist.LeaderViewManager.GetLatestShardLeaderByFilter(meta.WithReplica2LeaderView(replica), meta.WithChannelName2LeaderView(action.Shard))
+				if view == nil {
+					msg := "no shard leader for the segment to execute releasing"
+					err := merr.WrapErrChannelNotFound(task.Shard(), "shard delegator not found")
+					log.Warn(msg, zap.Error(err))
+					return
+				}
+				dstNode = view.ID
+				log = log.With(zap.Int64("shardLeader", view.ID))
+				req.NeedTransfer = true
 			}
-			view := ex.dist.LeaderViewManager.GetLatestShardLeaderByFilter(meta.WithReplica2LeaderView(replica), meta.WithChannelName2LeaderView(action.Shard()))
-			if view == nil {
-				msg := "no shard leader for the segment to execute releasing"
-				err := merr.WrapErrChannelNotFound(task.Shard(), "shard delegator not found")
-				log.Warn(msg, zap.Error(err))
-				return
-			}
-
-			dstNode = view.ID
-			log = log.With(zap.Int64("shardLeader", view.ID))
-			req.NeedTransfer = true
 		}
 	}
 
@@ -340,28 +341,36 @@ func (ex *Executor) subscribeChannel(task *ChannelTask, step int) error {
 
 	collectionInfo, err := ex.broker.DescribeCollection(ctx, task.CollectionID())
 	if err != nil {
-		log.Warn("failed to get collection info")
+		log.Warn("failed to get collection info", zap.Error(err))
 		return err
 	}
-	partitions, err := utils.GetPartitions(ex.meta.CollectionManager, task.CollectionID())
+	loadFields := ex.meta.GetLoadFields(ctx, task.CollectionID())
+	partitions, err := utils.GetPartitions(ctx, ex.targetMgr, task.CollectionID())
 	if err != nil {
-		log.Warn("failed to get partitions of collection")
+		log.Warn("failed to get partitions of collection", zap.Error(err))
 		return err
 	}
 	indexInfo, err := ex.broker.ListIndexes(ctx, task.CollectionID())
 	if err != nil {
-		log.Warn("fail to get index meta of collection")
+		log.Warn("fail to get index meta of collection", zap.Error(err))
+		return err
+	}
+	dbResp, err := ex.broker.DescribeDatabase(ctx, collectionInfo.GetDbName())
+	if err != nil {
+		log.Warn("failed to get database info", zap.Error(err))
 		return err
 	}
 	loadMeta := packLoadMeta(
-		ex.meta.GetLoadType(task.CollectionID()),
+		ex.meta.GetLoadType(ctx, task.CollectionID()),
 		task.CollectionID(),
 		collectionInfo.GetDbName(),
 		task.ResourceGroup(),
+		loadFields,
 		partitions...,
 	)
+	loadMeta.DbProperties = dbResp.GetProperties()
 
-	dmChannel := ex.targetMgr.GetDmChannel(task.CollectionID(), action.ChannelName(), meta.NextTarget)
+	dmChannel := ex.targetMgr.GetDmChannel(ctx, task.CollectionID(), action.ChannelName(), meta.NextTarget)
 	if dmChannel == nil {
 		msg := "channel does not exist in next target, skip it"
 		log.Warn(msg, zap.String("channelName", action.ChannelName()))
@@ -459,6 +468,9 @@ func (ex *Executor) executeLeaderAction(task *LeaderTask, step int) {
 		ex.removeDistribution(task, step)
 
 	case ActionTypeUpdate:
+		ex.updatePartStatsVersions(task, step)
+
+	case ActionTypeStatsUpdate:
 		ex.updatePartStatsVersions(task, step)
 	}
 }
@@ -649,22 +661,24 @@ func (ex *Executor) getMetaInfo(ctx context.Context, task Task) (*milvuspb.Descr
 		log.Warn("failed to get collection info", zap.Error(err))
 		return nil, nil, nil, err
 	}
-	partitions, err := utils.GetPartitions(ex.meta.CollectionManager, collectionID)
+	loadFields := ex.meta.GetLoadFields(ctx, task.CollectionID())
+	partitions, err := utils.GetPartitions(ctx, ex.targetMgr, collectionID)
 	if err != nil {
 		log.Warn("failed to get partitions of collection", zap.Error(err))
 		return nil, nil, nil, err
 	}
 
 	loadMeta := packLoadMeta(
-		ex.meta.GetLoadType(task.CollectionID()),
+		ex.meta.GetLoadType(ctx, task.CollectionID()),
 		task.CollectionID(),
 		collectionInfo.GetDbName(),
 		task.ResourceGroup(),
+		loadFields,
 		partitions...,
 	)
 
 	// get channel first, in case of target updated after segment info fetched
-	channel := ex.targetMgr.GetDmChannel(collectionID, shard, meta.NextTargetFirst)
+	channel := ex.targetMgr.GetDmChannel(ctx, collectionID, shard, meta.NextTargetFirst)
 	if channel == nil {
 		return nil, nil, nil, merr.WrapErrChannelNotAvailable(shard)
 	}
@@ -674,12 +688,12 @@ func (ex *Executor) getMetaInfo(ctx context.Context, task Task) (*milvuspb.Descr
 
 func (ex *Executor) getLoadInfo(ctx context.Context, collectionID, segmentID int64, channel *meta.DmChannel) (*querypb.SegmentLoadInfo, []*indexpb.IndexInfo, error) {
 	log := log.Ctx(ctx)
-	resp, err := ex.broker.GetSegmentInfo(ctx, segmentID)
-	if err != nil || len(resp.GetInfos()) == 0 {
+	segmentInfos, err := ex.broker.GetSegmentInfo(ctx, segmentID)
+	if err != nil || len(segmentInfos) == 0 {
 		log.Warn("failed to get segment info from DataCoord", zap.Error(err))
 		return nil, nil, err
 	}
-	segment := resp.GetInfos()[0]
+	segment := segmentInfos[0]
 	log = log.With(zap.String("level", segment.GetLevel().String()))
 
 	indexes, err := ex.broker.GetIndexInfo(ctx, collectionID, segment.GetID())
@@ -698,7 +712,7 @@ func (ex *Executor) getLoadInfo(ctx context.Context, collectionID, segmentID int
 		return nil, nil, err
 	}
 	// update the field index params
-	for _, segmentIndex := range indexes {
+	for _, segmentIndex := range indexes[segment.GetID()] {
 		index, found := lo.Find(indexInfos, func(indexInfo *indexpb.IndexInfo) bool {
 			return indexInfo.IndexID == segmentIndex.IndexID
 		})
@@ -715,6 +729,6 @@ func (ex *Executor) getLoadInfo(ctx context.Context, collectionID, segmentID int
 		segmentIndex.IndexParams = funcutil.Map2KeyValuePair(params)
 	}
 
-	loadInfo := utils.PackSegmentLoadInfo(segment, channel.GetSeekPosition(), indexes)
+	loadInfo := utils.PackSegmentLoadInfo(segment, channel.GetSeekPosition(), indexes[segment.GetID()])
 	return loadInfo, indexInfos, nil
 }

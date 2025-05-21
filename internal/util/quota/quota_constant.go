@@ -24,9 +24,11 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/config"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/metrics"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 var (
@@ -50,6 +52,7 @@ func initLimitConfigMaps() {
 				internalpb.RateType_DMLBulkLoad:   &quotaConfig.DMLMaxBulkLoadRate,
 				internalpb.RateType_DQLSearch:     &quotaConfig.DQLMaxSearchRate,
 				internalpb.RateType_DQLQuery:      &quotaConfig.DQLMaxQueryRate,
+				internalpb.RateType_DDLDB:         &quotaConfig.MaxDBRate,
 			},
 			internalpb.RateScope_Database: {
 				internalpb.RateType_DDLCollection: &quotaConfig.DDLCollectionRatePerDB,
@@ -82,6 +85,20 @@ func initLimitConfigMaps() {
 				internalpb.RateType_DQLQuery:    &quotaConfig.DQLMaxQueryRatePerPartition,
 			},
 		}
+
+		pt := paramtable.Get()
+		pt.Watch(quotaConfig.DMLMaxInsertRate.Key, config.NewHandler(quotaConfig.DMLMaxInsertRate.Key, func(event *config.Event) {
+			metrics.MaxInsertRate.WithLabelValues(paramtable.GetStringNodeID(), "cluster").Set(quotaConfig.DMLMaxInsertRate.GetAsFloat())
+		}))
+		pt.Watch(quotaConfig.DMLMaxInsertRatePerDB.Key, config.NewHandler(quotaConfig.DMLMaxInsertRatePerDB.Key, func(event *config.Event) {
+			metrics.MaxInsertRate.WithLabelValues(paramtable.GetStringNodeID(), "db").Set(quotaConfig.DMLMaxInsertRatePerDB.GetAsFloat())
+		}))
+		pt.Watch(quotaConfig.DMLMaxInsertRatePerCollection.Key, config.NewHandler(quotaConfig.DMLMaxInsertRatePerCollection.Key, func(event *config.Event) {
+			metrics.MaxInsertRate.WithLabelValues(paramtable.GetStringNodeID(), "collection").Set(quotaConfig.DMLMaxInsertRatePerCollection.GetAsFloat())
+		}))
+		pt.Watch(quotaConfig.DMLMaxInsertRatePerPartition.Key, config.NewHandler(quotaConfig.DMLMaxInsertRatePerPartition.Key, func(event *config.Event) {
+			metrics.MaxInsertRate.WithLabelValues(paramtable.GetStringNodeID(), "partition").Set(quotaConfig.DMLMaxInsertRatePerPartition.GetAsFloat())
+		}))
 	})
 }
 

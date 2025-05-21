@@ -17,7 +17,7 @@
 package segments
 
 /*
-#cgo pkg-config: milvus_common milvus_segcore
+#cgo pkg-config: milvus_core
 
 #include "segcore/load_index_c.h"
 #include "common/binary_set_c.h"
@@ -26,23 +26,17 @@ import "C"
 
 import (
 	"context"
+	"fmt"
 	"runtime"
+	"time"
 	"unsafe"
 
-	"github.com/golang/protobuf/proto"
-	"github.com/pingcap/log"
-	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/internal/datacoord"
-	"github.com/milvus-io/milvus/internal/proto/cgopb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
-	"github.com/milvus-io/milvus/internal/querycoordv2/params"
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/util/indexparamcheck"
-	"github.com/milvus-io/milvus/pkg/util/indexparams"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/metrics"
+	"github.com/milvus-io/milvus/pkg/v2/proto/cgopb"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 // LoadIndexInfo is a wrapper of the underlying C-structure C.CLoadIndexInfo
@@ -71,67 +65,6 @@ func deleteLoadIndexInfo(info *LoadIndexInfo) {
 		C.DeleteLoadIndexInfo(info.cLoadIndexInfo)
 		return nil, nil
 	}).Await()
-}
-
-func isIndexMmapEnable(indexInfo *querypb.FieldIndexInfo) bool {
-	enableMmap := common.IsMmapEnabled(indexInfo.IndexParams...)
-	if !enableMmap {
-		_, ok := funcutil.KeyValuePair2Map(indexInfo.IndexParams)[common.MmapEnabledKey]
-		indexType := datacoord.GetIndexType(indexInfo.IndexParams)
-		indexSupportMmap := indexparamcheck.IsMmapSupported(indexType)
-		enableMmap = !ok && params.Params.QueryNodeCfg.MmapEnabled.GetAsBool() && indexSupportMmap
-	}
-	return enableMmap
-}
-
-func (li *LoadIndexInfo) appendLoadIndexInfo(ctx context.Context, indexInfo *querypb.FieldIndexInfo, collectionID int64, partitionID int64, segmentID int64, fieldType schemapb.DataType) error {
-	fieldID := indexInfo.FieldID
-	indexPaths := indexInfo.IndexFilePaths
-
-	indexParams := funcutil.KeyValuePair2Map(indexInfo.IndexParams)
-
-	enableMmap := isIndexMmapEnable(indexInfo)
-	// as Knowhere reports error if encounter a unknown param, we need to delete it
-	delete(indexParams, common.MmapEnabledKey)
-
-	mmapDirPath := paramtable.Get().QueryNodeCfg.MmapDirPath.GetValue()
-	err := li.appendFieldInfo(ctx, collectionID, partitionID, segmentID, fieldID, fieldType, enableMmap, mmapDirPath)
-	if err != nil {
-		return err
-	}
-
-	err = li.appendIndexInfo(ctx, indexInfo.IndexID, indexInfo.BuildID, indexInfo.IndexVersion)
-	if err != nil {
-		return err
-	}
-
-	// some build params also exist in indexParams, which are useless during loading process
-	if indexParams["index_type"] == indexparamcheck.IndexDISKANN {
-		err = indexparams.SetDiskIndexLoadParams(paramtable.Get(), indexParams, indexInfo.GetNumRows())
-		if err != nil {
-			return err
-		}
-	}
-
-	err = indexparams.AppendPrepareLoadParams(paramtable.Get(), indexParams)
-	if err != nil {
-		return err
-	}
-
-	log.Info("load with index params", zap.Any("indexParams", indexParams))
-	for key, value := range indexParams {
-		err = li.appendIndexParam(ctx, key, value)
-		if err != nil {
-			return err
-		}
-	}
-
-	if err := li.appendIndexEngineVersion(ctx, indexInfo.GetCurrentIndexVersion()); err != nil {
-		return err
-	}
-
-	err = li.appendIndexData(ctx, indexPaths)
-	return err
 }
 
 // appendIndexParam append indexParam to index
@@ -222,13 +155,9 @@ func (li *LoadIndexInfo) appendIndexData(ctx context.Context, indexKeys []string
 
 	var status C.CStatus
 	GetLoadPool().Submit(func() (any, error) {
-		if paramtable.Get().CommonCfg.EnableStorageV2.GetAsBool() {
-			status = C.AppendIndexV3(li.cLoadIndexInfo)
-		} else {
-			traceCtx := ParseCTraceContext(ctx)
-			status = C.AppendIndexV2(traceCtx.ctx, li.cLoadIndexInfo)
-			runtime.KeepAlive(traceCtx)
-		}
+		traceCtx := ParseCTraceContext(ctx)
+		status = C.AppendIndexV2(traceCtx.ctx, li.cLoadIndexInfo)
+		runtime.KeepAlive(traceCtx)
 		return nil, nil
 	}).Await()
 
@@ -248,7 +177,7 @@ func (li *LoadIndexInfo) appendIndexEngineVersion(ctx context.Context, indexEngi
 	return HandleCStatus(ctx, &status, "AppendIndexEngineVersion failed")
 }
 
-func (li *LoadIndexInfo) finish(ctx context.Context, info *cgopb.LoadIndexInfo) error {
+func (li *LoadIndexInfo) appendLoadIndexInfo(ctx context.Context, info *cgopb.LoadIndexInfo) error {
 	marshaled, err := proto.Marshal(info)
 	if err != nil {
 		return err
@@ -260,18 +189,23 @@ func (li *LoadIndexInfo) finish(ctx context.Context, info *cgopb.LoadIndexInfo) 
 		return nil, nil
 	}).Await()
 
-	if err := HandleCStatus(ctx, &status, "FinishLoadIndexInfo failed"); err != nil {
-		return err
-	}
+	return HandleCStatus(ctx, &status, "FinishLoadIndexInfo failed")
+}
 
+func (li *LoadIndexInfo) loadIndex(ctx context.Context) error {
+	var status C.CStatus
 	_, _ = GetLoadPool().Submit(func() (any, error) {
-		if paramtable.Get().CommonCfg.EnableStorageV2.GetAsBool() {
-			status = C.AppendIndexV3(li.cLoadIndexInfo)
-		} else {
-			traceCtx := ParseCTraceContext(ctx)
-			status = C.AppendIndexV2(traceCtx.ctx, li.cLoadIndexInfo)
-			runtime.KeepAlive(traceCtx)
-		}
+		start := time.Now()
+		defer func() {
+			metrics.QueryNodeCGOCallLatency.WithLabelValues(
+				fmt.Sprint(paramtable.GetNodeID()),
+				"AppendIndexV2",
+				"Sync",
+			).Observe(float64(time.Since(start).Milliseconds()))
+		}()
+		traceCtx := ParseCTraceContext(ctx)
+		status = C.AppendIndexV2(traceCtx.ctx, li.cLoadIndexInfo)
+		runtime.KeepAlive(traceCtx)
 		return nil, nil
 	}).Await()
 

@@ -19,12 +19,17 @@
 #include <cassert>
 #include <memory>
 
-#include "exec/operator/CallbackSink.h"
-#include "exec/operator/FilterBits.h"
-#include "exec/operator/Operator.h"
-#include "exec/Task.h"
-
 #include "common/EasyAssert.h"
+#include "exec/operator/CallbackSink.h"
+#include "exec/operator/CountNode.h"
+#include "exec/operator/FilterBitsNode.h"
+#include "exec/operator/IterativeFilterNode.h"
+#include "exec/operator/MvccNode.h"
+#include "exec/operator/Operator.h"
+#include "exec/operator/VectorSearchNode.h"
+#include "exec/operator/RandomSampleNode.h"
+#include "exec/operator/GroupByNode.h"
+#include "exec/Task.h"
 
 namespace milvus {
 namespace exec {
@@ -47,11 +52,41 @@ DriverFactory::CreateDriver(std::unique_ptr<DriverContext> ctx,
     for (size_t i = 0; i < plannodes_.size(); ++i) {
         auto id = operators.size();
         auto plannode = plannodes_[i];
-        if (auto filternode =
+        if (auto filterbitsnode =
                 std::dynamic_pointer_cast<const plan::FilterBitsNode>(
                     plannode)) {
+            operators.push_back(std::make_unique<PhyFilterBitsNode>(
+                id, ctx.get(), filterbitsnode));
+        } else if (auto filternode =
+                       std::dynamic_pointer_cast<const plan::FilterNode>(
+                           plannode)) {
+            operators.push_back(std::make_unique<PhyIterativeFilterNode>(
+                id, ctx.get(), filternode));
+        } else if (auto mvccnode =
+                       std::dynamic_pointer_cast<const plan::MvccNode>(
+                           plannode)) {
             operators.push_back(
-                std::make_unique<FilterBits>(id, ctx.get(), filternode));
+                std::make_unique<PhyMvccNode>(id, ctx.get(), mvccnode));
+        } else if (auto countnode =
+                       std::dynamic_pointer_cast<const plan::CountNode>(
+                           plannode)) {
+            operators.push_back(
+                std::make_unique<PhyCountNode>(id, ctx.get(), countnode));
+        } else if (auto vectorsearchnode =
+                       std::dynamic_pointer_cast<const plan::VectorSearchNode>(
+                           plannode)) {
+            operators.push_back(std::make_unique<PhyVectorSearchNode>(
+                id, ctx.get(), vectorsearchnode));
+        } else if (auto groupbynode =
+                       std::dynamic_pointer_cast<const plan::GroupByNode>(
+                           plannode)) {
+            operators.push_back(
+                std::make_unique<PhyGroupByNode>(id, ctx.get(), groupbynode));
+        } else if (auto samplenode =
+                       std::dynamic_pointer_cast<const plan::RandomSampleNode>(
+                           plannode)) {
+            operators.push_back(std::make_unique<PhyRandomSampleNode>(
+                id, ctx.get(), samplenode));
         }
         // TODO: add more operators
     }
@@ -141,27 +176,21 @@ Driver::Next(std::shared_ptr<BlockingState>& blocking_state) {
     return result;
 }
 
-#define CALL_OPERATOR(call_func, operator, method_name)                        \
-    try {                                                                      \
-        call_func;                                                             \
-    } catch (SegcoreError & e) {                                               \
-        auto err_msg = fmt::format(                                            \
-            "Operator::{} failed for [Operator:{}, plan node id: "             \
-            "{}] : {}",                                                        \
-            method_name,                                                       \
-            operator->get_operator_type(),                                     \
-            operator->get_plannode_id(),                                       \
-            e.what());                                                         \
-        LOG_ERROR(err_msg);                                                    \
-        throw ExecOperatorException(err_msg);                                  \
-    } catch (std::exception & e) {                                             \
-        throw ExecOperatorException(                                           \
-            fmt::format("Operator::{} failed for [Operator:{}, plan node id: " \
-                        "{}] : {}",                                            \
-                        method_name,                                           \
-                        operator->get_operator_type(),                         \
-                        operator->get_plannode_id(),                           \
-                        e.what()));                                            \
+#define CALL_OPERATOR(call_func, operator, method_name)            \
+    try {                                                          \
+        call_func;                                                 \
+    } catch (std::exception & e) {                                 \
+        std::string stack_trace = milvus::impl::EasyStackTrace();  \
+        auto err_msg = fmt::format(                                \
+            "Operator::{} failed for [Operator:{}, plan node id: " \
+            "{}] : {}\nStack trace: {}",                           \
+            method_name,                                           \
+            operator->ToString(),                                  \
+            operator->get_plannode_id(),                           \
+            e.what(),                                              \
+            stack_trace);                                          \
+        LOG_ERROR(err_msg);                                        \
+        throw ExecOperatorException(err_msg);                      \
     }
 
 StopReason

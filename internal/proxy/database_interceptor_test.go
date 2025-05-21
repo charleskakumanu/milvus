@@ -4,13 +4,14 @@ import (
 	"context"
 	"testing"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/encoding/prototext"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
-	"github.com/milvus-io/milvus/pkg/util"
+	"github.com/milvus-io/milvus/pkg/v2/util"
 )
 
 func TestDatabaseInterceptor(t *testing.T) {
@@ -56,6 +57,7 @@ func TestDatabaseInterceptor(t *testing.T) {
 			&milvuspb.GetCollectionStatisticsRequest{},
 			&milvuspb.ShowCollectionsRequest{},
 			&milvuspb.AlterCollectionRequest{},
+			&milvuspb.AlterCollectionFieldRequest{},
 			&milvuspb.CreatePartitionRequest{},
 			&milvuspb.DropPartitionRequest{},
 			&milvuspb.HasPartitionRequest{},
@@ -93,6 +95,7 @@ func TestDatabaseInterceptor(t *testing.T) {
 			&milvuspb.ListImportTasksRequest{},
 			&milvuspb.OperatePrivilegeRequest{Entity: &milvuspb.GrantEntity{}},
 			&milvuspb.SelectGrantRequest{Entity: &milvuspb.GrantEntity{}},
+			&milvuspb.ManualCompactionRequest{},
 		}
 
 		md := metadata.Pairs(util.HeaderDBName, "db")
@@ -116,7 +119,6 @@ func TestDatabaseInterceptor(t *testing.T) {
 			&milvuspb.CalcDistanceRequest{},
 			&milvuspb.FlushAllRequest{},
 			&milvuspb.GetCompactionStateRequest{},
-			&milvuspb.ManualCompactionRequest{},
 			&milvuspb.GetCompactionPlansRequest{},
 			&milvuspb.GetFlushAllStateRequest{},
 			&milvuspb.GetImportStateRequest{},
@@ -133,7 +135,7 @@ func TestDatabaseInterceptor(t *testing.T) {
 			assert.NoError(t, err)
 
 			if len(after) != len(before) {
-				t.Errorf("req has been modified:%s", req.String())
+				t.Errorf("req has been modified:%s", prototext.Format(req))
 			}
 		}
 	})

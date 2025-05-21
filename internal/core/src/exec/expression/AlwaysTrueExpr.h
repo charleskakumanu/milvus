@@ -47,11 +47,29 @@ class PhyAlwaysTrueExpr : public Expr {
 
     void
     MoveCursor() override {
-        int64_t real_batch_size = current_pos_ + batch_size_ >= active_count_
-                                      ? active_count_ - current_pos_
-                                      : batch_size_;
+        if (!has_offset_input_) {
+            int64_t real_batch_size =
+                current_pos_ + batch_size_ >= active_count_
+                    ? active_count_ - current_pos_
+                    : batch_size_;
 
-        current_pos_ += real_batch_size;
+            current_pos_ += real_batch_size;
+        }
+    }
+
+    std::string
+    ToString() const override {
+        return "[AlwaysTrue]";
+    }
+
+    bool
+    IsSource() const override {
+        return true;
+    }
+
+    std::optional<milvus::expr::ColumnInfo>
+    GetColumnInfo() const override {
+        return std::nullopt;
     }
 
  private:

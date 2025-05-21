@@ -18,25 +18,23 @@ package querycoordv2
 
 import (
 	"context"
-	"encoding/json"
 	"sort"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/samber/lo"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/rgpb"
+	"github.com/milvus-io/milvus/internal/json"
 	etcdkv "github.com/milvus-io/milvus/internal/kv/etcd"
 	"github.com/milvus-io/milvus/internal/metastore"
 	"github.com/milvus-io/milvus/internal/metastore/kv/querycoord"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/querycoordv2/balance"
 	"github.com/milvus-io/milvus/internal/querycoordv2/checkers"
 	"github.com/milvus-io/milvus/internal/querycoordv2/dist"
@@ -47,13 +45,17 @@ import (
 	"github.com/milvus-io/milvus/internal/querycoordv2/session"
 	"github.com/milvus-io/milvus/internal/querycoordv2/task"
 	"github.com/milvus-io/milvus/internal/querycoordv2/utils"
+	"github.com/milvus-io/milvus/internal/util/proxyutil"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
-	"github.com/milvus-io/milvus/pkg/kv"
-	"github.com/milvus-io/milvus/pkg/util/etcd"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/metricsinfo"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/kv"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/etcd"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 type ServiceSuite struct {
@@ -85,6 +87,8 @@ type ServiceSuite struct {
 
 	distMgr        *meta.DistributionManager
 	distController *dist.MockController
+
+	proxyManager *proxyutil.MockProxyClientManager
 
 	// Test object
 	server *Server
@@ -124,6 +128,10 @@ func (suite *ServiceSuite) SetupSuite() {
 		1, 2, 3, 4, 5,
 		101, 102, 103, 104, 105,
 	}
+
+	suite.proxyManager = proxyutil.NewMockProxyClientManager(suite.T())
+	suite.proxyManager.EXPECT().InvalidateCollectionMetaCache(mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+	suite.proxyManager.EXPECT().InvalidateShardLeaderCache(mock.Anything, mock.Anything).Return(nil).Maybe()
 }
 
 func (suite *ServiceSuite) SetupTest() {
@@ -145,12 +153,15 @@ func (suite *ServiceSuite) SetupTest() {
 	suite.meta = meta.NewMeta(params.RandomIncrementIDAllocator(), suite.store, suite.nodeMgr)
 	suite.broker = meta.NewMockBroker(suite.T())
 	suite.targetMgr = meta.NewTargetManager(suite.broker, suite.meta)
+	suite.cluster = session.NewMockCluster(suite.T())
+	suite.cluster.EXPECT().SyncDistribution(mock.Anything, mock.Anything, mock.Anything).Return(merr.Success(), nil).Maybe()
 	suite.targetObserver = observers.NewTargetObserver(
 		suite.meta,
 		suite.targetMgr,
 		suite.dist,
 		suite.broker,
 		suite.cluster,
+		suite.nodeMgr,
 	)
 	suite.targetObserver.Start()
 	for _, node := range suite.nodes {
@@ -159,12 +170,12 @@ func (suite *ServiceSuite) SetupTest() {
 			Address:  "localhost",
 			Hostname: "localhost",
 		}))
-		suite.meta.ResourceManager.HandleNodeUp(node)
+		suite.meta.ResourceManager.HandleNodeUp(context.TODO(), node)
 	}
-	suite.cluster = session.NewMockCluster(suite.T())
-	suite.cluster.EXPECT().SyncDistribution(mock.Anything, mock.Anything, mock.Anything).Return(merr.Success(), nil).Maybe()
 	suite.jobScheduler = job.NewScheduler()
 	suite.taskScheduler = task.NewMockScheduler(suite.T())
+	suite.taskScheduler.EXPECT().GetSegmentTaskDelta(mock.Anything, mock.Anything).Return(0).Maybe()
+	suite.taskScheduler.EXPECT().GetChannelTaskDelta(mock.Anything, mock.Anything).Return(0).Maybe()
 	suite.jobScheduler.Start()
 	suite.balancer = balance.NewRowCountBasedBalancer(
 		suite.taskScheduler,
@@ -183,6 +194,7 @@ func (suite *ServiceSuite) SetupTest() {
 		suite.targetMgr,
 		suite.targetObserver,
 		&checkers.CheckerController{},
+		suite.proxyManager,
 	)
 	suite.collectionObserver.Start()
 
@@ -204,8 +216,11 @@ func (suite *ServiceSuite) SetupTest() {
 		getBalancerFunc:     func() balance.Balance { return suite.balancer },
 		distController:      suite.distController,
 		ctx:                 context.Background(),
+		metricsRequest:      metricsinfo.NewMetricsRequest(),
+		proxyClientManager:  suite.proxyManager,
 	}
 
+	suite.server.registerMetricsRequest()
 	suite.server.UpdateStateCode(commonpb.StateCode_Healthy)
 
 	suite.broker.EXPECT().GetCollectionLoadInfo(mock.Anything, mock.Anything).Return([]string{meta.DefaultResourceGroupName}, 1, nil).Maybe()
@@ -219,7 +234,7 @@ func (suite *ServiceSuite) TestShowCollections() {
 
 	// Test get all collections
 	req := &querypb.ShowCollectionsRequest{}
-	resp, err := server.ShowCollections(ctx, req)
+	resp, err := server.ShowLoadCollections(ctx, req)
 	suite.NoError(err)
 	suite.Equal(commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	suite.Len(resp.CollectionIDs, collectionNum)
@@ -230,27 +245,27 @@ func (suite *ServiceSuite) TestShowCollections() {
 	// Test get 1 collection
 	collection := suite.collections[0]
 	req.CollectionIDs = []int64{collection}
-	resp, err = server.ShowCollections(ctx, req)
+	resp, err = server.ShowLoadCollections(ctx, req)
 	suite.NoError(err)
 	suite.Equal(commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	suite.Len(resp.CollectionIDs, 1)
 	suite.Equal(collection, resp.CollectionIDs[0])
 
 	// Test insufficient memory
-	colBak := suite.meta.CollectionManager.GetCollection(collection)
-	err = suite.meta.CollectionManager.RemoveCollection(collection)
+	colBak := suite.meta.CollectionManager.GetCollection(ctx, collection)
+	err = suite.meta.CollectionManager.RemoveCollection(ctx, collection)
 	suite.NoError(err)
 	meta.GlobalFailedLoadCache.Put(collection, merr.WrapErrServiceMemoryLimitExceeded(100, 10))
-	resp, err = server.ShowCollections(ctx, req)
+	resp, err = server.ShowLoadCollections(ctx, req)
 	suite.NoError(err)
 	suite.Equal(commonpb.ErrorCode_InsufficientMemoryToLoad, resp.GetStatus().GetErrorCode())
 	meta.GlobalFailedLoadCache.Remove(collection)
-	err = suite.meta.CollectionManager.PutCollection(colBak)
+	err = suite.meta.CollectionManager.PutCollection(ctx, colBak)
 	suite.NoError(err)
 
 	// Test when server is not healthy
 	server.UpdateStateCode(commonpb.StateCode_Initializing)
-	resp, err = server.ShowCollections(ctx, req)
+	resp, err = server.ShowLoadCollections(ctx, req)
 	suite.NoError(err)
 	suite.Equal(resp.GetStatus().GetCode(), merr.Code(merr.ErrServiceNotReady))
 }
@@ -268,7 +283,7 @@ func (suite *ServiceSuite) TestShowPartitions() {
 		req := &querypb.ShowPartitionsRequest{
 			CollectionID: collection,
 		}
-		resp, err := server.ShowPartitions(ctx, req)
+		resp, err := server.ShowLoadPartitions(ctx, req)
 		suite.NoError(err)
 		suite.Equal(commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		suite.Len(resp.PartitionIDs, partitionNum)
@@ -281,7 +296,7 @@ func (suite *ServiceSuite) TestShowPartitions() {
 			CollectionID: collection,
 			PartitionIDs: partitions[0:1],
 		}
-		resp, err = server.ShowPartitions(ctx, req)
+		resp, err = server.ShowLoadPartitions(ctx, req)
 		suite.NoError(err)
 		suite.Equal(commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		suite.Len(resp.PartitionIDs, 1)
@@ -291,27 +306,29 @@ func (suite *ServiceSuite) TestShowPartitions() {
 
 		// Test insufficient memory
 		if suite.loadTypes[collection] == querypb.LoadType_LoadCollection {
-			colBak := suite.meta.CollectionManager.GetCollection(collection)
-			err = suite.meta.CollectionManager.RemoveCollection(collection)
+			colBak := suite.meta.CollectionManager.GetCollection(ctx, collection)
+			err = suite.meta.CollectionManager.RemoveCollection(ctx, collection)
 			suite.NoError(err)
 			meta.GlobalFailedLoadCache.Put(collection, merr.WrapErrServiceMemoryLimitExceeded(100, 10))
-			resp, err = server.ShowPartitions(ctx, req)
+			resp, err = server.ShowLoadPartitions(ctx, req)
 			suite.NoError(err)
-			suite.Equal(commonpb.ErrorCode_InsufficientMemoryToLoad, resp.GetStatus().GetErrorCode())
+			err := merr.CheckRPCCall(resp, err)
+			assert.True(suite.T(), errors.Is(err, merr.ErrPartitionNotLoaded))
 			meta.GlobalFailedLoadCache.Remove(collection)
-			err = suite.meta.CollectionManager.PutCollection(colBak)
+			err = suite.meta.CollectionManager.PutCollection(ctx, colBak)
 			suite.NoError(err)
 		} else {
 			partitionID := partitions[0]
-			parBak := suite.meta.CollectionManager.GetPartition(partitionID)
-			err = suite.meta.CollectionManager.RemovePartition(collection, partitionID)
+			parBak := suite.meta.CollectionManager.GetPartition(ctx, partitionID)
+			err = suite.meta.CollectionManager.RemovePartition(ctx, collection, partitionID)
 			suite.NoError(err)
 			meta.GlobalFailedLoadCache.Put(collection, merr.WrapErrServiceMemoryLimitExceeded(100, 10))
-			resp, err = server.ShowPartitions(ctx, req)
+			resp, err = server.ShowLoadPartitions(ctx, req)
 			suite.NoError(err)
-			suite.Equal(commonpb.ErrorCode_InsufficientMemoryToLoad, resp.GetStatus().GetErrorCode())
+			err := merr.CheckRPCCall(resp, err)
+			assert.True(suite.T(), errors.Is(err, merr.ErrPartitionNotLoaded))
 			meta.GlobalFailedLoadCache.Remove(collection)
-			err = suite.meta.CollectionManager.PutPartition(parBak)
+			err = suite.meta.CollectionManager.PutPartition(ctx, parBak)
 			suite.NoError(err)
 		}
 	}
@@ -321,7 +338,7 @@ func (suite *ServiceSuite) TestShowPartitions() {
 		CollectionID: suite.collections[0],
 	}
 	server.UpdateStateCode(commonpb.StateCode_Initializing)
-	resp, err := server.ShowPartitions(ctx, req)
+	resp, err := server.ShowLoadPartitions(ctx, req)
 	suite.NoError(err)
 	suite.Equal(resp.GetStatus().GetCode(), merr.Code(merr.ErrServiceNotReady))
 }
@@ -332,8 +349,9 @@ func (suite *ServiceSuite) TestLoadCollection() {
 
 	// Test load all collections
 	for _, collection := range suite.collections {
+		suite.broker.EXPECT().DescribeCollection(mock.Anything, mock.Anything).
+			Return(nil, nil)
 		suite.expectGetRecoverInfo(collection)
-		suite.expectLoadPartitions()
 
 		req := &querypb.LoadCollectionRequest{
 			CollectionID: collection,
@@ -341,7 +359,7 @@ func (suite *ServiceSuite) TestLoadCollection() {
 		resp, err := server.LoadCollection(ctx, req)
 		suite.NoError(err)
 		suite.Equal(commonpb.ErrorCode_Success, resp.ErrorCode)
-		suite.assertLoaded(collection)
+		suite.assertLoaded(ctx, collection)
 	}
 
 	// Test load again
@@ -417,21 +435,21 @@ func (suite *ServiceSuite) TestResourceGroup() {
 		Address:  "localhost",
 		Hostname: "localhost",
 	}))
-	server.meta.ResourceManager.AddResourceGroup("rg11", &rgpb.ResourceGroupConfig{
+	server.meta.ResourceManager.AddResourceGroup(ctx, "rg11", &rgpb.ResourceGroupConfig{
 		Requests: &rgpb.ResourceGroupLimit{NodeNum: 2},
 		Limits:   &rgpb.ResourceGroupLimit{NodeNum: 2},
 	})
-	server.meta.ResourceManager.HandleNodeUp(1011)
-	server.meta.ResourceManager.HandleNodeUp(1012)
-	server.meta.ResourceManager.AddResourceGroup("rg12", &rgpb.ResourceGroupConfig{
+	server.meta.ResourceManager.HandleNodeUp(ctx, 1011)
+	server.meta.ResourceManager.HandleNodeUp(ctx, 1012)
+	server.meta.ResourceManager.AddResourceGroup(ctx, "rg12", &rgpb.ResourceGroupConfig{
 		Requests: &rgpb.ResourceGroupLimit{NodeNum: 2},
 		Limits:   &rgpb.ResourceGroupLimit{NodeNum: 2},
 	})
-	server.meta.ResourceManager.HandleNodeUp(1013)
-	server.meta.ResourceManager.HandleNodeUp(1014)
-	server.meta.CollectionManager.PutCollection(utils.CreateTestCollection(1, 1))
-	server.meta.CollectionManager.PutCollection(utils.CreateTestCollection(2, 1))
-	server.meta.ReplicaManager.Put(meta.NewReplica(&querypb.Replica{
+	server.meta.ResourceManager.HandleNodeUp(ctx, 1013)
+	server.meta.ResourceManager.HandleNodeUp(ctx, 1014)
+	server.meta.CollectionManager.PutCollection(ctx, utils.CreateTestCollection(1, 1))
+	server.meta.CollectionManager.PutCollection(ctx, utils.CreateTestCollection(2, 1))
+	server.meta.ReplicaManager.Put(ctx, meta.NewReplica(&querypb.Replica{
 		ID:            1,
 		CollectionID:  1,
 		Nodes:         []int64{1011},
@@ -440,7 +458,7 @@ func (suite *ServiceSuite) TestResourceGroup() {
 	},
 		typeutil.NewUniqueSet(1011, 1013)),
 	)
-	server.meta.ReplicaManager.Put(meta.NewReplica(&querypb.Replica{
+	server.meta.ReplicaManager.Put(ctx, meta.NewReplica(&querypb.Replica{
 		ID:            2,
 		CollectionID:  2,
 		Nodes:         []int64{1014},
@@ -535,18 +553,18 @@ func (suite *ServiceSuite) TestTransferNode() {
 	defer server.resourceObserver.Stop()
 	defer server.replicaObserver.Stop()
 
-	err := server.meta.ResourceManager.AddResourceGroup("rg1", &rgpb.ResourceGroupConfig{
+	err := server.meta.ResourceManager.AddResourceGroup(ctx, "rg1", &rgpb.ResourceGroupConfig{
 		Requests: &rgpb.ResourceGroupLimit{NodeNum: 0},
 		Limits:   &rgpb.ResourceGroupLimit{NodeNum: 0},
 	})
 	suite.NoError(err)
-	err = server.meta.ResourceManager.AddResourceGroup("rg2", &rgpb.ResourceGroupConfig{
+	err = server.meta.ResourceManager.AddResourceGroup(ctx, "rg2", &rgpb.ResourceGroupConfig{
 		Requests: &rgpb.ResourceGroupLimit{NodeNum: 0},
 		Limits:   &rgpb.ResourceGroupLimit{NodeNum: 0},
 	})
 	suite.NoError(err)
-	suite.meta.CollectionManager.PutCollection(utils.CreateTestCollection(1, 2))
-	suite.meta.ReplicaManager.Put(meta.NewReplica(
+	suite.meta.CollectionManager.PutCollection(ctx, utils.CreateTestCollection(1, 2))
+	suite.meta.ReplicaManager.Put(ctx, meta.NewReplica(
 		&querypb.Replica{
 			ID:            1,
 			CollectionID:  1,
@@ -565,15 +583,15 @@ func (suite *ServiceSuite) TestTransferNode() {
 	suite.Equal(commonpb.ErrorCode_Success, resp.ErrorCode)
 
 	suite.Eventually(func() bool {
-		nodes, err := server.meta.ResourceManager.GetNodes("rg1")
+		nodes, err := server.meta.ResourceManager.GetNodes(ctx, "rg1")
 		if err != nil || len(nodes) != 1 {
 			return false
 		}
-		nodesInReplica := server.meta.ReplicaManager.Get(1).GetNodes()
+		nodesInReplica := server.meta.ReplicaManager.Get(ctx, 1).GetNodes()
 		return len(nodesInReplica) == 1
 	}, 5*time.Second, 100*time.Millisecond)
 
-	suite.meta.ReplicaManager.Put(meta.NewReplica(
+	suite.meta.ReplicaManager.Put(ctx, meta.NewReplica(
 		&querypb.Replica{
 			ID:            2,
 			CollectionID:  1,
@@ -599,12 +617,12 @@ func (suite *ServiceSuite) TestTransferNode() {
 	suite.NoError(err)
 	suite.Equal(commonpb.ErrorCode_IllegalArgument, resp.ErrorCode)
 
-	err = server.meta.ResourceManager.AddResourceGroup("rg3", &rgpb.ResourceGroupConfig{
+	err = server.meta.ResourceManager.AddResourceGroup(ctx, "rg3", &rgpb.ResourceGroupConfig{
 		Requests: &rgpb.ResourceGroupLimit{NodeNum: 4},
 		Limits:   &rgpb.ResourceGroupLimit{NodeNum: 4},
 	})
 	suite.NoError(err)
-	err = server.meta.ResourceManager.AddResourceGroup("rg4", &rgpb.ResourceGroupConfig{
+	err = server.meta.ResourceManager.AddResourceGroup(ctx, "rg4", &rgpb.ResourceGroupConfig{
 		Requests: &rgpb.ResourceGroupLimit{NodeNum: 0},
 		Limits:   &rgpb.ResourceGroupLimit{NodeNum: 0},
 	})
@@ -629,10 +647,10 @@ func (suite *ServiceSuite) TestTransferNode() {
 		Address:  "localhost",
 		Hostname: "localhost",
 	}))
-	suite.meta.ResourceManager.HandleNodeUp(11)
-	suite.meta.ResourceManager.HandleNodeUp(12)
-	suite.meta.ResourceManager.HandleNodeUp(13)
-	suite.meta.ResourceManager.HandleNodeUp(14)
+	suite.meta.ResourceManager.HandleNodeUp(ctx, 11)
+	suite.meta.ResourceManager.HandleNodeUp(ctx, 12)
+	suite.meta.ResourceManager.HandleNodeUp(ctx, 13)
+	suite.meta.ResourceManager.HandleNodeUp(ctx, 14)
 
 	resp, err = server.TransferNode(ctx, &milvuspb.TransferNodeRequest{
 		SourceResourceGroup: "rg3",
@@ -643,11 +661,11 @@ func (suite *ServiceSuite) TestTransferNode() {
 	suite.Equal(commonpb.ErrorCode_Success, resp.ErrorCode)
 
 	suite.Eventually(func() bool {
-		nodes, err := server.meta.ResourceManager.GetNodes("rg3")
+		nodes, err := server.meta.ResourceManager.GetNodes(ctx, "rg3")
 		if err != nil || len(nodes) != 1 {
 			return false
 		}
-		nodes, err = server.meta.ResourceManager.GetNodes("rg4")
+		nodes, err = server.meta.ResourceManager.GetNodes(ctx, "rg4")
 		return err == nil && len(nodes) == 3
 	}, 5*time.Second, 100*time.Millisecond)
 
@@ -682,17 +700,17 @@ func (suite *ServiceSuite) TestTransferReplica() {
 	ctx := context.Background()
 	server := suite.server
 
-	err := server.meta.ResourceManager.AddResourceGroup("rg1", &rgpb.ResourceGroupConfig{
+	err := server.meta.ResourceManager.AddResourceGroup(ctx, "rg1", &rgpb.ResourceGroupConfig{
 		Requests: &rgpb.ResourceGroupLimit{NodeNum: 1},
 		Limits:   &rgpb.ResourceGroupLimit{NodeNum: 1},
 	})
 	suite.NoError(err)
-	err = server.meta.ResourceManager.AddResourceGroup("rg2", &rgpb.ResourceGroupConfig{
+	err = server.meta.ResourceManager.AddResourceGroup(ctx, "rg2", &rgpb.ResourceGroupConfig{
 		Requests: &rgpb.ResourceGroupLimit{NodeNum: 1},
 		Limits:   &rgpb.ResourceGroupLimit{NodeNum: 1},
 	})
 	suite.NoError(err)
-	err = server.meta.ResourceManager.AddResourceGroup("rg3", &rgpb.ResourceGroupConfig{
+	err = server.meta.ResourceManager.AddResourceGroup(ctx, "rg3", &rgpb.ResourceGroupConfig{
 		Requests: &rgpb.ResourceGroupLimit{NodeNum: 3},
 		Limits:   &rgpb.ResourceGroupLimit{NodeNum: 3},
 	})
@@ -734,17 +752,17 @@ func (suite *ServiceSuite) TestTransferReplica() {
 	suite.NoError(err)
 	suite.ErrorIs(merr.Error(resp), merr.ErrParameterInvalid)
 
-	suite.server.meta.Put(meta.NewReplica(&querypb.Replica{
+	suite.server.meta.Put(ctx, meta.NewReplica(&querypb.Replica{
 		CollectionID:  1,
 		ID:            111,
 		ResourceGroup: meta.DefaultResourceGroupName,
 	}, typeutil.NewUniqueSet(1)))
-	suite.server.meta.Put(meta.NewReplica(&querypb.Replica{
+	suite.server.meta.Put(ctx, meta.NewReplica(&querypb.Replica{
 		CollectionID:  1,
 		ID:            222,
 		ResourceGroup: meta.DefaultResourceGroupName,
 	}, typeutil.NewUniqueSet(2)))
-	suite.server.meta.Put(meta.NewReplica(&querypb.Replica{
+	suite.server.meta.Put(ctx, meta.NewReplica(&querypb.Replica{
 		CollectionID:  1,
 		ID:            333,
 		ResourceGroup: meta.DefaultResourceGroupName,
@@ -775,18 +793,18 @@ func (suite *ServiceSuite) TestTransferReplica() {
 		Address:  "localhost",
 		Hostname: "localhost",
 	}))
-	suite.server.meta.HandleNodeUp(1001)
-	suite.server.meta.HandleNodeUp(1002)
-	suite.server.meta.HandleNodeUp(1003)
-	suite.server.meta.HandleNodeUp(1004)
-	suite.server.meta.HandleNodeUp(1005)
+	suite.server.meta.HandleNodeUp(ctx, 1001)
+	suite.server.meta.HandleNodeUp(ctx, 1002)
+	suite.server.meta.HandleNodeUp(ctx, 1003)
+	suite.server.meta.HandleNodeUp(ctx, 1004)
+	suite.server.meta.HandleNodeUp(ctx, 1005)
 
-	suite.server.meta.Put(meta.NewReplica(&querypb.Replica{
+	suite.server.meta.Put(ctx, meta.NewReplica(&querypb.Replica{
 		CollectionID:  2,
 		ID:            444,
 		ResourceGroup: meta.DefaultResourceGroupName,
 	}, typeutil.NewUniqueSet(3)))
-	suite.server.meta.Put(meta.NewReplica(&querypb.Replica{
+	suite.server.meta.Put(ctx, meta.NewReplica(&querypb.Replica{
 		CollectionID:  2,
 		ID:            555,
 		ResourceGroup: "rg2",
@@ -811,7 +829,7 @@ func (suite *ServiceSuite) TestTransferReplica() {
 	// we support transfer replica to resource group load same collection.
 	suite.Equal(resp.ErrorCode, commonpb.ErrorCode_Success)
 
-	replicaNum := len(suite.server.meta.ReplicaManager.GetByCollection(1))
+	replicaNum := len(suite.server.meta.ReplicaManager.GetByCollection(ctx, 1))
 	suite.Equal(3, replicaNum)
 	resp, err = suite.server.TransferReplica(ctx, &querypb.TransferReplicaRequest{
 		SourceResourceGroup: meta.DefaultResourceGroupName,
@@ -829,7 +847,7 @@ func (suite *ServiceSuite) TestTransferReplica() {
 	})
 	suite.NoError(err)
 	suite.Equal(resp.ErrorCode, commonpb.ErrorCode_Success)
-	suite.Len(suite.server.meta.GetByResourceGroup("rg3"), 3)
+	suite.Len(suite.server.meta.GetByResourceGroup(ctx, "rg3"), 3)
 
 	// server unhealthy
 	server.UpdateStateCode(commonpb.StateCode_Abnormal)
@@ -843,65 +861,14 @@ func (suite *ServiceSuite) TestTransferReplica() {
 	suite.ErrorIs(merr.Error(resp), merr.ErrServiceNotReady)
 }
 
-func (suite *ServiceSuite) TestLoadCollectionFailed() {
-	suite.loadAll()
-	ctx := context.Background()
-	server := suite.server
-
-	// Test load with different replica number
-	for _, collection := range suite.collections {
-		req := &querypb.LoadCollectionRequest{
-			CollectionID:  collection,
-			ReplicaNumber: suite.replicaNumber[collection] + 1,
-		}
-		resp, err := server.LoadCollection(ctx, req)
-		suite.NoError(err)
-		suite.ErrorIs(merr.Error(resp), merr.ErrParameterInvalid)
-	}
-
-	req := &querypb.LoadCollectionRequest{
-		CollectionID:   0,
-		ReplicaNumber:  2,
-		ResourceGroups: []string{meta.DefaultResourceGroupName, "rg"},
-	}
-	resp, err := server.LoadCollection(ctx, req)
-	suite.NoError(err)
-	suite.Equal(commonpb.ErrorCode_IllegalArgument, resp.ErrorCode)
-
-	// Test load with partitions loaded
-	for _, collection := range suite.collections {
-		if suite.loadTypes[collection] != querypb.LoadType_LoadPartition {
-			continue
-		}
-
-		req := &querypb.LoadCollectionRequest{
-			CollectionID: collection,
-		}
-		resp, err := server.LoadCollection(ctx, req)
-		suite.NoError(err)
-		suite.Equal(commonpb.ErrorCode_IllegalArgument, resp.ErrorCode)
-	}
-
-	// Test load with wrong rg num
-	for _, collection := range suite.collections {
-		req := &querypb.LoadCollectionRequest{
-			CollectionID:   collection,
-			ReplicaNumber:  suite.replicaNumber[collection] + 1,
-			ResourceGroups: []string{"rg1", "rg2"},
-		}
-		resp, err := server.LoadCollection(ctx, req)
-		suite.NoError(err)
-		suite.Equal(commonpb.ErrorCode_IllegalArgument, resp.ErrorCode)
-	}
-}
-
 func (suite *ServiceSuite) TestLoadPartition() {
 	ctx := context.Background()
 	server := suite.server
 
 	// Test load all partitions
 	for _, collection := range suite.collections {
-		suite.expectLoadPartitions()
+		suite.broker.EXPECT().DescribeCollection(mock.Anything, mock.Anything).
+			Return(nil, nil)
 		suite.expectGetRecoverInfo(collection)
 
 		req := &querypb.LoadPartitionsRequest{
@@ -911,7 +878,7 @@ func (suite *ServiceSuite) TestLoadPartition() {
 		resp, err := server.LoadPartitions(ctx, req)
 		suite.NoError(err)
 		suite.Equal(commonpb.ErrorCode_Success, resp.ErrorCode)
-		suite.assertLoaded(collection)
+		suite.assertLoaded(ctx, collection)
 	}
 
 	// Test load again
@@ -996,9 +963,6 @@ func (suite *ServiceSuite) TestReleaseCollection() {
 	ctx := context.Background()
 	server := suite.server
 
-	suite.cluster.EXPECT().ReleasePartitions(mock.Anything, mock.Anything, mock.Anything).
-		Return(merr.Success(), nil)
-
 	// Test release all collections
 	for _, collection := range suite.collections {
 		req := &querypb.ReleaseCollectionRequest{
@@ -1007,7 +971,7 @@ func (suite *ServiceSuite) TestReleaseCollection() {
 		resp, err := server.ReleaseCollection(ctx, req)
 		suite.NoError(err)
 		suite.Equal(commonpb.ErrorCode_Success, resp.ErrorCode)
-		suite.assertReleased(collection)
+		suite.assertReleased(ctx, collection)
 	}
 
 	// Test release again
@@ -1031,22 +995,27 @@ func (suite *ServiceSuite) TestReleaseCollection() {
 }
 
 func (suite *ServiceSuite) TestReleasePartition() {
-	suite.loadAll()
 	ctx := context.Background()
+	suite.loadAll()
+	for _, collection := range suite.collections {
+		suite.updateChannelDist(ctx, collection)
+		suite.updateSegmentDist(collection, suite.nodes[0])
+	}
+
 	server := suite.server
 
 	// Test release all partitions
-	suite.cluster.EXPECT().ReleasePartitions(mock.Anything, mock.Anything, mock.Anything).
-		Return(merr.Success(), nil)
 	for _, collection := range suite.collections {
 		req := &querypb.ReleasePartitionsRequest{
 			CollectionID: collection,
 			PartitionIDs: suite.partitions[collection][0:1],
 		}
+		suite.updateChannelDist(ctx, collection)
+		suite.updateSegmentDist(collection, suite.nodes[0], suite.partitions[collection][1:]...)
 		resp, err := server.ReleasePartitions(ctx, req)
 		suite.NoError(err)
 		suite.Equal(commonpb.ErrorCode_Success, resp.ErrorCode)
-		suite.assertPartitionLoaded(collection, suite.partitions[collection][1:]...)
+		suite.assertPartitionLoaded(ctx, collection, suite.partitions[collection][1:]...)
 	}
 
 	// Test release again
@@ -1058,7 +1027,7 @@ func (suite *ServiceSuite) TestReleasePartition() {
 		resp, err := server.ReleasePartitions(ctx, req)
 		suite.NoError(err)
 		suite.Equal(commonpb.ErrorCode_Success, resp.ErrorCode)
-		suite.assertPartitionLoaded(collection, suite.partitions[collection][1:]...)
+		suite.assertPartitionLoaded(ctx, collection, suite.partitions[collection][1:]...)
 	}
 
 	// Test when server is not healthy
@@ -1073,13 +1042,12 @@ func (suite *ServiceSuite) TestReleasePartition() {
 }
 
 func (suite *ServiceSuite) TestRefreshCollection() {
+	ctx := context.Background()
 	server := suite.server
-
-	server.collectionObserver.Start()
 
 	// Test refresh all collections.
 	for _, collection := range suite.collections {
-		err := server.refreshCollection(collection)
+		err := server.refreshCollection(ctx, collection)
 		// Collection not loaded error.
 		suite.ErrorIs(err, merr.ErrCollectionNotLoaded)
 	}
@@ -1089,19 +1057,19 @@ func (suite *ServiceSuite) TestRefreshCollection() {
 
 	// Test refresh all collections again when collections are loaded. This time should fail with collection not 100% loaded.
 	for _, collection := range suite.collections {
-		suite.updateCollectionStatus(collection, querypb.LoadStatus_Loading)
-		err := server.refreshCollection(collection)
+		suite.updateCollectionStatus(ctx, collection, querypb.LoadStatus_Loading)
+		err := server.refreshCollection(ctx, collection)
 		suite.ErrorIs(err, merr.ErrCollectionNotLoaded)
 	}
 
 	// Test refresh all collections
 	for _, id := range suite.collections {
 		// Load and explicitly mark load percentage to 100%.
-		suite.updateChannelDist(id)
+		suite.updateChannelDist(ctx, id)
 		suite.updateSegmentDist(id, suite.nodes[0])
-		suite.updateCollectionStatus(id, querypb.LoadStatus_Loaded)
+		suite.updateCollectionStatus(ctx, id, querypb.LoadStatus_Loaded)
 
-		err := server.refreshCollection(id)
+		err := server.refreshCollection(ctx, id)
 		suite.NoError(err)
 
 		readyCh, err := server.targetObserver.UpdateNextTarget(id)
@@ -1109,18 +1077,18 @@ func (suite *ServiceSuite) TestRefreshCollection() {
 		<-readyCh
 
 		// Now the refresh must be done
-		collection := server.meta.CollectionManager.GetCollection(id)
+		collection := server.meta.CollectionManager.GetCollection(ctx, id)
 		suite.True(collection.IsRefreshed())
 	}
 
 	// Test refresh not ready
 	for _, id := range suite.collections {
-		suite.updateChannelDistWithoutSegment(id)
-		err := server.refreshCollection(id)
+		suite.updateChannelDistWithoutSegment(ctx, id)
+		err := server.refreshCollection(ctx, id)
 		suite.NoError(err)
 
 		// Now the refresh must be not done
-		collection := server.meta.CollectionManager.GetCollection(id)
+		collection := server.meta.CollectionManager.GetCollection(ctx, id)
 		suite.False(collection.IsRefreshed())
 	}
 }
@@ -1163,7 +1131,7 @@ func (suite *ServiceSuite) TestGetSegmentInfo() {
 		req := &querypb.GetSegmentInfoRequest{
 			CollectionID: collection,
 		}
-		resp, err := server.GetSegmentInfo(ctx, req)
+		resp, err := server.GetLoadSegmentInfo(ctx, req)
 		suite.NoError(err)
 		suite.Equal(commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		suite.assertSegments(collection, resp.GetInfos())
@@ -1175,7 +1143,7 @@ func (suite *ServiceSuite) TestGetSegmentInfo() {
 			CollectionID: collection,
 			SegmentIDs:   suite.getAllSegments(collection),
 		}
-		resp, err := server.GetSegmentInfo(ctx, req)
+		resp, err := server.GetLoadSegmentInfo(ctx, req)
 		suite.NoError(err)
 		suite.Equal(commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		suite.assertSegments(collection, resp.GetInfos())
@@ -1186,7 +1154,7 @@ func (suite *ServiceSuite) TestGetSegmentInfo() {
 	req := &querypb.GetSegmentInfoRequest{
 		CollectionID: suite.collections[0],
 	}
-	resp, err := server.GetSegmentInfo(ctx, req)
+	resp, err := server.GetLoadSegmentInfo(ctx, req)
 	suite.NoError(err)
 	suite.Equal(resp.GetStatus().GetCode(), merr.Code(merr.ErrServiceNotReady))
 }
@@ -1198,11 +1166,11 @@ func (suite *ServiceSuite) TestLoadBalance() {
 
 	// Test get balance first segment
 	for _, collection := range suite.collections {
-		replicas := suite.meta.ReplicaManager.GetByCollection(collection)
+		replicas := suite.meta.ReplicaManager.GetByCollection(ctx, collection)
 		nodes := replicas[0].GetNodes()
 		srcNode := nodes[0]
 		dstNode := nodes[1]
-		suite.updateCollectionStatus(collection, querypb.LoadStatus_Loaded)
+		suite.updateCollectionStatus(ctx, collection, querypb.LoadStatus_Loaded)
 		suite.updateSegmentDist(collection, srcNode)
 		segments := suite.getAllSegments(collection)
 		req := &querypb.LoadBalanceRequest{
@@ -1211,7 +1179,9 @@ func (suite *ServiceSuite) TestLoadBalance() {
 			DstNodeIDs:       []int64{dstNode},
 			SealedSegmentIDs: segments,
 		}
-		suite.taskScheduler.ExpectedCalls = make([]*mock.Call, 0)
+		suite.taskScheduler.ExpectedCalls = nil
+		suite.taskScheduler.EXPECT().GetSegmentTaskDelta(mock.Anything, mock.Anything).Return(0).Maybe()
+		suite.taskScheduler.EXPECT().GetChannelTaskDelta(mock.Anything, mock.Anything).Return(0).Maybe()
 		suite.taskScheduler.EXPECT().Add(mock.Anything).Run(func(task task.Task) {
 			actions := task.Actions()
 			suite.Len(actions, 2)
@@ -1245,10 +1215,10 @@ func (suite *ServiceSuite) TestLoadBalanceWithNoDstNode() {
 
 	// Test get balance first segment
 	for _, collection := range suite.collections {
-		replicas := suite.meta.ReplicaManager.GetByCollection(collection)
+		replicas := suite.meta.ReplicaManager.GetByCollection(ctx, collection)
 		nodes := replicas[0].GetNodes()
 		srcNode := nodes[0]
-		suite.updateCollectionStatus(collection, querypb.LoadStatus_Loaded)
+		suite.updateCollectionStatus(ctx, collection, querypb.LoadStatus_Loaded)
 		suite.updateSegmentDist(collection, srcNode)
 		segments := suite.getAllSegments(collection)
 		req := &querypb.LoadBalanceRequest{
@@ -1256,7 +1226,9 @@ func (suite *ServiceSuite) TestLoadBalanceWithNoDstNode() {
 			SourceNodeIDs:    []int64{srcNode},
 			SealedSegmentIDs: segments,
 		}
-		suite.taskScheduler.ExpectedCalls = make([]*mock.Call, 0)
+		suite.taskScheduler.ExpectedCalls = nil
+		suite.taskScheduler.EXPECT().GetSegmentTaskDelta(mock.Anything, mock.Anything).Return(0).Maybe()
+		suite.taskScheduler.EXPECT().GetChannelTaskDelta(mock.Anything, mock.Anything).Return(0).Maybe()
 		suite.taskScheduler.EXPECT().Add(mock.Anything).Run(func(task task.Task) {
 			actions := task.Actions()
 			suite.Len(actions, 2)
@@ -1295,10 +1267,10 @@ func (suite *ServiceSuite) TestLoadBalanceWithEmptySegmentList() {
 
 	// update two collection's dist
 	for _, collection := range suite.collections {
-		replicas := suite.meta.ReplicaManager.GetByCollection(collection)
+		replicas := suite.meta.ReplicaManager.GetByCollection(ctx, collection)
 		replicas[0].AddRWNode(srcNode)
 		replicas[0].AddRWNode(dstNode)
-		suite.updateCollectionStatus(collection, querypb.LoadStatus_Loaded)
+		suite.updateCollectionStatus(ctx, collection, querypb.LoadStatus_Loaded)
 
 		for partition, segments := range suite.segments[collection] {
 			for _, segment := range segments {
@@ -1321,9 +1293,9 @@ func (suite *ServiceSuite) TestLoadBalanceWithEmptySegmentList() {
 	}))
 	defer func() {
 		for _, collection := range suite.collections {
-			replicas := suite.meta.ReplicaManager.GetByCollection(collection)
-			suite.meta.ReplicaManager.RemoveNode(replicas[0].GetID(), srcNode)
-			suite.meta.ReplicaManager.RemoveNode(replicas[0].GetID(), dstNode)
+			replicas := suite.meta.ReplicaManager.GetByCollection(ctx, collection)
+			suite.meta.ReplicaManager.RemoveNode(ctx, replicas[0].GetID(), srcNode)
+			suite.meta.ReplicaManager.RemoveNode(ctx, replicas[0].GetID(), dstNode)
 		}
 		suite.nodeMgr.Remove(1001)
 		suite.nodeMgr.Remove(1002)
@@ -1337,14 +1309,16 @@ func (suite *ServiceSuite) TestLoadBalanceWithEmptySegmentList() {
 			SourceNodeIDs: []int64{srcNode},
 			DstNodeIDs:    []int64{dstNode},
 		}
-		suite.taskScheduler.ExpectedCalls = make([]*mock.Call, 0)
+		suite.taskScheduler.ExpectedCalls = nil
+		suite.taskScheduler.EXPECT().GetSegmentTaskDelta(mock.Anything, mock.Anything).Return(0).Maybe()
+		suite.taskScheduler.EXPECT().GetChannelTaskDelta(mock.Anything, mock.Anything).Return(0).Maybe()
 		suite.taskScheduler.EXPECT().Add(mock.Anything).Run(func(t task.Task) {
 			actions := t.Actions()
 			suite.Len(actions, 2)
 			growAction := actions[0].(*task.SegmentAction)
 			reduceAction := actions[1].(*task.SegmentAction)
-			suite.True(lo.Contains(segmentOnCollection[collection], growAction.SegmentID()))
-			suite.True(lo.Contains(segmentOnCollection[collection], reduceAction.SegmentID()))
+			suite.True(lo.Contains(segmentOnCollection[collection], growAction.GetSegmentID()))
+			suite.True(lo.Contains(segmentOnCollection[collection], reduceAction.GetSegmentID()))
 			suite.Equal(dstNode, growAction.Node())
 			suite.Equal(srcNode, reduceAction.Node())
 			t.Cancel(nil)
@@ -1363,7 +1337,7 @@ func (suite *ServiceSuite) TestLoadBalanceFailed() {
 
 	// Test load balance without source node
 	for _, collection := range suite.collections {
-		replicas := suite.meta.ReplicaManager.GetByCollection(collection)
+		replicas := suite.meta.ReplicaManager.GetByCollection(ctx, collection)
 		dstNode := replicas[0].GetNodes()[1]
 		segments := suite.getAllSegments(collection)
 		req := &querypb.LoadBalanceRequest{
@@ -1378,11 +1352,11 @@ func (suite *ServiceSuite) TestLoadBalanceFailed() {
 
 	// Test load balance with not fully loaded
 	for _, collection := range suite.collections {
-		replicas := suite.meta.ReplicaManager.GetByCollection(collection)
+		replicas := suite.meta.ReplicaManager.GetByCollection(ctx, collection)
 		nodes := replicas[0].GetNodes()
 		srcNode := nodes[0]
 		dstNode := nodes[1]
-		suite.updateCollectionStatus(collection, querypb.LoadStatus_Loading)
+		suite.updateCollectionStatus(ctx, collection, querypb.LoadStatus_Loading)
 		segments := suite.getAllSegments(collection)
 		req := &querypb.LoadBalanceRequest{
 			CollectionID:     collection,
@@ -1401,10 +1375,10 @@ func (suite *ServiceSuite) TestLoadBalanceFailed() {
 			continue
 		}
 
-		replicas := suite.meta.ReplicaManager.GetByCollection(collection)
+		replicas := suite.meta.ReplicaManager.GetByCollection(ctx, collection)
 		srcNode := replicas[0].GetNodes()[0]
 		dstNode := replicas[1].GetNodes()[0]
-		suite.updateCollectionStatus(collection, querypb.LoadStatus_Loaded)
+		suite.updateCollectionStatus(ctx, collection, querypb.LoadStatus_Loaded)
 		suite.updateSegmentDist(collection, srcNode)
 		segments := suite.getAllSegments(collection)
 		req := &querypb.LoadBalanceRequest{
@@ -1420,11 +1394,11 @@ func (suite *ServiceSuite) TestLoadBalanceFailed() {
 
 	// Test balance task failed
 	for _, collection := range suite.collections {
-		replicas := suite.meta.ReplicaManager.GetByCollection(collection)
+		replicas := suite.meta.ReplicaManager.GetByCollection(ctx, collection)
 		nodes := replicas[0].GetNodes()
 		srcNode := nodes[0]
 		dstNode := nodes[1]
-		suite.updateCollectionStatus(collection, querypb.LoadStatus_Loaded)
+		suite.updateCollectionStatus(ctx, collection, querypb.LoadStatus_Loaded)
 		suite.updateSegmentDist(collection, srcNode)
 		segments := suite.getAllSegments(collection)
 		req := &querypb.LoadBalanceRequest{
@@ -1441,7 +1415,7 @@ func (suite *ServiceSuite) TestLoadBalanceFailed() {
 		suite.Equal(commonpb.ErrorCode_UnexpectedError, resp.ErrorCode)
 		suite.Contains(resp.Reason, "mock error")
 
-		suite.meta.ReplicaManager.RecoverNodesInCollection(collection, map[string]typeutil.UniqueSet{meta.DefaultResourceGroupName: typeutil.NewUniqueSet(10)})
+		suite.meta.ReplicaManager.RecoverNodesInCollection(ctx, collection, map[string]typeutil.UniqueSet{meta.DefaultResourceGroupName: typeutil.NewUniqueSet(10)})
 		req.SourceNodeIDs = []int64{10}
 		resp, err = server.LoadBalance(ctx, req)
 		suite.NoError(err)
@@ -1463,7 +1437,7 @@ func (suite *ServiceSuite) TestLoadBalanceFailed() {
 		suite.NoError(err)
 		suite.Equal(commonpb.ErrorCode_UnexpectedError, resp.ErrorCode)
 		suite.nodeMgr.Remove(10)
-		suite.meta.ReplicaManager.RemoveNode(replicas[0].GetID(), 10)
+		suite.meta.ReplicaManager.RemoveNode(ctx, replicas[0].GetID(), 10)
 	}
 }
 
@@ -1498,7 +1472,7 @@ func (suite *ServiceSuite) TestGetMetrics() {
 		suite.cluster.EXPECT().GetMetrics(ctx, node, mock.Anything).Return(&milvuspb.GetMetricsResponse{
 			Status:        merr.Success(),
 			ComponentName: "QueryNode",
-		}, nil)
+		}, nil).Maybe()
 	}
 
 	metricReq := make(map[string]string)
@@ -1528,7 +1502,7 @@ func (suite *ServiceSuite) TestGetReplicas() {
 	server := suite.server
 
 	for _, collection := range suite.collections {
-		suite.updateChannelDist(collection)
+		suite.updateChannelDist(ctx, collection)
 		req := &milvuspb.GetReplicasRequest{
 			CollectionID: collection,
 		}
@@ -1540,11 +1514,11 @@ func (suite *ServiceSuite) TestGetReplicas() {
 
 	// Test get with shard nodes
 	for _, collection := range suite.collections {
-		replicas := suite.meta.ReplicaManager.GetByCollection(collection)
+		replicas := suite.meta.ReplicaManager.GetByCollection(ctx, collection)
 		for _, replica := range replicas {
 			suite.updateSegmentDist(collection, replica.GetNodes()[0])
 		}
-		suite.updateChannelDist(collection)
+		suite.updateChannelDist(ctx, collection)
 		req := &milvuspb.GetReplicasRequest{
 			CollectionID:   collection,
 			WithShardNodes: true,
@@ -1565,7 +1539,7 @@ func (suite *ServiceSuite) TestGetReplicas() {
 				}
 			}
 
-			suite.Equal(len(replica.GetNodeIds()), len(suite.meta.ReplicaManager.Get(replica.ReplicaID).GetNodes()))
+			suite.Equal(len(replica.GetNodeIds()), len(suite.meta.ReplicaManager.Get(ctx, replica.ReplicaID).GetNodes()))
 		}
 	}
 
@@ -1584,13 +1558,13 @@ func (suite *ServiceSuite) TestGetReplicasWhenNoAvailableNodes() {
 	ctx := context.Background()
 	server := suite.server
 
-	replicas := suite.meta.ReplicaManager.GetByCollection(suite.collections[0])
+	replicas := suite.meta.ReplicaManager.GetByCollection(ctx, suite.collections[0])
 	for _, replica := range replicas {
 		suite.updateSegmentDist(suite.collections[0], replica.GetNodes()[0])
 	}
-	suite.updateChannelDist(suite.collections[0])
+	suite.updateChannelDist(ctx, suite.collections[0])
 
-	suite.meta.ReplicaManager.Put(utils.CreateTestReplica(100001, suite.collections[0], []int64{}))
+	suite.meta.ReplicaManager.Put(ctx, utils.CreateTestReplica(100001, suite.collections[0], []int64{}))
 
 	req := &milvuspb.GetReplicasRequest{
 		CollectionID:   suite.collections[0],
@@ -1602,44 +1576,65 @@ func (suite *ServiceSuite) TestGetReplicasWhenNoAvailableNodes() {
 }
 
 func (suite *ServiceSuite) TestCheckHealth() {
+	suite.loadAll()
 	ctx := context.Background()
 	server := suite.server
 
+	assertCheckHealthResult := func(isHealthy bool) {
+		resp, err := server.CheckHealth(ctx, &milvuspb.CheckHealthRequest{})
+		suite.NoError(err)
+		suite.Equal(resp.IsHealthy, isHealthy)
+		if !isHealthy {
+			suite.NotEmpty(resp.Reasons)
+		} else {
+			suite.Empty(resp.Reasons)
+		}
+	}
+
+	setNodeSate := func(state commonpb.StateCode) {
+		// Test for components state fail
+		suite.cluster.EXPECT().GetComponentStates(mock.Anything, mock.Anything).Unset()
+		suite.cluster.EXPECT().GetComponentStates(mock.Anything, mock.Anything).Return(
+			&milvuspb.ComponentStates{
+				State:  &milvuspb.ComponentInfo{StateCode: state},
+				Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success},
+			},
+			nil).Maybe()
+	}
+
 	// Test for server is not healthy
 	server.UpdateStateCode(commonpb.StateCode_Initializing)
-	resp, err := server.CheckHealth(ctx, &milvuspb.CheckHealthRequest{})
-	suite.NoError(err)
-	suite.Equal(resp.IsHealthy, false)
-	suite.NotEmpty(resp.Reasons)
+	assertCheckHealthResult(false)
 
 	// Test for components state fail
-	for _, node := range suite.nodes {
-		suite.cluster.EXPECT().GetComponentStates(mock.Anything, node).Return(
-			&milvuspb.ComponentStates{
-				State:  &milvuspb.ComponentInfo{StateCode: commonpb.StateCode_Abnormal},
-				Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success},
-			},
-			nil).Once()
-	}
+	setNodeSate(commonpb.StateCode_Abnormal)
 	server.UpdateStateCode(commonpb.StateCode_Healthy)
-	resp, err = server.CheckHealth(ctx, &milvuspb.CheckHealthRequest{})
-	suite.NoError(err)
-	suite.Equal(resp.IsHealthy, false)
-	suite.NotEmpty(resp.Reasons)
+	assertCheckHealthResult(false)
 
-	// Test for server is healthy
-	for _, node := range suite.nodes {
-		suite.cluster.EXPECT().GetComponentStates(mock.Anything, node).Return(
-			&milvuspb.ComponentStates{
-				State:  &milvuspb.ComponentInfo{StateCode: commonpb.StateCode_Healthy},
-				Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success},
-			},
-			nil).Once()
+	// Test for check load percentage fail
+	setNodeSate(commonpb.StateCode_Healthy)
+	assertCheckHealthResult(true)
+
+	// Test for check channel ok
+	for _, collection := range suite.collections {
+		suite.updateCollectionStatus(ctx, collection, querypb.LoadStatus_Loaded)
+		suite.updateChannelDist(ctx, collection)
 	}
-	resp, err = server.CheckHealth(ctx, &milvuspb.CheckHealthRequest{})
-	suite.NoError(err)
-	suite.Equal(resp.IsHealthy, true)
-	suite.Empty(resp.Reasons)
+	assertCheckHealthResult(true)
+
+	// Test for check channel fail
+	tm := meta.NewMockTargetManager(suite.T())
+	tm.EXPECT().GetDmChannelsByCollection(mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+	otm := server.targetMgr
+	server.targetMgr = tm
+	assertCheckHealthResult(true)
+
+	// Test for get shard leader fail
+	server.targetMgr = otm
+	for _, node := range suite.nodes {
+		suite.nodeMgr.Stopping(node)
+	}
+	assertCheckHealthResult(true)
 }
 
 func (suite *ServiceSuite) TestGetShardLeaders() {
@@ -1648,8 +1643,8 @@ func (suite *ServiceSuite) TestGetShardLeaders() {
 	server := suite.server
 
 	for _, collection := range suite.collections {
-		suite.updateCollectionStatus(collection, querypb.LoadStatus_Loaded)
-		suite.updateChannelDist(collection)
+		suite.updateCollectionStatus(ctx, collection, querypb.LoadStatus_Loaded)
+		suite.updateChannelDist(ctx, collection)
 		req := &querypb.GetShardLeadersRequest{
 			CollectionID: collection,
 		}
@@ -1680,8 +1675,8 @@ func (suite *ServiceSuite) TestGetShardLeadersFailed() {
 	server := suite.server
 
 	for _, collection := range suite.collections {
-		suite.updateCollectionStatus(collection, querypb.LoadStatus_Loaded)
-		suite.updateChannelDist(collection)
+		suite.updateCollectionStatus(ctx, collection, querypb.LoadStatus_Loaded)
+		suite.updateChannelDist(ctx, collection)
 		req := &querypb.GetShardLeadersRequest{
 			CollectionID: collection,
 		}
@@ -1708,7 +1703,7 @@ func (suite *ServiceSuite) TestGetShardLeadersFailed() {
 			suite.dist.ChannelDistManager.Update(node)
 			suite.dist.LeaderViewManager.Update(node)
 		}
-		suite.updateChannelDistWithoutSegment(collection)
+		suite.updateChannelDistWithoutSegment(ctx, collection)
 		suite.fetchHeartbeats(time.Now())
 		resp, err = server.GetShardLeaders(ctx, req)
 		suite.NoError(err)
@@ -1751,9 +1746,10 @@ func (suite *ServiceSuite) TestHandleNodeUp() {
 	suite.server.resourceObserver.Start()
 	defer suite.server.resourceObserver.Stop()
 
+	ctx := context.Background()
 	server := suite.server
-	suite.server.meta.CollectionManager.PutCollection(utils.CreateTestCollection(1, 1))
-	suite.server.meta.ReplicaManager.Put(meta.NewReplica(
+	suite.server.meta.CollectionManager.PutCollection(ctx, utils.CreateTestCollection(1, 1))
+	suite.server.meta.ReplicaManager.Put(ctx, meta.NewReplica(
 		&querypb.Replica{
 			ID:            1,
 			CollectionID:  1,
@@ -1774,19 +1770,19 @@ func (suite *ServiceSuite) TestHandleNodeUp() {
 	server.handleNodeUp(111)
 	// wait for async update by observer
 	suite.Eventually(func() bool {
-		nodes := suite.server.meta.ReplicaManager.Get(1).GetNodes()
-		nodesInRG, _ := suite.server.meta.ResourceManager.GetNodes(meta.DefaultResourceGroupName)
+		nodes := suite.server.meta.ReplicaManager.Get(ctx, 1).GetNodes()
+		nodesInRG, _ := suite.server.meta.ResourceManager.GetNodes(ctx, meta.DefaultResourceGroupName)
 		return len(nodes) == len(nodesInRG)
 	}, 5*time.Second, 100*time.Millisecond)
-	nodes := suite.server.meta.ReplicaManager.Get(1).GetNodes()
-	nodesInRG, _ := suite.server.meta.ResourceManager.GetNodes(meta.DefaultResourceGroupName)
+	nodes := suite.server.meta.ReplicaManager.Get(ctx, 1).GetNodes()
+	nodesInRG, _ := suite.server.meta.ResourceManager.GetNodes(ctx, meta.DefaultResourceGroupName)
 	suite.ElementsMatch(nodes, nodesInRG)
 }
 
 func (suite *ServiceSuite) loadAll() {
 	ctx := context.Background()
 	for _, collection := range suite.collections {
-		suite.expectLoadPartitions()
+		suite.expectLoadMetaRPCs()
 		suite.expectGetRecoverInfo(collection)
 		if suite.loadTypes[collection] == querypb.LoadType_LoadCollection {
 			req := &querypb.LoadCollectionRequest{
@@ -1799,7 +1795,6 @@ func (suite *ServiceSuite) loadAll() {
 				suite.dist,
 				suite.meta,
 				suite.broker,
-				suite.cluster,
 				suite.targetMgr,
 				suite.targetObserver,
 				suite.collectionObserver,
@@ -1808,10 +1803,10 @@ func (suite *ServiceSuite) loadAll() {
 			suite.jobScheduler.Add(job)
 			err := job.Wait()
 			suite.NoError(err)
-			suite.EqualValues(suite.replicaNumber[collection], suite.meta.GetReplicaNumber(collection))
-			suite.True(suite.meta.Exist(collection))
-			suite.NotNil(suite.meta.GetCollection(collection))
-			suite.targetMgr.UpdateCollectionCurrentTarget(collection)
+			suite.EqualValues(suite.replicaNumber[collection], suite.meta.GetReplicaNumber(ctx, collection))
+			suite.True(suite.meta.Exist(ctx, collection))
+			suite.NotNil(suite.meta.GetCollection(ctx, collection))
+			suite.targetMgr.UpdateCollectionCurrentTarget(ctx, collection)
 		} else {
 			req := &querypb.LoadPartitionsRequest{
 				CollectionID:  collection,
@@ -1824,7 +1819,6 @@ func (suite *ServiceSuite) loadAll() {
 				suite.dist,
 				suite.meta,
 				suite.broker,
-				suite.cluster,
 				suite.targetMgr,
 				suite.targetObserver,
 				suite.collectionObserver,
@@ -1833,30 +1827,30 @@ func (suite *ServiceSuite) loadAll() {
 			suite.jobScheduler.Add(job)
 			err := job.Wait()
 			suite.NoError(err)
-			suite.EqualValues(suite.replicaNumber[collection], suite.meta.GetReplicaNumber(collection))
-			suite.True(suite.meta.Exist(collection))
-			suite.NotNil(suite.meta.GetPartitionsByCollection(collection))
-			suite.targetMgr.UpdateCollectionCurrentTarget(collection)
+			suite.EqualValues(suite.replicaNumber[collection], suite.meta.GetReplicaNumber(ctx, collection))
+			suite.True(suite.meta.Exist(ctx, collection))
+			suite.NotNil(suite.meta.GetPartitionsByCollection(ctx, collection))
+			suite.targetMgr.UpdateCollectionCurrentTarget(ctx, collection)
 		}
 	}
 }
 
-func (suite *ServiceSuite) assertLoaded(collection int64) {
-	suite.True(suite.meta.Exist(collection))
+func (suite *ServiceSuite) assertLoaded(ctx context.Context, collection int64) {
+	suite.True(suite.meta.Exist(ctx, collection))
 	for _, channel := range suite.channels[collection] {
-		suite.NotNil(suite.targetMgr.GetDmChannel(collection, channel, meta.NextTarget))
+		suite.NotNil(suite.targetMgr.GetDmChannel(ctx, collection, channel, meta.NextTarget))
 	}
 	for _, partitions := range suite.segments[collection] {
 		for _, segment := range partitions {
-			suite.NotNil(suite.targetMgr.GetSealedSegment(collection, segment, meta.NextTarget))
+			suite.NotNil(suite.targetMgr.GetSealedSegment(ctx, collection, segment, meta.NextTarget))
 		}
 	}
 }
 
-func (suite *ServiceSuite) assertPartitionLoaded(collection int64, partitions ...int64) {
-	suite.True(suite.meta.Exist(collection))
+func (suite *ServiceSuite) assertPartitionLoaded(ctx context.Context, collection int64, partitions ...int64) {
+	suite.True(suite.meta.Exist(ctx, collection))
 	for _, channel := range suite.channels[collection] {
-		suite.NotNil(suite.targetMgr.GetDmChannel(collection, channel, meta.CurrentTarget))
+		suite.NotNil(suite.targetMgr.GetDmChannel(ctx, collection, channel, meta.CurrentTarget))
 	}
 	partitionSet := typeutil.NewUniqueSet(partitions...)
 	for partition, segments := range suite.segments[collection] {
@@ -1864,20 +1858,20 @@ func (suite *ServiceSuite) assertPartitionLoaded(collection int64, partitions ..
 			continue
 		}
 		for _, segment := range segments {
-			suite.NotNil(suite.targetMgr.GetSealedSegment(collection, segment, meta.CurrentTarget))
+			suite.NotNil(suite.targetMgr.GetSealedSegment(ctx, collection, segment, meta.CurrentTarget))
 		}
 	}
 }
 
-func (suite *ServiceSuite) assertReleased(collection int64) {
-	suite.False(suite.meta.Exist(collection))
+func (suite *ServiceSuite) assertReleased(ctx context.Context, collection int64) {
+	suite.False(suite.meta.Exist(ctx, collection))
 	for _, channel := range suite.channels[collection] {
-		suite.Nil(suite.targetMgr.GetDmChannel(collection, channel, meta.CurrentTarget))
+		suite.Nil(suite.targetMgr.GetDmChannel(ctx, collection, channel, meta.CurrentTarget))
 	}
 	for _, partitions := range suite.segments[collection] {
 		for _, segment := range partitions {
-			suite.Nil(suite.targetMgr.GetSealedSegment(collection, segment, meta.CurrentTarget))
-			suite.Nil(suite.targetMgr.GetSealedSegment(collection, segment, meta.NextTarget))
+			suite.Nil(suite.targetMgr.GetSealedSegment(ctx, collection, segment, meta.CurrentTarget))
+			suite.Nil(suite.targetMgr.GetSealedSegment(ctx, collection, segment, meta.NextTarget))
 		}
 	}
 }
@@ -1923,13 +1917,11 @@ func (suite *ServiceSuite) expectGetRecoverInfo(collection int64) {
 		Return(vChannels, segmentBinlogs, nil).Maybe()
 }
 
-func (suite *ServiceSuite) expectLoadPartitions() {
+func (suite *ServiceSuite) expectLoadMetaRPCs() {
 	suite.broker.EXPECT().DescribeCollection(mock.Anything, mock.Anything).
-		Return(nil, nil)
+		Return(nil, nil).Maybe()
 	suite.broker.EXPECT().ListIndexes(mock.Anything, mock.Anything).
-		Return(nil, nil)
-	suite.cluster.EXPECT().LoadPartitions(mock.Anything, mock.Anything, mock.Anything).
-		Return(merr.Success(), nil)
+		Return(nil, nil).Maybe()
 }
 
 func (suite *ServiceSuite) getAllSegments(collection int64) []int64 {
@@ -1940,9 +1932,13 @@ func (suite *ServiceSuite) getAllSegments(collection int64) []int64 {
 	return allSegments
 }
 
-func (suite *ServiceSuite) updateSegmentDist(collection, node int64) {
+func (suite *ServiceSuite) updateSegmentDist(collection, node int64, partitions ...int64) {
+	partitionSet := typeutil.NewSet(partitions...)
 	metaSegments := make([]*meta.Segment, 0)
 	for partition, segments := range suite.segments[collection] {
+		if partitionSet.Len() > 0 && !partitionSet.Contain(partition) {
+			continue
+		}
 		for _, segment := range segments {
 			metaSegments = append(metaSegments,
 				utils.CreateTestSegment(collection, partition, segment, node, 1, "test-channel"))
@@ -1951,11 +1947,11 @@ func (suite *ServiceSuite) updateSegmentDist(collection, node int64) {
 	suite.dist.SegmentDistManager.Update(node, metaSegments...)
 }
 
-func (suite *ServiceSuite) updateChannelDist(collection int64) {
+func (suite *ServiceSuite) updateChannelDist(ctx context.Context, collection int64) {
 	channels := suite.channels[collection]
 	segments := lo.Flatten(lo.Values(suite.segments[collection]))
 
-	replicas := suite.meta.ReplicaManager.GetByCollection(collection)
+	replicas := suite.meta.ReplicaManager.GetByCollection(ctx, collection)
 	for _, replica := range replicas {
 		i := 0
 		for _, node := range suite.sortInt64(replica.GetNodes()) {
@@ -1989,10 +1985,10 @@ func (suite *ServiceSuite) sortInt64(ints []int64) []int64 {
 	return ints
 }
 
-func (suite *ServiceSuite) updateChannelDistWithoutSegment(collection int64) {
+func (suite *ServiceSuite) updateChannelDistWithoutSegment(ctx context.Context, collection int64) {
 	channels := suite.channels[collection]
 
-	replicas := suite.meta.ReplicaManager.GetByCollection(collection)
+	replicas := suite.meta.ReplicaManager.GetByCollection(ctx, collection)
 	for _, replica := range replicas {
 		i := 0
 		for _, node := range suite.sortInt64(replica.GetNodes()) {
@@ -2001,9 +1997,10 @@ func (suite *ServiceSuite) updateChannelDistWithoutSegment(collection int64) {
 				ChannelName:  channels[i],
 			}))
 			suite.dist.LeaderViewManager.Update(node, &meta.LeaderView{
-				ID:           node,
-				CollectionID: collection,
-				Channel:      channels[i],
+				ID:                 node,
+				CollectionID:       collection,
+				Channel:            channels[i],
+				UnServiceableError: merr.ErrSegmentLack,
 			})
 			i++
 			if i >= len(channels) {
@@ -2013,8 +2010,8 @@ func (suite *ServiceSuite) updateChannelDistWithoutSegment(collection int64) {
 	}
 }
 
-func (suite *ServiceSuite) updateCollectionStatus(collectionID int64, status querypb.LoadStatus) {
-	collection := suite.meta.GetCollection(collectionID)
+func (suite *ServiceSuite) updateCollectionStatus(ctx context.Context, collectionID int64, status querypb.LoadStatus) {
+	collection := suite.meta.GetCollection(ctx, collectionID)
 	if collection != nil {
 		collection := collection.Clone()
 		collection.LoadPercentage = 0
@@ -2022,9 +2019,9 @@ func (suite *ServiceSuite) updateCollectionStatus(collectionID int64, status que
 			collection.LoadPercentage = 100
 		}
 		collection.CollectionLoadInfo.Status = status
-		suite.meta.PutCollection(collection)
+		suite.meta.PutCollection(ctx, collection)
 
-		partitions := suite.meta.GetPartitionsByCollection(collectionID)
+		partitions := suite.meta.GetPartitionsByCollection(ctx, collectionID)
 		for _, partition := range partitions {
 			partition := partition.Clone()
 			partition.LoadPercentage = 0
@@ -2032,7 +2029,7 @@ func (suite *ServiceSuite) updateCollectionStatus(collectionID int64, status que
 				partition.LoadPercentage = 100
 			}
 			partition.PartitionLoadInfo.Status = status
-			suite.meta.PutPartition(partition)
+			suite.meta.PutPartition(ctx, partition)
 		}
 	}
 }

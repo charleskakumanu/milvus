@@ -1,7 +1,7 @@
-// Code generated from Plan.g4 by ANTLR 4.9. DO NOT EDIT.
+// Code generated from Plan.g4 by ANTLR 4.13.2. DO NOT EDIT.
 
 package planparserv2 // Plan
-import "github.com/antlr/antlr4/runtime/Go/antlr"
+import "github.com/antlr4-go/antlr/v4"
 
 // A complete Visitor for a parse tree produced by PlanParser.
 type PlanVisitor interface {
@@ -9,6 +9,9 @@ type PlanVisitor interface {
 
 	// Visit a parse tree produced by PlanParser#JSONIdentifier.
 	VisitJSONIdentifier(ctx *JSONIdentifierContext) interface{}
+
+	// Visit a parse tree produced by PlanParser#RandomSample.
+	VisitRandomSample(ctx *RandomSampleContext) interface{}
 
 	// Visit a parse tree produced by PlanParser#Parens.
 	VisitParens(ctx *ParensContext) interface{}
@@ -25,6 +28,9 @@ type PlanVisitor interface {
 	// Visit a parse tree produced by PlanParser#LogicalOr.
 	VisitLogicalOr(ctx *LogicalOrContext) interface{}
 
+	// Visit a parse tree produced by PlanParser#IsNotNull.
+	VisitIsNotNull(ctx *IsNotNullContext) interface{}
+
 	// Visit a parse tree produced by PlanParser#MulDivMod.
 	VisitMulDivMod(ctx *MulDivModContext) interface{}
 
@@ -37,6 +43,9 @@ type PlanVisitor interface {
 	// Visit a parse tree produced by PlanParser#LogicalAnd.
 	VisitLogicalAnd(ctx *LogicalAndContext) interface{}
 
+	// Visit a parse tree produced by PlanParser#TemplateVariable.
+	VisitTemplateVariable(ctx *TemplateVariableContext) interface{}
+
 	// Visit a parse tree produced by PlanParser#Equality.
 	VisitEquality(ctx *EqualityContext) interface{}
 
@@ -46,20 +55,32 @@ type PlanVisitor interface {
 	// Visit a parse tree produced by PlanParser#Shift.
 	VisitShift(ctx *ShiftContext) interface{}
 
+	// Visit a parse tree produced by PlanParser#Call.
+	VisitCall(ctx *CallContext) interface{}
+
 	// Visit a parse tree produced by PlanParser#ReverseRange.
 	VisitReverseRange(ctx *ReverseRangeContext) interface{}
 
 	// Visit a parse tree produced by PlanParser#BitOr.
 	VisitBitOr(ctx *BitOrContext) interface{}
 
+	// Visit a parse tree produced by PlanParser#EmptyArray.
+	VisitEmptyArray(ctx *EmptyArrayContext) interface{}
+
 	// Visit a parse tree produced by PlanParser#AddSub.
 	VisitAddSub(ctx *AddSubContext) interface{}
+
+	// Visit a parse tree produced by PlanParser#PhraseMatch.
+	VisitPhraseMatch(ctx *PhraseMatchContext) interface{}
 
 	// Visit a parse tree produced by PlanParser#Relational.
 	VisitRelational(ctx *RelationalContext) interface{}
 
 	// Visit a parse tree produced by PlanParser#ArrayLength.
 	VisitArrayLength(ctx *ArrayLengthContext) interface{}
+
+	// Visit a parse tree produced by PlanParser#TextMatch.
+	VisitTextMatch(ctx *TextMatchContext) interface{}
 
 	// Visit a parse tree produced by PlanParser#Term.
 	VisitTerm(ctx *TermContext) interface{}
@@ -91,8 +112,8 @@ type PlanVisitor interface {
 	// Visit a parse tree produced by PlanParser#BitAnd.
 	VisitBitAnd(ctx *BitAndContext) interface{}
 
-	// Visit a parse tree produced by PlanParser#EmptyTerm.
-	VisitEmptyTerm(ctx *EmptyTermContext) interface{}
+	// Visit a parse tree produced by PlanParser#IsNull.
+	VisitIsNull(ctx *IsNullContext) interface{}
 
 	// Visit a parse tree produced by PlanParser#Power.
 	VisitPower(ctx *PowerContext) interface{}

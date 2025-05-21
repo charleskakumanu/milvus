@@ -29,12 +29,12 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
 	. "github.com/milvus-io/milvus/internal/querycoordv2/params"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 type MockQueryNode struct {
@@ -134,7 +134,7 @@ func (node *MockQueryNode) Start() error {
 	node.session.Init(typeutil.QueryNodeRole, node.addr, false, true)
 	node.session.ServerID = node.ID
 	node.session.Register()
-	log.Debug("mock QueryNode started",
+	log.Ctx(context.TODO()).Debug("mock QueryNode started",
 		zap.Int64("nodeID", node.ID),
 		zap.String("nodeAddr", node.addr))
 

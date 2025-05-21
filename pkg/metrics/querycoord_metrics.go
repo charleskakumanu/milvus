@@ -21,7 +21,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 const (
@@ -36,6 +36,7 @@ const (
 
 	LeaderGrowTaskLabel   = "leader_grow"
 	LeaderReduceTaskLabel = "leader_reduce"
+	LeaderUpdateTaskLabel = "leader_update"
 
 	UnknownTaskLabel = "unknown"
 
@@ -131,7 +132,31 @@ var (
 			Name:      "task_latency",
 			Help:      "latency of all kind of task in query coord scheduler scheduler",
 			Buckets:   longTaskBuckets,
-		}, []string{collectionIDLabelName, taskTypeLabel, channelNameLabelName})
+		}, []string{collectionIDLabelName, TaskTypeLabel, channelNameLabelName})
+
+	QueryCoordResourceGroupInfo = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryCoordRole,
+			Name:      "resource_group_info",
+			Help:      "all resource group detail info in query coord",
+		}, []string{ResourceGroupLabelName, NodeIDLabelName})
+
+	QueryCoordResourceGroupReplicaTotal = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryCoordRole,
+			Name:      "resource_group_replica_total",
+			Help:      "total replica number of resource group",
+		}, []string{ResourceGroupLabelName})
+
+	QueryCoordReplicaRONodeTotal = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryCoordRole,
+			Name:      "replica_ro_node_total",
+			Help:      "total read only node number of replica",
+		})
 )
 
 // RegisterQueryCoord registers QueryCoord metrics
@@ -146,6 +171,9 @@ func RegisterQueryCoord(registry *prometheus.Registry) {
 	registry.MustRegister(QueryCoordNumQueryNodes)
 	registry.MustRegister(QueryCoordCurrentTargetCheckpointUnixSeconds)
 	registry.MustRegister(QueryCoordTaskLatency)
+	registry.MustRegister(QueryCoordResourceGroupInfo)
+	registry.MustRegister(QueryCoordResourceGroupReplicaTotal)
+	registry.MustRegister(QueryCoordReplicaRONodeTotal)
 }
 
 func CleanQueryCoordMetricsWithCollectionID(collectionID int64) {

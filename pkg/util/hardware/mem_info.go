@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build !darwin && !openbsd && !freebsd
-// +build !darwin,!openbsd,!freebsd
+//go:build !darwin && !openbsd && !freebsd && !windows
+// +build !darwin,!openbsd,!freebsd,!windows
 
 package hardware
 
@@ -24,7 +24,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/v2/log"
 )
 
 var proc *process.Process

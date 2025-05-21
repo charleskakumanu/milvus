@@ -22,22 +22,42 @@ import (
 	"math"
 	"sync"
 
-	"github.com/apache/arrow/go/v12/arrow"
-	"github.com/apache/arrow/go/v12/arrow/array"
-	"github.com/apache/arrow/go/v12/arrow/memory"
-	"github.com/apache/arrow/go/v12/parquet"
-	"github.com/apache/arrow/go/v12/parquet/compress"
-	"github.com/apache/arrow/go/v12/parquet/pqarrow"
+	"github.com/apache/arrow/go/v17/arrow"
+	"github.com/apache/arrow/go/v17/arrow/array"
+	"github.com/apache/arrow/go/v17/arrow/memory"
+	"github.com/apache/arrow/go/v17/parquet"
+	"github.com/apache/arrow/go/v17/parquet/compress"
+	"github.com/apache/arrow/go/v17/parquet/pqarrow"
 	"github.com/cockroachdb/errors"
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 var _ PayloadWriterInterface = (*NativePayloadWriter)(nil)
+
+type PayloadWriterOptions func(*NativePayloadWriter)
+
+func WithNullable(nullable bool) PayloadWriterOptions {
+	return func(w *NativePayloadWriter) {
+		w.nullable = nullable
+	}
+}
+
+func WithWriterProps(writerProps *parquet.WriterProperties) PayloadWriterOptions {
+	return func(w *NativePayloadWriter) {
+		w.writerProps = writerProps
+	}
+}
+
+func WithDim(dim int) PayloadWriterOptions {
+	return func(w *NativePayloadWriter) {
+		w.dim = NewNullableInt(dim)
+	}
+}
 
 type NativePayloadWriter struct {
 	dataType    schemapb.DataType
@@ -47,43 +67,42 @@ type NativePayloadWriter struct {
 	flushedRows int
 	output      *bytes.Buffer
 	releaseOnce sync.Once
-	dim         int
+	dim         *NullableInt
 	nullable    bool
+	writerProps *parquet.WriterProperties
 }
 
-func NewPayloadWriter(colType schemapb.DataType, nullable bool, dim ...int) (PayloadWriterInterface, error) {
-	var arrowType arrow.DataType
-	var dimension int
-	// writer for sparse float vector doesn't require dim
-	if typeutil.IsVectorType(colType) && !typeutil.IsSparseFloatVectorType(colType) {
-		if len(dim) != 1 {
-			return nil, merr.WrapErrParameterInvalidMsg("incorrect input numbers")
-		}
-		if nullable {
-			return nil, merr.WrapErrParameterInvalidMsg("vector type not supprot nullable")
-		}
-		arrowType = milvusDataTypeToArrowType(colType, dim[0])
-		dimension = dim[0]
-	} else {
-		if len(dim) != 0 {
-			return nil, merr.WrapErrParameterInvalidMsg("incorrect input numbers")
-		}
-		arrowType = milvusDataTypeToArrowType(colType, 1)
-		dimension = 1
-	}
-
-	builder := array.NewBuilder(memory.DefaultAllocator, arrowType)
-
-	return &NativePayloadWriter{
+func NewPayloadWriter(colType schemapb.DataType, options ...PayloadWriterOptions) (PayloadWriterInterface, error) {
+	w := &NativePayloadWriter{
 		dataType:    colType,
-		arrowType:   arrowType,
-		builder:     builder,
 		finished:    false,
 		flushedRows: 0,
 		output:      new(bytes.Buffer),
-		dim:         dimension,
-		nullable:    nullable,
-	}, nil
+		nullable:    false,
+		writerProps: parquet.NewWriterProperties(
+			parquet.WithCompression(compress.Codecs.Zstd),
+			parquet.WithCompressionLevel(3),
+		),
+		dim: &NullableInt{},
+	}
+	for _, o := range options {
+		o(w)
+	}
+
+	// writer for sparse float vector doesn't require dim
+	if typeutil.IsVectorType(colType) && !typeutil.IsSparseFloatVectorType(colType) {
+		if w.dim.IsNull() {
+			return nil, merr.WrapErrParameterInvalidMsg("incorrect input numbers")
+		}
+		if w.nullable {
+			return nil, merr.WrapErrParameterInvalidMsg("vector type does not support nullable")
+		}
+	} else {
+		w.dim = NewNullableInt(1)
+	}
+	w.arrowType = MilvusDataTypeToArrowType(colType, *w.dim.Value)
+	w.builder = array.NewBuilder(memory.DefaultAllocator, w.arrowType)
+	return w, nil
 }
 
 func (w *NativePayloadWriter) AddDataToPayload(data interface{}, validData []bool) error {
@@ -192,31 +211,37 @@ func (w *NativePayloadWriter) AddDataToPayload(data interface{}, validData []boo
 		if !ok {
 			return merr.WrapErrParameterInvalidMsg("incorrect data type")
 		}
-		return w.AddBinaryVectorToPayload(val, w.dim)
+		return w.AddBinaryVectorToPayload(val, w.dim.GetValue())
 	case schemapb.DataType_FloatVector:
 		val, ok := data.([]float32)
 		if !ok {
 			return merr.WrapErrParameterInvalidMsg("incorrect data type")
 		}
-		return w.AddFloatVectorToPayload(val, w.dim)
+		return w.AddFloatVectorToPayload(val, w.dim.GetValue())
 	case schemapb.DataType_Float16Vector:
 		val, ok := data.([]byte)
 		if !ok {
 			return merr.WrapErrParameterInvalidMsg("incorrect data type")
 		}
-		return w.AddFloat16VectorToPayload(val, w.dim)
+		return w.AddFloat16VectorToPayload(val, w.dim.GetValue())
 	case schemapb.DataType_BFloat16Vector:
 		val, ok := data.([]byte)
 		if !ok {
 			return merr.WrapErrParameterInvalidMsg("incorrect data type")
 		}
-		return w.AddBFloat16VectorToPayload(val, w.dim)
+		return w.AddBFloat16VectorToPayload(val, w.dim.GetValue())
 	case schemapb.DataType_SparseFloatVector:
 		val, ok := data.(*SparseFloatVectorFieldData)
 		if !ok {
 			return merr.WrapErrParameterInvalidMsg("incorrect data type")
 		}
 		return w.AddSparseFloatVectorToPayload(val)
+	case schemapb.DataType_Int8Vector:
+		val, ok := data.([]int8)
+		if !ok {
+			return merr.WrapErrParameterInvalidMsg("incorrect data type")
+		}
+		return w.AddInt8VectorToPayload(val, w.dim.GetValue())
 	default:
 		return errors.New("unsupported datatype")
 	}
@@ -649,6 +674,33 @@ func (w *NativePayloadWriter) AddSparseFloatVectorToPayload(data *SparseFloatVec
 	return nil
 }
 
+func (w *NativePayloadWriter) AddInt8VectorToPayload(data []int8, dim int) error {
+	if w.finished {
+		return errors.New("can't append data to finished int8 vector payload")
+	}
+
+	if len(data) == 0 {
+		return errors.New("can't add empty msgs into int8 vector payload")
+	}
+
+	builder, ok := w.builder.(*array.FixedSizeBinaryBuilder)
+	if !ok {
+		return errors.New("failed to cast Int8VectorBuilder")
+	}
+
+	byteLength := dim
+	length := len(data) / byteLength
+
+	builder.Reserve(length)
+	for i := 0; i < length; i++ {
+		vec := data[i*dim : (i+1)*dim]
+		vecBytes := arrow.Int8Traits.CastToBytes(vec)
+		builder.Append(vecBytes)
+	}
+
+	return nil
+}
+
 func (w *NativePayloadWriter) FinishPayloadWriter() error {
 	if w.finished {
 		return errors.New("can't reuse a finished writer")
@@ -674,14 +726,10 @@ func (w *NativePayloadWriter) FinishPayloadWriter() error {
 	table := array.NewTable(schema, []arrow.Column{column}, int64(column.Len()))
 	defer table.Release()
 
-	props := parquet.NewWriterProperties(
-		parquet.WithCompression(compress.Codecs.Zstd),
-		parquet.WithCompressionLevel(3),
-	)
 	return pqarrow.WriteTable(table,
 		w.output,
 		1024*1024*1024,
-		props,
+		w.writerProps,
 		pqarrow.DefaultWriterProps(),
 	)
 }
@@ -715,7 +763,7 @@ func (w *NativePayloadWriter) Close() {
 	w.ReleasePayloadWriter()
 }
 
-func milvusDataTypeToArrowType(dataType schemapb.DataType, dim int) arrow.DataType {
+func MilvusDataTypeToArrowType(dataType schemapb.DataType, dim int) arrow.DataType {
 	switch dataType {
 	case schemapb.DataType_Bool:
 		return &arrow.BooleanType{}
@@ -731,7 +779,7 @@ func milvusDataTypeToArrowType(dataType schemapb.DataType, dim int) arrow.DataTy
 		return &arrow.Float32Type{}
 	case schemapb.DataType_Double:
 		return &arrow.Float64Type{}
-	case schemapb.DataType_VarChar, schemapb.DataType_String:
+	case schemapb.DataType_VarChar, schemapb.DataType_String, schemapb.DataType_Text:
 		return &arrow.StringType{}
 	case schemapb.DataType_Array:
 		return &arrow.BinaryType{}
@@ -755,6 +803,10 @@ func milvusDataTypeToArrowType(dataType schemapb.DataType, dim int) arrow.DataTy
 		}
 	case schemapb.DataType_SparseFloatVector:
 		return &arrow.BinaryType{}
+	case schemapb.DataType_Int8Vector:
+		return &arrow.FixedSizeBinaryType{
+			ByteWidth: dim,
+		}
 	default:
 		panic("unsupported data type")
 	}

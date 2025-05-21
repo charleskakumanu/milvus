@@ -21,37 +21,36 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/metricsinfo"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
-	"github.com/milvus-io/milvus/pkg/util/uniquegenerator"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/uniquegenerator"
 )
 
 func TestProxy_metrics(t *testing.T) {
 	var err error
 
 	ctx := context.Background()
+	req, _ := metricsinfo.ConstructRequestByMetricType(metricsinfo.SystemInfoMetrics)
+	resp, err := getSystemInfoMetrics(ctx, req, getMockProxyRequestMetrics())
+	assert.NoError(t, err)
+	assert.NotNil(t, resp)
+}
 
-	rc := NewRootCoordMock()
-	defer rc.Close()
-
-	qc := getQueryCoordClient()
-	dc := NewDataCoordMock()
-	defer dc.Close()
+func getMockProxyRequestMetrics() *Proxy {
+	mixc := NewMixCoordMock()
+	defer mixc.Close()
 
 	proxy := &Proxy{
-		rootCoord:  rc,
-		queryCoord: qc,
-		dataCoord:  dc,
-		session:    &sessionutil.Session{SessionRaw: sessionutil.SessionRaw{Address: funcutil.GenRandomStr()}},
+		mixCoord: mixc,
+		session:  &sessionutil.Session{SessionRaw: sessionutil.SessionRaw{Address: funcutil.GenRandomStr()}},
 	}
 
-	rc.getMetricsFunc = func(ctx context.Context, request *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error) {
+	mixc.getMetricsFunc = func(ctx context.Context, request *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error) {
 		id := typeutil.UniqueID(uniquegenerator.GetUniqueIntGeneratorIns().GetInt())
 
 		rootCoordTopology := metricsinfo.RootCoordTopology{
@@ -80,68 +79,6 @@ func TestProxy_metrics(t *testing.T) {
 			},
 		}
 
-		resp, _ := metricsinfo.MarshalTopology(rootCoordTopology)
-
-		return &milvuspb.GetMetricsResponse{
-			Status:        merr.Success(),
-			Response:      resp,
-			ComponentName: metricsinfo.ConstructComponentName(typeutil.RootCoordRole, id),
-		}, nil
-	}
-
-	getMetricsFunc := func(ctx context.Context, request *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error) {
-		id := typeutil.UniqueID(uniquegenerator.GetUniqueIntGeneratorIns().GetInt())
-
-		clusterTopology := metricsinfo.QueryClusterTopology{
-			Self: metricsinfo.QueryCoordInfos{
-				BaseComponentInfos: metricsinfo.BaseComponentInfos{
-					Name:          metricsinfo.ConstructComponentName(typeutil.QueryCoordRole, id),
-					HardwareInfos: metricsinfo.HardwareMetrics{},
-					SystemInfo:    metricsinfo.DeployMetrics{},
-					Type:          typeutil.QueryCoordRole,
-					ID:            id,
-				},
-				SystemConfigurations: metricsinfo.QueryCoordConfiguration{},
-			},
-			ConnectedNodes: make([]metricsinfo.QueryNodeInfos, 0),
-		}
-
-		infos := metricsinfo.QueryNodeInfos{
-			BaseComponentInfos:   metricsinfo.BaseComponentInfos{},
-			SystemConfigurations: metricsinfo.QueryNodeConfiguration{},
-		}
-		clusterTopology.ConnectedNodes = append(clusterTopology.ConnectedNodes, infos)
-
-		coordTopology := metricsinfo.QueryCoordTopology{
-			Cluster: clusterTopology,
-			Connections: metricsinfo.ConnTopology{
-				Name: metricsinfo.ConstructComponentName(typeutil.QueryCoordRole, id),
-				ConnectedComponents: []metricsinfo.ConnectionInfo{
-					{
-						TargetName: metricsinfo.ConstructComponentName(typeutil.RootCoordRole, id),
-						TargetType: typeutil.RootCoordRole,
-					},
-					{
-						TargetName: metricsinfo.ConstructComponentName(typeutil.DataCoordRole, id),
-						TargetType: typeutil.DataCoordRole,
-					},
-				},
-			},
-		}
-
-		resp, _ := metricsinfo.MarshalTopology(coordTopology)
-
-		return &milvuspb.GetMetricsResponse{
-			Status:        merr.Success(),
-			Response:      resp,
-			ComponentName: metricsinfo.ConstructComponentName(typeutil.QueryCoordRole, id),
-		}, nil
-	}
-	qc.EXPECT().GetMetrics(mock.Anything, mock.Anything).Return(getMetricsFunc(nil, nil))
-
-	dc.getMetricsFunc = func(ctx context.Context, request *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error) {
-		id := typeutil.UniqueID(uniquegenerator.GetUniqueIntGeneratorIns().GetInt())
-
 		clusterTopology := metricsinfo.DataClusterTopology{
 			Self: metricsinfo.DataCoordInfos{
 				BaseComponentInfos: metricsinfo.BaseComponentInfos{
@@ -153,8 +90,7 @@ func TestProxy_metrics(t *testing.T) {
 				},
 				SystemConfigurations: metricsinfo.DataCoordConfiguration{},
 			},
-			ConnectedDataNodes:  make([]metricsinfo.DataNodeInfos, 0),
-			ConnectedIndexNodes: make([]metricsinfo.IndexNodeInfos, 0),
+			ConnectedDataNodes: make([]metricsinfo.DataNodeInfos, 0),
 		}
 
 		infos := metricsinfo.DataNodeInfos{
@@ -163,11 +99,11 @@ func TestProxy_metrics(t *testing.T) {
 		}
 		clusterTopology.ConnectedDataNodes = append(clusterTopology.ConnectedDataNodes, infos)
 
-		indexNodeInfos := metricsinfo.IndexNodeInfos{
+		indexNodeInfos := metricsinfo.DataNodeInfos{
 			BaseComponentInfos:   metricsinfo.BaseComponentInfos{},
-			SystemConfigurations: metricsinfo.IndexNodeConfiguration{},
+			SystemConfigurations: metricsinfo.DataNodeConfiguration{},
 		}
-		clusterTopology.ConnectedIndexNodes = append(clusterTopology.ConnectedIndexNodes, indexNodeInfos)
+		clusterTopology.ConnectedDataNodes = append(clusterTopology.ConnectedDataNodes, indexNodeInfos)
 
 		coordTopology := metricsinfo.DataCoordTopology{
 			Cluster: clusterTopology,
@@ -186,20 +122,51 @@ func TestProxy_metrics(t *testing.T) {
 			},
 		}
 
-		resp, _ := metricsinfo.MarshalTopology(coordTopology)
+		systemTopology := metricsinfo.SystemTopology{
+			NodesInfo: []metricsinfo.SystemTopologyNode{
+				{
+					Identifier: int(id),
+					Connected: []metricsinfo.ConnectionEdge{
+						{
+							ConnectedIdentifier: int(id),
+							Type:                metricsinfo.CoordConnectToNode,
+							TargetType:          typeutil.QueryCoordRole,
+						},
+						{
+							ConnectedIdentifier: int(id),
+							Type:                metricsinfo.CoordConnectToNode,
+							TargetType:          typeutil.DataCoordRole,
+						},
+					},
+					Infos: &rootCoordTopology.Self,
+				},
+				{
+					Identifier: int(id),
+					Connected: []metricsinfo.ConnectionEdge{
+						{
+							ConnectedIdentifier: int(id),
+							Type:                metricsinfo.CoordConnectToNode,
+							TargetType:          typeutil.RootCoordRole,
+						},
+						{
+							ConnectedIdentifier: int(id),
+							Type:                metricsinfo.CoordConnectToNode,
+							TargetType:          typeutil.QueryCoordRole,
+						},
+					},
+					Infos: &coordTopology.Cluster.Self,
+				},
+			},
+		}
+
+		resp, _ := metricsinfo.MarshalTopology(systemTopology)
 
 		return &milvuspb.GetMetricsResponse{
 			Status:        merr.Success(),
 			Response:      resp,
-			ComponentName: metricsinfo.ConstructComponentName(typeutil.DataCoordRole, id),
+			ComponentName: metricsinfo.ConstructComponentName(typeutil.MixCoordRole, id),
 		}, nil
 	}
 
-	req, _ := metricsinfo.ConstructRequestByMetricType(metricsinfo.SystemInfoMetrics)
-	resp, err := getSystemInfoMetrics(ctx, req, proxy)
-	assert.NoError(t, err)
-	assert.NotNil(t, resp)
-
-	rc.getMetricsFunc = nil
-	dc.getMetricsFunc = nil
+	return proxy
 }

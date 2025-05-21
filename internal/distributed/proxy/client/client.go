@@ -20,21 +20,23 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/errors"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/proxypb"
+	"github.com/milvus-io/milvus/internal/distributed/utils"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/grpcclient"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/commonpbutil"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/proxypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 var Params *paramtable.ComponentParam = paramtable.Get()
@@ -49,12 +51,12 @@ type Client struct {
 // NewClient creates a new client instance
 func NewClient(ctx context.Context, addr string, nodeID int64) (types.ProxyClient, error) {
 	if addr == "" {
-		return nil, fmt.Errorf("address is empty")
+		return nil, errors.New("address is empty")
 	}
 	sess := sessionutil.NewSession(ctx)
 	if sess == nil {
-		err := fmt.Errorf("new session error, maybe can not connect to etcd")
-		log.Debug("Proxy client new session failed", zap.Error(err))
+		err := errors.New("new session error, maybe can not connect to etcd")
+		log.Ctx(ctx).Debug("Proxy client new session failed", zap.Error(err))
 		return nil, err
 	}
 	config := &Params.ProxyGrpcClientCfg
@@ -69,6 +71,16 @@ func NewClient(ctx context.Context, addr string, nodeID int64) (types.ProxyClien
 	client.grpcClient.SetNewGrpcClientFunc(client.newGrpcClient)
 	client.grpcClient.SetNodeID(nodeID)
 	client.grpcClient.SetSession(sess)
+	if Params.InternalTLSCfg.InternalTLSEnabled.GetAsBool() {
+		client.grpcClient.EnableEncryption()
+		cp, err := utils.CreateCertPoolforClient(Params.InternalTLSCfg.InternalTLSCaPemPath.GetValue(), "Proxy")
+		if err != nil {
+			log.Ctx(ctx).Error("Failed to create cert pool for Proxy client")
+			return nil, err
+		}
+		client.grpcClient.SetInternalTLSCertPool(cp)
+		client.grpcClient.SetInternalTLSServerName(Params.InternalTLSCfg.InternalTLSSNI.GetValue())
+	}
 	return client, nil
 }
 
@@ -220,5 +232,11 @@ func (c *Client) ListImports(ctx context.Context, req *internalpb.ListImportsReq
 func (c *Client) InvalidateShardLeaderCache(ctx context.Context, req *proxypb.InvalidateShardLeaderCacheRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	return wrapGrpcCall(ctx, c, func(client proxypb.ProxyClient) (*commonpb.Status, error) {
 		return client.InvalidateShardLeaderCache(ctx, req)
+	})
+}
+
+func (c *Client) GetSegmentsInfo(ctx context.Context, req *internalpb.GetSegmentsInfoRequest, opts ...grpc.CallOption) (*internalpb.GetSegmentsInfoResponse, error) {
+	return wrapGrpcCall(ctx, c, func(client proxypb.ProxyClient) (*internalpb.GetSegmentsInfoResponse, error) {
+		return client.GetSegmentsInfo(ctx, req)
 	})
 }

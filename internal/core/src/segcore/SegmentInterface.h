@@ -12,15 +12,15 @@
 #pragma once
 
 #include <atomic>
-#include <deque>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 #include <index/ScalarIndex.h>
 
-#include "DeletedRecord.h"
-#include "FieldIndexing.h"
+#include "cachinglayer/CacheSlot.h"
+#include "common/EasyAssert.h"
+#include "common/Json.h"
 #include "common/Schema.h"
 #include "common/Span.h"
 #include "common/SystemProperty.h"
@@ -29,15 +29,18 @@
 #include "common/BitsetView.h"
 #include "common/QueryResult.h"
 #include "common/QueryInfo.h"
+#include "mmap/ChunkedColumnInterface.h"
 #include "query/Plan.h"
-#include "query/PlanNode.h"
-#include "pb/schema.pb.h"
 #include "pb/segcore.pb.h"
-#include "index/IndexInfo.h"
 #include "index/SkipIndex.h"
-#include "mmap/Column.h"
+#include "index/TextMatchIndex.h"
+#include "index/JsonKeyStatsInvertedIndex.h"
+#include "segcore/ConcurrentVector.h"
+#include "segcore/InsertRecord.h"
 
 namespace milvus::segcore {
+
+using namespace milvus::cachinglayer;
 
 struct SegmentStats {
     // we stat the memory size used by the segment,
@@ -62,14 +65,16 @@ class SegmentInterface {
     virtual std::unique_ptr<SearchResult>
     Search(const query::Plan* Plan,
            const query::PlaceholderGroup* placeholder_group,
-           Timestamp timestamp) const = 0;
+           Timestamp timestamp,
+           int32_t consistency_level = 0) const = 0;
 
     virtual std::unique_ptr<proto::segcore::RetrieveResults>
     Retrieve(tracer::TraceContext* trace_ctx,
              const query::RetrievePlan* Plan,
              Timestamp timestamp,
              int64_t limit_size,
-             bool ignore_non_pk) const = 0;
+             bool ignore_non_pk,
+             int32_t consistency_level = 0) const = 0;
 
     virtual std::unique_ptr<proto::segcore::RetrieveResults>
     Retrieve(tracer::TraceContext* trace_ctx,
@@ -100,23 +105,14 @@ class SegmentInterface {
                        int64_t num_rows,
                        int64_t field_size) = 0;
 
-    //  virtual int64_t
-    //  PreDelete(int64_t size) = 0;
-
     virtual SegcoreError
-    Delete(int64_t reserved_offset,
-           int64_t size,
-           const IdArray* pks,
-           const Timestamp* timestamps) = 0;
+    Delete(int64_t size, const IdArray* pks, const Timestamp* timestamps) = 0;
 
     virtual void
     LoadDeletedRecord(const LoadDeletedRecordInfo& info) = 0;
 
     virtual void
     LoadFieldData(const LoadFieldDataInfo& info) = 0;
-
-    virtual void
-    LoadFieldDataV2(const LoadFieldDataInfo& info) = 0;
 
     virtual int64_t
     get_segment_id() const = 0;
@@ -126,6 +122,37 @@ class SegmentInterface {
 
     virtual bool
     HasRawData(int64_t field_id) const = 0;
+
+    virtual bool
+    is_nullable(FieldId field_id) const = 0;
+
+    virtual void
+    CreateTextIndex(FieldId field_id) = 0;
+
+    virtual index::TextMatchIndex*
+    GetTextIndex(FieldId field_id) const = 0;
+
+    virtual index::IndexBase*
+    GetJsonIndex(FieldId field_id, std::string path) const {
+        return nullptr;
+    }
+    virtual index::JsonKeyStatsInvertedIndex*
+    GetJsonKeyIndex(FieldId field_id) const = 0;
+
+    virtual std::pair<milvus::Json, bool>
+    GetJsonData(FieldId field_id, size_t offset) const = 0;
+
+    virtual void
+    LazyCheckSchema(const Schema& sch) = 0;
+
+    // reopen segment with new schema
+    virtual void
+    Reopen(SchemaPtr sch) = 0;
+
+    // FinishLoad notifies the segment that all load operation are done
+    // currently it's used to sync field data list with updated schema.
+    virtual void
+    FinishLoad() = 0;
 };
 
 // internal API for DSL calculation
@@ -133,26 +160,113 @@ class SegmentInterface {
 class SegmentInternalInterface : public SegmentInterface {
  public:
     template <typename T>
-    Span<T>
+    PinWrapper<Span<T>>
     chunk_data(FieldId field_id, int64_t chunk_id) const {
-        return static_cast<Span<T>>(chunk_data_impl(field_id, chunk_id));
+        return chunk_data_impl(field_id, chunk_id)
+            .transform<Span<T>>([](SpanBase&& span_base) {
+                return static_cast<Span<T>>(span_base);
+            });
+    }
+
+    template <typename ViewType>
+    PinWrapper<std::pair<std::vector<ViewType>, FixedVector<bool>>>
+    chunk_view(FieldId field_id,
+               int64_t chunk_id,
+               std::optional<std::pair<int64_t, int64_t>> offset_len =
+                   std::nullopt) const {
+        if constexpr (std::is_same_v<ViewType, std::string_view>) {
+            return chunk_string_view_impl(field_id, chunk_id, offset_len);
+        } else if constexpr (std::is_same_v<ViewType, ArrayView>) {
+            return chunk_array_view_impl(field_id, chunk_id, offset_len);
+        } else if constexpr (std::is_same_v<ViewType, Json>) {
+            auto pw = chunk_string_view_impl(field_id, chunk_id, offset_len);
+            auto [string_views, valid_data] = pw.get();
+            std::vector<Json> res;
+            res.reserve(string_views.size());
+            for (const auto& str_view : string_views) {
+                res.emplace_back(str_view);
+            }
+            return PinWrapper<
+                std::pair<std::vector<ViewType>, FixedVector<bool>>>(
+                {std::move(res), std::move(valid_data)});
+        }
+    }
+
+    template <typename ViewType>
+    PinWrapper<std::pair<std::vector<ViewType>, FixedVector<bool>>>
+    get_batch_views(FieldId field_id,
+                    int64_t chunk_id,
+                    int64_t start_offset,
+                    int64_t length) const {
+        if (this->type() == SegmentType::Growing) {
+            PanicInfo(ErrorCode::Unsupported,
+                      "get chunk views not supported for growing segment");
+        }
+        return chunk_view<ViewType>(
+            field_id, chunk_id, std::make_pair(start_offset, length));
+    }
+
+    template <typename ViewType>
+    PinWrapper<std::pair<std::vector<ViewType>, FixedVector<bool>>>
+    get_views_by_offsets(FieldId field_id,
+                         int64_t chunk_id,
+                         const FixedVector<int32_t>& offsets) const {
+        if (this->type() == SegmentType::Growing) {
+            PanicInfo(ErrorCode::Unsupported,
+                      "get chunk views not supported for growing segment");
+        }
+        auto pw = chunk_view_by_offsets(field_id, chunk_id, offsets);
+        if constexpr (std::is_same_v<ViewType, std::string_view>) {
+            return pw;
+        } else {
+            static_assert(std::is_same_v<ViewType, milvus::Json>,
+                          "only Json is supported for get_views_by_offsets");
+            std::vector<ViewType> res;
+            res.reserve(pw.get().first.size());
+            for (const auto& view : pw.get().first) {
+                res.emplace_back(view);
+            }
+            return PinWrapper<
+                std::pair<std::vector<ViewType>, FixedVector<bool>>>(
+                {std::move(res), pw.get().second});
+        }
     }
 
     template <typename T>
-    const index::ScalarIndex<T>&
+    PinWrapper<const index::ScalarIndex<T>*>
     chunk_scalar_index(FieldId field_id, int64_t chunk_id) const {
         static_assert(IsScalar<T>);
         using IndexType = index::ScalarIndex<T>;
-        auto base_ptr = chunk_index_impl(field_id, chunk_id);
-        auto ptr = dynamic_cast<const IndexType*>(base_ptr);
+        auto pw = chunk_index_impl(field_id, chunk_id);
+        auto ptr = dynamic_cast<const IndexType*>(pw.get());
         AssertInfo(ptr, "entry mismatch");
-        return *ptr;
+        return PinWrapper<const index::ScalarIndex<T>*>(pw, ptr);
+    }
+
+    // union(segment_id, field_id) as unique id
+    virtual std::string
+    GetUniqueFieldId(int64_t field_id) const {
+        return std::to_string(get_segment_id()) + "_" +
+               std::to_string(field_id);
+    }
+
+    template <typename T>
+    PinWrapper<const index::ScalarIndex<T>*>
+    chunk_scalar_index(FieldId field_id,
+                       std::string path,
+                       int64_t chunk_id) const {
+        using IndexType = index::ScalarIndex<T>;
+        auto pw = chunk_index_impl(field_id, path, chunk_id);
+        auto ptr = dynamic_cast<const IndexType*>(pw.get());
+        AssertInfo(ptr, "entry mismatch");
+        return PinWrapper<const index::ScalarIndex<T>*>(pw, ptr);
     }
 
     std::unique_ptr<SearchResult>
     Search(const query::Plan* Plan,
            const query::PlaceholderGroup* placeholder_group,
-           Timestamp timestamp) const override;
+           Timestamp timestamp,
+           int32_t consistency_level = 0) const override;
 
     void
     FillPrimaryKeys(const query::Plan* plan,
@@ -167,7 +281,8 @@ class SegmentInternalInterface : public SegmentInterface {
              const query::RetrievePlan* Plan,
              Timestamp timestamp,
              int64_t limit_size,
-             bool ignore_non_pk) const override;
+             bool ignore_non_pk,
+             int32_t consistency_level = 0) const override;
 
     std::unique_ptr<proto::segcore::RetrieveResults>
     Retrieve(tracer::TraceContext* trace_ctx,
@@ -177,6 +292,12 @@ class SegmentInternalInterface : public SegmentInterface {
 
     virtual bool
     HasIndex(FieldId field_id) const = 0;
+
+    virtual bool
+    HasIndex(FieldId field_id,
+             const std::string& nested_path,
+             DataType data_type,
+             bool any_type = false) const = 0;
 
     virtual bool
     HasFieldData(FieldId field_id) const = 0;
@@ -194,24 +315,29 @@ class SegmentInternalInterface : public SegmentInterface {
     set_field_avg_size(FieldId field_id,
                        int64_t num_rows,
                        int64_t field_size) override;
+    virtual bool
+    is_chunked() const {
+        return false;
+    }
 
     const SkipIndex&
     GetSkipIndex() const;
 
     void
-    LoadPrimitiveSkipIndex(FieldId field_id,
-                           int64_t chunk_id,
-                           DataType data_type,
-                           const void* chunk_data,
-                           int64_t count);
-
-    void
-    LoadStringSkipIndex(FieldId field_id,
-                        int64_t chunk_id,
-                        const milvus::VariableColumn<std::string>& var_column);
+    LoadSkipIndex(FieldId field_id,
+                  DataType data_type,
+                  std::shared_ptr<ChunkedColumnInterface> column) {
+        skip_index_.LoadSkip(get_segment_id(), field_id, data_type, column);
+    }
 
     virtual DataType
     GetFieldDataType(FieldId fieldId) const = 0;
+
+    index::TextMatchIndex*
+    GetTextIndex(FieldId field_id) const override;
+
+    virtual index::JsonKeyStatsInvertedIndex*
+    GetJsonKeyIndex(FieldId field_id) const override;
 
  public:
     virtual void
@@ -223,7 +349,7 @@ class SegmentInternalInterface : public SegmentInterface {
                   SearchResult& output) const = 0;
 
     virtual void
-    mask_with_delete(BitsetType& bitset,
+    mask_with_delete(BitsetTypeView& bitset,
                      int64_t ins_barrier,
                      Timestamp timestamp) const = 0;
 
@@ -235,14 +361,23 @@ class SegmentInternalInterface : public SegmentInterface {
     virtual int64_t
     num_chunk_data(FieldId field_id) const = 0;
 
+    virtual int64_t
+    num_rows_until_chunk(FieldId field_id, int64_t chunk_id) const = 0;
+
     // bitset 1 means not hit. 0 means hit.
     virtual void
-    mask_with_timestamps(BitsetType& bitset_chunk,
+    mask_with_timestamps(BitsetTypeView& bitset_chunk,
                          Timestamp timestamp) const = 0;
 
     // count of chunks
     virtual int64_t
-    num_chunk() const = 0;
+    num_chunk(FieldId field_id) const = 0;
+
+    virtual int64_t
+    chunk_size(FieldId field_id, int64_t chunk_id) const = 0;
+
+    virtual std::pair<int64_t, int64_t>
+    get_chunk_by_offset(FieldId field_id, int64_t offset) const = 0;
 
     // element size in each chunk
     virtual int64_t
@@ -292,9 +427,7 @@ class SegmentInternalInterface : public SegmentInterface {
      * @return All candidates offsets.
      */
     virtual std::pair<std::vector<OffsetMap::OffsetType>, bool>
-    find_first(int64_t limit,
-               const BitsetType& bitset,
-               bool false_filtered_out) const = 0;
+    find_first(int64_t limit, const BitsetType& bitset) const = 0;
 
     void
     FillTargetEntry(
@@ -306,15 +439,59 @@ class SegmentInternalInterface : public SegmentInterface {
         bool ignore_non_pk,
         bool fill_ids) const;
 
+    // return whether field mmap or not
+    virtual bool
+    is_mmap_field(FieldId field_id) const = 0;
+
+    virtual std::unique_ptr<DataArray>
+    bulk_subscript_not_exist_field(const milvus::FieldMeta& field_meta,
+                                   int64_t count) const;
+
  protected:
+    // todo: use an Unified struct for all type in growing/seal segment to store data and valid_data.
     // internal API: return chunk_data in span
-    virtual SpanBase
+    virtual PinWrapper<SpanBase>
     chunk_data_impl(FieldId field_id, int64_t chunk_id) const = 0;
 
-    // internal API: return chunk_index in span, support scalar index only
-    virtual const index::IndexBase*
-    chunk_index_impl(FieldId field_id, int64_t chunk_id) const = 0;
+    // internal API: return chunk string views in vector
+    virtual PinWrapper<
+        std::pair<std::vector<std::string_view>, FixedVector<bool>>>
+    chunk_string_view_impl(FieldId field_id,
+                           int64_t chunk_id,
+                           std::optional<std::pair<int64_t, int64_t>>
+                               offset_len = std::nullopt) const = 0;
 
+    virtual PinWrapper<std::pair<std::vector<ArrayView>, FixedVector<bool>>>
+    chunk_array_view_impl(FieldId field_id,
+                          int64_t chunk_id,
+                          std::optional<std::pair<int64_t, int64_t>>
+                              offset_len = std::nullopt) const = 0;
+
+    virtual PinWrapper<
+        std::pair<std::vector<std::string_view>, FixedVector<bool>>>
+    chunk_view_by_offsets(FieldId field_id,
+                          int64_t chunk_id,
+                          const FixedVector<int32_t>& offsets) const = 0;
+
+    // internal API: return chunk_index in span, support scalar index only
+    virtual PinWrapper<const index::IndexBase*>
+    chunk_index_impl(FieldId field_id, int64_t chunk_id) const = 0;
+    virtual void
+    check_search(const query::Plan* plan) const = 0;
+
+    virtual const ConcurrentVector<Timestamp>&
+    get_timestamps() const = 0;
+
+ public:
+    virtual PinWrapper<const index::IndexBase*>
+    chunk_index_impl(FieldId field_id,
+                     std::string path,
+                     int64_t chunk_id) const {
+        PanicInfo(ErrorCode::NotImplemented, "not implemented");
+    };
+
+    virtual bool
+    is_field_exist(FieldId field_id) const = 0;
     // calculate output[i] = Vec[seg_offsets[i]}, where Vec binds to system_type
     virtual void
     bulk_subscript(SystemFieldType system_type,
@@ -328,11 +505,15 @@ class SegmentInternalInterface : public SegmentInterface {
                    const int64_t* seg_offsets,
                    int64_t count) const = 0;
 
-    virtual void
-    check_search(const query::Plan* plan) const = 0;
+    virtual std::unique_ptr<DataArray>
+    bulk_subscript(
+        FieldId field_ids,
+        const int64_t* seg_offsets,
+        int64_t count,
+        const std::vector<std::string>& dynamic_field_names) const = 0;
 
-    virtual const ConcurrentVector<Timestamp>&
-    get_timestamps() const = 0;
+    virtual std::vector<SegOffset>
+    search_pk(const PkType& pk, Timestamp timestamp) const = 0;
 
  protected:
     mutable std::shared_mutex mutex_;
@@ -340,6 +521,14 @@ class SegmentInternalInterface : public SegmentInterface {
     std::unordered_map<FieldId, std::pair<int64_t, int64_t>>
         variable_fields_avg_size_;  // bytes;
     SkipIndex skip_index_;
+
+    // text-indexes used to do match.
+    std::unordered_map<FieldId, std::unique_ptr<index::TextMatchIndex>>
+        text_indexes_;
+
+    std::unordered_map<FieldId,
+                       std::unique_ptr<index::JsonKeyStatsInvertedIndex>>
+        json_indexes_;
 };
 
 }  // namespace milvus::segcore

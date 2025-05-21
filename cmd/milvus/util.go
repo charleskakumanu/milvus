@@ -21,10 +21,11 @@ import (
 
 	"github.com/milvus-io/milvus/cmd/roles"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/etcd"
-	"github.com/milvus-io/milvus/pkg/util/hardware"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/internal/util/streamingutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/etcd"
+	"github.com/milvus-io/milvus/pkg/v2/util/hardware"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 func makeRuntimeDir(dir string) error {
@@ -122,51 +123,49 @@ func removePidFile(lock *flock.Flock) {
 }
 
 func GetMilvusRoles(args []string, flags *flag.FlagSet) *roles.MilvusRoles {
-	alias, enableRootCoord, enableQueryCoord, enableIndexCoord, enableDataCoord, enableQueryNode,
-		enableDataNode, enableIndexNode, enableProxy := formatFlags(args, flags)
-
+	alias, enableRootCoord, enableQueryCoord, enableDataCoord, enableQueryNode,
+		enableDataNode, enableProxy, enableStreamingNode := formatFlags(args, flags)
 	serverType := args[2]
 	role := roles.NewMilvusRoles()
 	role.Alias = alias
 	role.ServerType = serverType
 
 	switch serverType {
-	case typeutil.RootCoordRole:
-		role.EnableRootCoord = true
 	case typeutil.ProxyRole:
 		role.EnableProxy = true
-	case typeutil.QueryCoordRole:
-		role.EnableQueryCoord = true
 	case typeutil.QueryNodeRole:
 		role.EnableQueryNode = true
-	case typeutil.DataCoordRole:
-		role.EnableDataCoord = true
 	case typeutil.DataNodeRole:
 		role.EnableDataNode = true
-	case typeutil.IndexCoordRole:
-		role.EnableIndexCoord = true
-	case typeutil.IndexNodeRole:
-		role.EnableIndexNode = true
-	case typeutil.StandaloneRole, typeutil.EmbeddedRole:
-		role.EnableRootCoord = true
-		role.EnableProxy = true
-		role.EnableQueryCoord = true
+	case typeutil.StreamingNodeRole:
+		streamingutil.EnableEmbededQueryNode()
+		role.EnableStreamingNode = true
 		role.EnableQueryNode = true
-		role.EnableDataCoord = true
+	case typeutil.StandaloneRole, typeutil.EmbeddedRole:
+		role.EnableMixCoord = true
+		role.EnableProxy = true
+		role.EnableQueryNode = true
 		role.EnableDataNode = true
-		role.EnableIndexCoord = true
-		role.EnableIndexNode = true
+		if streamingutil.IsStreamingServiceEnabled() {
+			role.EnableStreamingNode = true
+		}
 		role.Local = true
 		role.Embedded = serverType == typeutil.EmbeddedRole
+	case typeutil.MixCoordRole:
+		role.EnableMixCoord = true
+
 	case typeutil.MixtureRole:
 		role.EnableRootCoord = enableRootCoord
 		role.EnableQueryCoord = enableQueryCoord
 		role.EnableDataCoord = enableDataCoord
-		role.EnableIndexCoord = enableIndexCoord
 		role.EnableQueryNode = enableQueryNode
 		role.EnableDataNode = enableDataNode
-		role.EnableIndexNode = enableIndexNode
 		role.EnableProxy = enableProxy
+		role.EnableStreamingNode = enableStreamingNode
+		if enableStreamingNode && !enableQueryNode {
+			role.EnableQueryNode = true
+			streamingutil.EnableEmbededQueryNode()
+		}
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown server type = %s\n%s", serverType, getHelp())
 		os.Exit(-1)
@@ -176,19 +175,18 @@ func GetMilvusRoles(args []string, flags *flag.FlagSet) *roles.MilvusRoles {
 }
 
 func formatFlags(args []string, flags *flag.FlagSet) (alias string, enableRootCoord, enableQueryCoord,
-	enableIndexCoord, enableDataCoord, enableQueryNode, enableDataNode, enableIndexNode, enableProxy bool,
+	enableDataCoord, enableQueryNode, enableDataNode, enableProxy bool, enableStreamingNode bool,
 ) {
 	flags.StringVar(&alias, "alias", "", "set alias")
-
+	var enableIndexCoord bool
 	flags.BoolVar(&enableRootCoord, typeutil.RootCoordRole, false, "enable root coordinator")
 	flags.BoolVar(&enableQueryCoord, typeutil.QueryCoordRole, false, "enable query coordinator")
-	flags.BoolVar(&enableIndexCoord, typeutil.IndexCoordRole, false, "enable index coordinator")
 	flags.BoolVar(&enableDataCoord, typeutil.DataCoordRole, false, "enable data coordinator")
-
+	flags.BoolVar(&enableIndexCoord, typeutil.IndexCoordRole, false, "enable index coordinator")
 	flags.BoolVar(&enableQueryNode, typeutil.QueryNodeRole, false, "enable query node")
 	flags.BoolVar(&enableDataNode, typeutil.DataNodeRole, false, "enable data node")
-	flags.BoolVar(&enableIndexNode, typeutil.IndexNodeRole, false, "enable index node")
 	flags.BoolVar(&enableProxy, typeutil.ProxyRole, false, "enable proxy node")
+	flags.BoolVar(&enableStreamingNode, typeutil.StreamingNodeRole, false, "enable streaming node")
 
 	serverType := args[2]
 	if serverType == typeutil.EmbeddedRole {
@@ -228,7 +226,7 @@ func CleanSession(metaPath string, etcdEndpoints []string, sessionSuffix []strin
 	for _, key := range keys {
 		_, _ = etcdCli.Delete(ctx, key)
 	}
-	log.Info("clean sessions from etcd", zap.Any("keys", keys))
+	log.Ctx(ctx).Info("clean sessions from etcd", zap.Any("keys", keys))
 	return nil
 }
 
@@ -245,14 +243,14 @@ func getSessionPaths(ctx context.Context, client *clientv3.Client, metaPath stri
 
 // filterUnmatchedKey skip active keys that don't match completed key, the latest active key may from standby server
 func addActiveKeySuffix(ctx context.Context, client *clientv3.Client, sessionPathPrefix string, sessionSuffix []string) []string {
+	log := log.Ctx(ctx)
 	suffixSet := lo.SliceToMap(sessionSuffix, func(t string) (string, struct{}) {
 		return t, struct{}{}
 	})
 
 	for _, suffix := range sessionSuffix {
-		if strings.Contains(suffix, "-") && (strings.HasPrefix(suffix, typeutil.RootCoordRole) ||
-			strings.HasPrefix(suffix, typeutil.QueryCoordRole) || strings.HasPrefix(suffix, typeutil.DataCoordRole) ||
-			strings.HasPrefix(suffix, typeutil.IndexCoordRole)) {
+		if strings.Contains(suffix, "-") && (strings.HasPrefix(suffix, typeutil.MixCoordRole) ||
+			strings.HasPrefix(suffix, typeutil.QueryCoordRole) || strings.HasPrefix(suffix, typeutil.DataCoordRole)) {
 			res := strings.Split(suffix, "-")
 			if len(res) != 2 {
 				// skip illegal keys
@@ -277,11 +275,6 @@ func addActiveKeySuffix(ctx context.Context, client *clientv3.Client, sessionPat
 			if serverID == targetServerID {
 				log.Info("add active serverID key", zap.String("suffix", suffix), zap.String("key", key))
 				suffixSet[serverType] = struct{}{}
-			}
-
-			// also remove a faked indexcoord seesion if role is a datacoord
-			if strings.HasPrefix(suffix, typeutil.DataCoordRole) {
-				suffixSet[typeutil.IndexCoordRole] = struct{}{}
 			}
 		}
 	}

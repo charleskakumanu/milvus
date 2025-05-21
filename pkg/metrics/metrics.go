@@ -29,6 +29,7 @@ const (
 	AbandonLabel = "abandon"
 	SuccessLabel = "success"
 	FailLabel    = "fail"
+	CancelLabel  = "cancel"
 	TotalLabel   = "total"
 
 	HybridSearchLabel = "hybrid_search"
@@ -56,6 +57,10 @@ const (
 	FlushingSegmentLabel = "Flushing"
 	DroppedSegmentLabel  = "Dropped"
 
+	StreamingDataSourceLabel  = "streaming"
+	BulkinsertDataSourceLabel = "bulkinsert"
+	CompactionDataSourceLabel = "compaction"
+
 	Leader     = "OnLeader"
 	FromLeader = "FromLeader"
 
@@ -73,31 +78,42 @@ const (
 	Executing = "executing"
 	Done      = "done"
 
+	ImportStagePending      = "pending"
+	ImportStagePreImport    = "preimport"
+	ImportStageImport       = "import"
+	ImportStageStats        = "stats"
+	ImportStageBuildIndex   = "build_index"
+	ImportStageWaitL0Import = "wait_l0_import"
+
 	compactionTypeLabelName  = "compaction_type"
 	isVectorFieldLabelName   = "is_vector_field"
+	segmentPruneLabelName    = "segment_prune_label"
 	stageLabelName           = "compaction_stage"
 	nodeIDLabelName          = "node_id"
+	nodeHostLabelName        = "node_host"
 	statusLabelName          = "status"
 	indexTaskStatusLabelName = "index_task_status"
 	msgTypeLabelName         = "msg_type"
 	collectionIDLabelName    = "collection_id"
-	partitionIDLabelName     = "partition_id"
+	fieldIDLabelName         = "field_id"
 	channelNameLabelName     = "channel_name"
 	functionLabelName        = "function_name"
 	queryTypeLabelName       = "query_type"
 	collectionName           = "collection_name"
 	databaseLabelName        = "db_name"
-	resourceGroupLabelName   = "rg"
+	ResourceGroupLabelName   = "rg"
 	indexName                = "index_name"
 	isVectorIndex            = "is_vector_index"
 	segmentStateLabelName    = "segment_state"
-	segmentIDLabelName       = "segment_id"
 	segmentLevelLabelName    = "segment_level"
+	segmentIsSortedLabelName = "segment_is_sorted"
 	usernameLabelName        = "username"
 	roleNameLabelName        = "role_name"
 	cacheNameLabelName       = "cache_name"
 	cacheStateLabelName      = "cache_state"
-	indexCountLabelName      = "indexed_field_count"
+	dataSourceLabelName      = "data_source"
+	dataTypeLabelName        = "data_type"
+	importStageLabelName     = "import_stage"
 	requestScope             = "scope"
 	fullMethodLabelName      = "full_method"
 	reduceLevelName          = "reduce_level"
@@ -107,12 +123,22 @@ const (
 	lockType                 = "lock_type"
 	lockOp                   = "lock_op"
 	loadTypeName             = "load_type"
+	pathLabelName            = "path"
+	cgoNameLabelName         = `cgo_name`
+	cgoTypeLabelName         = `cgo_type`
+	queueTypeLabelName       = `queue_type`
+
+	// model function/UDF labels
+	functionTypeName = "function_type_name"
+	functionProvider = "function_provider"
+	functionName     = "function_name"
 
 	// entities label
 	LoadedLabel         = "loaded"
 	NumEntitiesAllLabel = "all"
 
-	taskTypeLabel = "task_type"
+	TaskTypeLabel  = "task_type"
+	TaskStateLabel = "task_state"
 )
 
 var (
@@ -164,5 +190,6 @@ func Register(r prometheus.Registerer) {
 	r.MustRegister(LockCosts)
 	r.MustRegister(BuildInfo)
 	r.MustRegister(RuntimeInfo)
+	r.MustRegister(ThreadNum)
 	metricRegisterer = r
 }

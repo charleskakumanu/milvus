@@ -23,9 +23,10 @@ import (
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 const (
@@ -73,6 +74,8 @@ type distribution struct {
 	// current is the snapshot for quick usage for search/query
 	// generated for each change of distribution
 	current *atomic.Pointer[snapshot]
+
+	idfOracle IDFOracle
 	// protects current & segments
 	mut sync.RWMutex
 }
@@ -84,6 +87,7 @@ type SegmentEntry struct {
 	PartitionID   UniqueID
 	Version       int64
 	TargetVersion int64
+	Level         datapb.SegmentLevel
 }
 
 // NewDistribution creates a new distribution instance with all field initialized.
@@ -102,21 +106,32 @@ func NewDistribution() *distribution {
 	return dist
 }
 
+func (d *distribution) SetIDFOracle(idfOracle IDFOracle) {
+	d.mut.Lock()
+	defer d.mut.Unlock()
+	d.idfOracle = idfOracle
+}
+
 func (d *distribution) PinReadableSegments(partitions ...int64) (sealed []SnapshotItem, growing []SegmentEntry, version int64, err error) {
 	d.mut.RLock()
 	defer d.mut.RUnlock()
 
 	if !d.Serviceable() {
-		return nil, nil, -1, merr.WrapErrServiceInternal("channel distribution is not serviceable")
+		return nil, nil, -1, merr.WrapErrChannelNotAvailable("channel distribution is not serviceable")
 	}
 
 	current := d.current.Load()
+	// snapshot sanity check
+	// if user specified a partition id which is not serviceable, return err
+	for _, partition := range partitions {
+		if !current.partitions.Contain(partition) {
+			return nil, nil, -1, merr.WrapErrPartitionNotLoaded(partition)
+		}
+	}
 	sealed, growing = current.Get(partitions...)
 	version = current.version
 	targetVersion := current.GetTargetVersion()
-	filterReadable := func(entry SegmentEntry, _ int) bool {
-		return entry.TargetVersion == targetVersion || entry.TargetVersion == initialTargetVersion
-	}
+	filterReadable := d.readableFilter(targetVersion)
 	sealed, growing = d.filterSegments(sealed, growing, filterReadable)
 	return
 }
@@ -157,9 +172,7 @@ func (d *distribution) PeekSegments(readable bool, partitions ...int64) (sealed 
 
 	if readable {
 		targetVersion := current.GetTargetVersion()
-		filterReadable := func(entry SegmentEntry, _ int) bool {
-			return entry.TargetVersion == targetVersion || entry.TargetVersion == initialTargetVersion
-		}
+		filterReadable := d.readableFilter(targetVersion)
 		sealed, growing = d.filterSegments(sealed, growing, filterReadable)
 		return
 	}
@@ -255,7 +268,7 @@ func (d *distribution) AddOfflines(segmentIDs ...int64) {
 }
 
 // UpdateTargetVersion update readable segment version
-func (d *distribution) SyncTargetVersion(newVersion int64, growingInTarget []int64, sealedInTarget []int64, redundantGrowings []int64) {
+func (d *distribution) SyncTargetVersion(newVersion int64, partitions []int64, growingInTarget []int64, sealedInTarget []int64, redundantGrowings []int64) {
 	d.mut.Lock()
 	defer d.mut.Unlock()
 
@@ -293,10 +306,12 @@ func (d *distribution) SyncTargetVersion(newVersion int64, growingInTarget []int
 
 	oldValue := d.targetVersion.Load()
 	d.targetVersion.Store(newVersion)
-	d.genSnapshot()
+	// update working partition list
+	d.genSnapshot(WithPartitions(partitions))
 	// if sealed segment in leader view is less than sealed segment in target, set delegator to unserviceable
 	d.serviceable.Store(available)
 	log.Info("Update readable segment version",
+		zap.Int64s("partitions", partitions),
 		zap.Int64("oldVersion", oldValue),
 		zap.Int64("newVersion", newVersion),
 		zap.Int("growingSegmentNum", len(growingInTarget)),
@@ -339,36 +354,61 @@ func (d *distribution) RemoveDistributions(sealedSegments []SegmentEntry, growin
 // getSnapshot converts current distribution to snapshot format.
 // in which, user could use found nodeID=>segmentID list.
 // mutex RLock is required before calling this method.
-func (d *distribution) genSnapshot() chan struct{} {
+func (d *distribution) genSnapshot(opts ...genSnapshotOpt) chan struct{} {
+	// stores last snapshot
+	// ok to be nil
+	last := d.current.Load()
+	option := &genSnapshotOption{
+		partitions: typeutil.NewSet[int64](), // if no working list provided, snapshot shall have no item
+	}
+	// use last snapshot working parition list by default
+	if last != nil {
+		option.partitions = last.partitions
+	}
+	for _, opt := range opts {
+		opt(option)
+	}
+
 	nodeSegments := make(map[int64][]SegmentEntry)
 	for _, entry := range d.sealedSegments {
 		nodeSegments[entry.NodeID] = append(nodeSegments[entry.NodeID], entry)
 	}
 
+	// only store working partition entry in snapshot to reduce calculation
 	dist := make([]SnapshotItem, 0, len(nodeSegments))
 	for nodeID, items := range nodeSegments {
 		dist = append(dist, SnapshotItem{
-			NodeID:   nodeID,
-			Segments: items,
+			NodeID: nodeID,
+			Segments: lo.Map(items, func(entry SegmentEntry, _ int) SegmentEntry {
+				if !option.partitions.Contain(entry.PartitionID) {
+					entry.TargetVersion = unreadableTargetVersion
+				}
+				return entry
+			}),
 		})
 	}
 
 	growing := make([]SegmentEntry, 0, len(d.growingSegments))
 	for _, entry := range d.growingSegments {
+		if !option.partitions.Contain(entry.PartitionID) {
+			entry.TargetVersion = unreadableTargetVersion
+		}
 		growing = append(growing, entry)
 	}
 
 	d.serviceable.Store(d.offlines.Len() == 0)
 
-	// stores last snapshot
-	// ok to be nil
-	last := d.current.Load()
 	// update snapshot version
 	d.snapshotVersion++
 	newSnapShot := NewSnapshot(dist, growing, last, d.snapshotVersion, d.targetVersion.Load())
+	newSnapShot.partitions = option.partitions
+
 	d.current.Store(newSnapShot)
 	// shall be a new one
 	d.snapshots.GetOrInsert(d.snapshotVersion, newSnapShot)
+	if d.idfOracle != nil {
+		d.idfOracle.SyncDistribution(newSnapShot)
+	}
 
 	// first snapshot, return closed chan
 	if last == nil {
@@ -382,9 +422,28 @@ func (d *distribution) genSnapshot() chan struct{} {
 	return last.cleared
 }
 
+func (d *distribution) readableFilter(targetVersion int64) func(entry SegmentEntry, _ int) bool {
+	return func(entry SegmentEntry, _ int) bool {
+		// segment L0 is not readable for now
+		return entry.Level != datapb.SegmentLevel_L0 && (entry.TargetVersion == targetVersion || entry.TargetVersion == initialTargetVersion)
+	}
+}
+
 // getCleanup returns cleanup snapshots function.
 func (d *distribution) getCleanup(version int64) snapshotCleanup {
 	return func() {
 		d.snapshots.GetAndRemove(version)
+	}
+}
+
+type genSnapshotOption struct {
+	partitions typeutil.Set[int64]
+}
+
+type genSnapshotOpt func(*genSnapshotOption)
+
+func WithPartitions(partitions []int64) genSnapshotOpt {
+	return func(opt *genSnapshotOption) {
+		opt.partitions = typeutil.NewSet(partitions...)
 	}
 }

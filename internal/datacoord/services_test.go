@@ -2,7 +2,6 @@ package datacoord
 
 import (
 	"context"
-	"fmt"
 	"testing"
 	"time"
 
@@ -20,19 +19,25 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/datacoord/allocator"
+	"github.com/milvus-io/milvus/internal/datacoord/broker"
+	"github.com/milvus-io/milvus/internal/datacoord/session"
 	"github.com/milvus-io/milvus/internal/metastore/mocks"
 	"github.com/milvus-io/milvus/internal/metastore/model"
 	mocks2 "github.com/milvus-io/milvus/internal/mocks"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/indexpb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
+	"github.com/milvus-io/milvus/internal/mocks/distributed/mock_streaming"
+	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/types"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/mq/msgstream"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/metautil"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/tsoutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/workerpb"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/metautil"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 type ServerSuite struct {
@@ -44,9 +49,11 @@ type ServerSuite struct {
 
 func WithChannelManager(cm ChannelManager) Option {
 	return func(svr *Server) {
-		svr.sessionManager = NewSessionManagerImpl(withSessionCreator(svr.dataNodeCreator))
+		svr.sessionManager = session.NewDataNodeManagerImpl(session.WithDataNodeCreator(svr.dataNodeCreator))
 		svr.channelManager = cm
 		svr.cluster = NewClusterImpl(svr.sessionManager, svr.channelManager)
+		svr.nodeManager = session.NewNodeManager(svr.dataNodeCreator)
+		svr.cluster2 = session.NewCluster(svr.nodeManager)
 	}
 }
 
@@ -77,7 +84,7 @@ func genMsg(msgType commonpb.MsgType, ch string, t Timestamp, sourceID int64) *m
 		BaseMsg: msgstream.BaseMsg{
 			HashValues: []uint32{0},
 		},
-		DataNodeTtMsg: msgpb.DataNodeTtMsg{
+		DataNodeTtMsg: &msgpb.DataNodeTtMsg{
 			Base: &commonpb.MsgBase{
 				MsgType:   msgType,
 				Timestamp: t,
@@ -88,309 +95,6 @@ func genMsg(msgType commonpb.MsgType, ch string, t Timestamp, sourceID int64) *m
 			SegmentsStats: []*commonpb.SegmentStats{{SegmentID: 2, NumRows: 100}},
 		},
 	}
-}
-
-func (s *ServerSuite) TestHandleDataNodeTtMsg() {
-	var (
-		chanName       = "ch-1"
-		collID   int64 = 100
-		sourceID int64 = 1
-	)
-	s.testServer.meta.AddCollection(&collectionInfo{
-		ID:         collID,
-		Schema:     newTestSchema(),
-		Partitions: []int64{10},
-	})
-	resp, err := s.testServer.AssignSegmentID(context.TODO(), &datapb.AssignSegmentIDRequest{
-		NodeID: sourceID,
-		SegmentIDRequests: []*datapb.SegmentIDRequest{
-			{
-				CollectionID: collID,
-				PartitionID:  10,
-				ChannelName:  chanName,
-				Count:        100,
-			},
-		},
-	})
-	s.Require().NoError(err)
-	s.Require().True(merr.Ok(resp.GetStatus()))
-	s.Equal(1, len(resp.GetSegIDAssignments()))
-	assign := resp.GetSegIDAssignments()[0]
-
-	assignedSegmentID := resp.SegIDAssignments[0].SegID
-	segment := s.testServer.meta.GetHealthySegment(assignedSegmentID)
-	s.Require().NotNil(segment)
-	s.Equal(1, len(segment.allocations))
-
-	ts := tsoutil.AddPhysicalDurationOnTs(assign.ExpireTime, -3*time.Minute)
-	msg := genMsg(commonpb.MsgType_DataNodeTt, chanName, ts, sourceID)
-	msg.SegmentsStats = append(msg.SegmentsStats, &commonpb.SegmentStats{
-		SegmentID: assign.GetSegID(),
-		NumRows:   1,
-	})
-	mockCluster := NewMockCluster(s.T())
-	mockCluster.EXPECT().Close().Once()
-	mockCluster.EXPECT().Flush(mock.Anything, sourceID, chanName, mock.Anything).RunAndReturn(
-		func(ctx context.Context, nodeID int64, channel string, segments []*datapb.SegmentInfo) error {
-			s.EqualValues(chanName, channel)
-			s.EqualValues(sourceID, nodeID)
-			s.Equal(1, len(segments))
-			s.EqualValues(2, segments[0].GetID())
-
-			return fmt.Errorf("mock error")
-		}).Once()
-	s.testServer.cluster = mockCluster
-	s.mockChMgr.EXPECT().Match(sourceID, chanName).Return(true).Twice()
-
-	err = s.testServer.handleDataNodeTtMsg(context.TODO(), &msg.DataNodeTtMsg)
-	s.NoError(err)
-
-	tt := tsoutil.AddPhysicalDurationOnTs(assign.ExpireTime, 48*time.Hour)
-	msg = genMsg(commonpb.MsgType_DataNodeTt, chanName, tt, sourceID)
-	msg.SegmentsStats = append(msg.SegmentsStats, &commonpb.SegmentStats{
-		SegmentID: assign.GetSegID(),
-		NumRows:   1,
-	})
-
-	err = s.testServer.handleDataNodeTtMsg(context.TODO(), &msg.DataNodeTtMsg)
-	s.Error(err)
-}
-
-// restart the server for config DataNodeTimeTickByRPC=false
-func (s *ServerSuite) initSuiteForTtChannel() {
-	s.testServer.serverLoopWg.Add(1)
-	s.testServer.startDataNodeTtLoop(s.testServer.serverLoopCtx)
-
-	s.testServer.meta.AddCollection(&collectionInfo{
-		ID:         1,
-		Schema:     newTestSchema(),
-		Partitions: []int64{10},
-	})
-}
-
-func (s *ServerSuite) TestDataNodeTtChannel_ExpireAfterTt() {
-	s.initSuiteForTtChannel()
-
-	ctx := context.TODO()
-	ttMsgStream, err := s.testServer.factory.NewMsgStream(ctx)
-	s.Require().NoError(err)
-
-	ttMsgStream.AsProducer([]string{paramtable.Get().CommonCfg.DataCoordTimeTick.GetValue()})
-	defer ttMsgStream.Close()
-
-	var (
-		sourceID int64 = 9997
-		chanName       = "ch-1"
-		signal         = make(chan struct{})
-		collID   int64 = 1
-	)
-	mockCluster := NewMockCluster(s.T())
-	mockCluster.EXPECT().Close().Once()
-	mockCluster.EXPECT().Flush(mock.Anything, sourceID, chanName, mock.Anything).RunAndReturn(
-		func(ctx context.Context, nodeID int64, channel string, segments []*datapb.SegmentInfo) error {
-			s.EqualValues(chanName, channel)
-			s.EqualValues(sourceID, nodeID)
-			s.Equal(1, len(segments))
-			s.EqualValues(2, segments[0].GetID())
-
-			signal <- struct{}{}
-			return nil
-		}).Once()
-	s.testServer.cluster = mockCluster
-	s.mockChMgr.EXPECT().Match(sourceID, chanName).Return(true).Once()
-
-	resp, err := s.testServer.AssignSegmentID(context.TODO(), &datapb.AssignSegmentIDRequest{
-		NodeID: sourceID,
-		SegmentIDRequests: []*datapb.SegmentIDRequest{
-			{
-				CollectionID: collID,
-				PartitionID:  10,
-				ChannelName:  chanName,
-				Count:        100,
-			},
-		},
-	})
-	s.Require().NoError(err)
-	s.Require().True(merr.Ok(resp.GetStatus()))
-	s.Equal(1, len(resp.GetSegIDAssignments()))
-
-	assignedSegmentID := resp.SegIDAssignments[0].SegID
-	segment := s.testServer.meta.GetHealthySegment(assignedSegmentID)
-	s.Require().NotNil(segment)
-	s.Equal(1, len(segment.allocations))
-
-	msgPack := msgstream.MsgPack{}
-	tt := tsoutil.AddPhysicalDurationOnTs(resp.SegIDAssignments[0].ExpireTime, 48*time.Hour)
-	msg := genMsg(commonpb.MsgType_DataNodeTt, "ch-1", tt, sourceID)
-	msgPack.Msgs = append(msgPack.Msgs, msg)
-	err = ttMsgStream.Produce(&msgPack)
-	s.Require().NoError(err)
-
-	<-signal
-	segment = s.testServer.meta.GetHealthySegment(assignedSegmentID)
-	s.NotNil(segment)
-	s.Equal(0, len(segment.allocations))
-}
-
-func (s *ServerSuite) TestDataNodeTtChannel_FlushWithDiffChan() {
-	s.initSuiteForTtChannel()
-
-	ctx := context.TODO()
-	ttMsgStream, err := s.testServer.factory.NewMsgStream(ctx)
-	s.Require().NoError(err)
-
-	ttMsgStream.AsProducer([]string{paramtable.Get().CommonCfg.DataCoordTimeTick.GetValue()})
-	defer ttMsgStream.Close()
-
-	var (
-		sourceID int64 = 9998
-		chanName       = "ch-1"
-		signal         = make(chan struct{})
-		collID   int64 = 1
-	)
-
-	mockCluster := NewMockCluster(s.T())
-	mockCluster.EXPECT().Close().Once()
-	mockCluster.EXPECT().Flush(mock.Anything, sourceID, chanName, mock.Anything).RunAndReturn(
-		func(ctx context.Context, nodeID int64, channel string, segments []*datapb.SegmentInfo) error {
-			s.EqualValues(chanName, channel)
-			s.EqualValues(sourceID, nodeID)
-			s.Equal(1, len(segments))
-
-			signal <- struct{}{}
-			return nil
-		}).Once()
-	mockCluster.EXPECT().FlushChannels(mock.Anything, sourceID, mock.Anything, []string{chanName}).Return(nil).Once()
-	s.testServer.cluster = mockCluster
-
-	s.mockChMgr.EXPECT().Match(sourceID, chanName).Return(true).Once()
-	s.mockChMgr.EXPECT().GetNodeChannelsByCollectionID(collID).Return(map[int64][]string{
-		sourceID: {chanName},
-	})
-
-	resp, err := s.testServer.AssignSegmentID(ctx, &datapb.AssignSegmentIDRequest{
-		NodeID: sourceID,
-		SegmentIDRequests: []*datapb.SegmentIDRequest{
-			{
-				CollectionID: collID,
-				PartitionID:  10,
-				ChannelName:  chanName,
-				Count:        100,
-			},
-			{
-				CollectionID: collID,
-				PartitionID:  10,
-				ChannelName:  "ch-2",
-				Count:        100,
-			},
-		},
-	})
-	s.Require().NoError(err)
-	s.Require().True(merr.Ok(resp.GetStatus()))
-	s.Equal(2, len(resp.GetSegIDAssignments()))
-	var assign *datapb.SegmentIDAssignment
-	for _, segment := range resp.SegIDAssignments {
-		if segment.GetChannelName() == chanName {
-			assign = segment
-			break
-		}
-	}
-	s.Require().NotNil(assign)
-
-	resp2, err := s.testServer.Flush(ctx, &datapb.FlushRequest{
-		Base: &commonpb.MsgBase{
-			MsgType:  commonpb.MsgType_Flush,
-			SourceID: sourceID,
-		},
-		CollectionID: collID,
-	})
-	s.Require().NoError(err)
-	s.Require().True(merr.Ok(resp2.GetStatus()))
-
-	msgPack := msgstream.MsgPack{}
-	msg := genMsg(commonpb.MsgType_DataNodeTt, chanName, assign.ExpireTime, sourceID)
-	msg.SegmentsStats = append(msg.SegmentsStats, &commonpb.SegmentStats{
-		SegmentID: assign.GetSegID(),
-		NumRows:   1,
-	})
-	msgPack.Msgs = append(msgPack.Msgs, msg)
-	err = ttMsgStream.Produce(&msgPack)
-	s.NoError(err)
-
-	<-signal
-}
-
-func (s *ServerSuite) TestDataNodeTtChannel_SegmentFlushAfterTt() {
-	s.initSuiteForTtChannel()
-
-	var (
-		sourceID int64 = 9999
-		chanName       = "ch-1"
-		signal         = make(chan struct{})
-		collID   int64 = 1
-	)
-	mockCluster := NewMockCluster(s.T())
-	mockCluster.EXPECT().Close().Once()
-	mockCluster.EXPECT().Flush(mock.Anything, sourceID, chanName, mock.Anything).RunAndReturn(
-		func(ctx context.Context, nodeID int64, channel string, segments []*datapb.SegmentInfo) error {
-			s.EqualValues(chanName, channel)
-			s.EqualValues(sourceID, nodeID)
-			s.Equal(1, len(segments))
-
-			signal <- struct{}{}
-			return nil
-		}).Once()
-	mockCluster.EXPECT().FlushChannels(mock.Anything, sourceID, mock.Anything, []string{chanName}).Return(nil).Once()
-	s.testServer.cluster = mockCluster
-
-	s.mockChMgr.EXPECT().Match(sourceID, chanName).Return(true).Once()
-	s.mockChMgr.EXPECT().GetNodeChannelsByCollectionID(collID).Return(map[int64][]string{
-		sourceID: {chanName},
-	})
-
-	ctx := context.TODO()
-	ttMsgStream, err := s.testServer.factory.NewMsgStream(ctx)
-	s.Require().NoError(err)
-
-	ttMsgStream.AsProducer([]string{paramtable.Get().CommonCfg.DataCoordTimeTick.GetValue()})
-	defer ttMsgStream.Close()
-
-	resp, err := s.testServer.AssignSegmentID(context.TODO(), &datapb.AssignSegmentIDRequest{
-		SegmentIDRequests: []*datapb.SegmentIDRequest{
-			{
-				CollectionID: 1,
-				PartitionID:  10,
-				ChannelName:  chanName,
-				Count:        100,
-			},
-		},
-	})
-	s.Require().NoError(err)
-	s.Require().True(merr.Ok(resp.GetStatus()))
-	s.Require().Equal(1, len(resp.GetSegIDAssignments()))
-
-	assign := resp.GetSegIDAssignments()[0]
-
-	resp2, err := s.testServer.Flush(ctx, &datapb.FlushRequest{
-		Base: &commonpb.MsgBase{
-			MsgType: commonpb.MsgType_Flush,
-		},
-		CollectionID: 1,
-	})
-	s.Require().NoError(err)
-	s.Require().True(merr.Ok(resp2.GetStatus()))
-
-	msgPack := msgstream.MsgPack{}
-	msg := genMsg(commonpb.MsgType_DataNodeTt, "ch-1", assign.ExpireTime, 9999)
-	msg.SegmentsStats = append(msg.SegmentsStats, &commonpb.SegmentStats{
-		SegmentID: assign.GetSegID(),
-		NumRows:   1,
-	})
-	msgPack.Msgs = append(msgPack.Msgs, msg)
-	err = ttMsgStream.Produce(&msgPack)
-	s.Require().NoError(err)
-
-	<-signal
 }
 
 func (s *ServerSuite) TestGetFlushState_ByFlushTs() {
@@ -409,7 +113,7 @@ func (s *ServerSuite) TestGetFlushState_ByFlushTs() {
 		{"channel cp < flush ts", 13, false},
 	}
 
-	err := s.testServer.meta.UpdateChannelCheckpoint("ch1", &msgpb.MsgPosition{
+	err := s.testServer.meta.UpdateChannelCheckpoint(context.TODO(), "ch1", &msgpb.MsgPosition{
 		MsgID:     []byte{1},
 		Timestamp: 12,
 	})
@@ -460,7 +164,7 @@ func (s *ServerSuite) TestGetFlushState_BySegment() {
 			})
 
 			s.Require().NoError(err)
-			err = s.testServer.meta.UpdateChannelCheckpoint("ch1", &msgpb.MsgPosition{
+			err = s.testServer.meta.UpdateChannelCheckpoint(context.TODO(), "ch1", &msgpb.MsgPosition{
 				MsgID:     []byte{1},
 				Timestamp: 12,
 			})
@@ -548,13 +252,19 @@ func (s *ServerSuite) TestSaveBinlogPath_SaveDroppedSegment() {
 	segments := map[int64]commonpb.SegmentState{
 		0: commonpb.SegmentState_Flushed,
 		1: commonpb.SegmentState_Sealed,
+		2: commonpb.SegmentState_Sealed,
 	}
 	for segID, state := range segments {
+		numOfRows := int64(100)
+		if segID == 2 {
+			numOfRows = 0
+		}
 		info := &datapb.SegmentInfo{
 			ID:            segID,
 			InsertChannel: "ch1",
 			State:         state,
 			Level:         datapb.SegmentLevel_L1,
+			NumOfRows:     numOfRows,
 		}
 		err := s.testServer.meta.AddSegment(context.TODO(), NewSegmentInfo(info))
 		s.Require().NoError(err)
@@ -565,11 +275,14 @@ func (s *ServerSuite) TestSaveBinlogPath_SaveDroppedSegment() {
 		inSegID     int64
 		inDropped   bool
 		inFlushed   bool
+		numOfRows   int64
 
 		expectedState commonpb.SegmentState
 	}{
-		{"segID=0, flushed to dropped", 0, true, false, commonpb.SegmentState_Dropped},
-		{"segID=1, sealed to flushing", 1, false, true, commonpb.SegmentState_Flushing},
+		{"segID=0, flushed to dropped", 0, true, false, 100, commonpb.SegmentState_Dropped},
+		{"segID=1, sealed to flushing", 1, false, true, 100, commonpb.SegmentState_Flushing},
+		// empty segment flush should be dropped directly.
+		{"segID=2, sealed to dropped", 2, false, true, 0, commonpb.SegmentState_Dropped},
 	}
 
 	paramtable.Get().Save(paramtable.Get().DataCoordCfg.EnableAutoCompaction.Key, "False")
@@ -589,10 +302,10 @@ func (s *ServerSuite) TestSaveBinlogPath_SaveDroppedSegment() {
 			s.NoError(err)
 			s.EqualValues(resp.ErrorCode, commonpb.ErrorCode_Success)
 
-			segment := s.testServer.meta.GetSegment(test.inSegID)
+			segment := s.testServer.meta.GetSegment(context.TODO(), test.inSegID)
 			s.NotNil(segment)
 			s.EqualValues(0, len(segment.GetBinlogs()))
-			s.EqualValues(segment.NumOfRows, 0)
+			s.EqualValues(segment.NumOfRows, test.numOfRows)
 
 			flushing := []commonpb.SegmentState{commonpb.SegmentState_Flushed, commonpb.SegmentState_Flushing}
 			if lo.Contains(flushing, test.expectedState) {
@@ -608,7 +321,7 @@ func (s *ServerSuite) TestSaveBinlogPath_L0Segment() {
 	s.mockChMgr.EXPECT().Match(int64(0), "ch1").Return(true)
 	s.testServer.meta.AddCollection(&collectionInfo{ID: 0})
 
-	segment := s.testServer.meta.GetHealthySegment(1)
+	segment := s.testServer.meta.GetHealthySegment(context.TODO(), 1)
 	s.Require().Nil(segment)
 	ctx := context.Background()
 	resp, err := s.testServer.SaveBinlogPaths(ctx, &datapb.SaveBinlogPathsRequest{
@@ -652,7 +365,7 @@ func (s *ServerSuite) TestSaveBinlogPath_L0Segment() {
 	s.NoError(err)
 	s.EqualValues(resp.ErrorCode, commonpb.ErrorCode_Success)
 
-	segment = s.testServer.meta.GetHealthySegment(1)
+	segment = s.testServer.meta.GetHealthySegment(context.TODO(), 1)
 	s.NotNil(segment)
 	s.EqualValues(datapb.SegmentLevel_L0, segment.GetLevel())
 }
@@ -664,6 +377,7 @@ func (s *ServerSuite) TestSaveBinlogPath_NormalCase() {
 	segments := map[int64]int64{
 		0: 0,
 		1: 0,
+		2: 0,
 	}
 	for segID, collID := range segments {
 		info := &datapb.SegmentInfo{
@@ -732,7 +446,7 @@ func (s *ServerSuite) TestSaveBinlogPath_NormalCase() {
 	s.NoError(err)
 	s.EqualValues(resp.ErrorCode, commonpb.ErrorCode_Success)
 
-	segment := s.testServer.meta.GetHealthySegment(1)
+	segment := s.testServer.meta.GetHealthySegment(context.TODO(), 1)
 	s.NotNil(segment)
 	binlogs := segment.GetBinlogs()
 	s.EqualValues(1, len(binlogs))
@@ -748,6 +462,24 @@ func (s *ServerSuite) TestSaveBinlogPath_NormalCase() {
 	s.EqualValues(segment.DmlPosition.ChannelName, "ch1")
 	s.EqualValues(segment.DmlPosition.MsgID, []byte{1, 2, 3})
 	s.EqualValues(segment.NumOfRows, 10)
+
+	resp, err = s.testServer.SaveBinlogPaths(ctx, &datapb.SaveBinlogPathsRequest{
+		Base: &commonpb.MsgBase{
+			Timestamp: uint64(time.Now().Unix()),
+		},
+		SegmentID:           2,
+		CollectionID:        0,
+		Channel:             "ch1",
+		Field2BinlogPaths:   []*datapb.FieldBinlog{},
+		Field2StatslogPaths: []*datapb.FieldBinlog{},
+		CheckPoints:         []*datapb.CheckPoint{},
+		Flushed:             true,
+	})
+	s.NoError(err)
+	s.EqualValues(resp.ErrorCode, commonpb.ErrorCode_Success)
+	segment = s.testServer.meta.GetSegment(context.TODO(), 2)
+	s.NotNil(segment)
+	s.Equal(commonpb.SegmentState_Dropped, segment.GetState())
 }
 
 func (s *ServerSuite) TestFlush_NormalCase() {
@@ -773,18 +505,29 @@ func (s *ServerSuite) TestFlush_NormalCase() {
 	s.testServer.cluster = mockCluster
 
 	schema := newTestSchema()
-	s.testServer.meta.AddCollection(&collectionInfo{ID: 0, Schema: schema, Partitions: []int64{}})
-	allocations, err := s.testServer.segmentManager.AllocSegment(context.TODO(), 0, 1, "channel-1", 1)
+	s.testServer.meta.AddCollection(&collectionInfo{ID: 0, Schema: schema, Partitions: []int64{}, VChannelNames: []string{"channel-1"}})
+	allocations, err := s.testServer.segmentManager.AllocSegment(context.TODO(), 0, 1, "channel-1", 1, storage.StorageV1)
 	s.NoError(err)
 	s.EqualValues(1, len(allocations))
 	expireTs := allocations[0].ExpireTime
 	segID := allocations[0].SegmentID
 
+	info, err := s.testServer.segmentManager.AllocNewGrowingSegment(context.TODO(), AllocNewGrowingSegmentRequest{
+		CollectionID:         0,
+		PartitionID:          1,
+		SegmentID:            1,
+		ChannelName:          "channel1-1",
+		StorageVersion:       storage.StorageV1,
+		IsCreatedByStreaming: true,
+	})
+	s.NoError(err)
+	s.NotNil(info)
+
 	resp, err := s.testServer.Flush(context.TODO(), req)
 	s.NoError(err)
 	s.EqualValues(commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 
-	s.testServer.meta.SetCurrentRows(segID, 1)
+	s.testServer.meta.SetRowCount(segID, 1)
 	ids, err := s.testServer.segmentManager.GetFlushableSegments(context.TODO(), "channel-1", expireTs)
 	s.NoError(err)
 	s.EqualValues(1, len(ids))
@@ -955,11 +698,6 @@ func (s *ServerSuite) TestAssignSegmentID() {
 		s.SetupTest()
 		defer s.TearDownTest()
 
-		s.testServer.rootCoordClient = &mockRootCoord{
-			RootCoordClient: s.testServer.rootCoordClient,
-			collID:          collID,
-		}
-
 		schema := newTestSchema()
 		s.testServer.meta.AddCollection(&collectionInfo{
 			ID:         collID,
@@ -994,7 +732,7 @@ func TestBroadcastAlteredCollection(t *testing.T) {
 	})
 
 	t.Run("test meta non exist", func(t *testing.T) {
-		s := &Server{meta: &meta{collections: make(map[UniqueID]*collectionInfo, 1)}}
+		s := &Server{meta: &meta{collections: typeutil.NewConcurrentMap[UniqueID, *collectionInfo]()}}
 		s.stateCode.Store(commonpb.StateCode_Healthy)
 		ctx := context.Background()
 		req := &datapb.AlterCollectionRequest{
@@ -1005,13 +743,13 @@ func TestBroadcastAlteredCollection(t *testing.T) {
 		resp, err := s.BroadcastAlteredCollection(ctx, req)
 		assert.NotNil(t, resp)
 		assert.NoError(t, err)
-		assert.Equal(t, 1, len(s.meta.collections))
+		assert.Equal(t, 1, s.meta.collections.Len())
 	})
 
 	t.Run("test update meta", func(t *testing.T) {
-		s := &Server{meta: &meta{collections: map[UniqueID]*collectionInfo{
-			1: {ID: 1},
-		}}}
+		collections := typeutil.NewConcurrentMap[UniqueID, *collectionInfo]()
+		collections.Insert(1, &collectionInfo{ID: 1})
+		s := &Server{meta: &meta{collections: collections}}
 		s.stateCode.Store(commonpb.StateCode_Healthy)
 		ctx := context.Background()
 		req := &datapb.AlterCollectionRequest{
@@ -1020,11 +758,15 @@ func TestBroadcastAlteredCollection(t *testing.T) {
 			Properties:   []*commonpb.KeyValuePair{{Key: "k", Value: "v"}},
 		}
 
-		assert.Nil(t, s.meta.collections[1].Properties)
+		coll, ok := s.meta.collections.Get(1)
+		assert.True(t, ok)
+		assert.Nil(t, coll.Properties)
 		resp, err := s.BroadcastAlteredCollection(ctx, req)
 		assert.NotNil(t, resp)
 		assert.NoError(t, err)
-		assert.NotNil(t, s.meta.collections[1].Properties)
+		coll, ok = s.meta.collections.Get(1)
+		assert.True(t, ok)
+		assert.NotNil(t, coll.Properties)
 	})
 }
 
@@ -1064,11 +806,9 @@ func TestGetRecoveryInfoV2(t *testing.T) {
 	t.Run("test get recovery info with no segments", func(t *testing.T) {
 		svr := newTestServer(t)
 		defer closeTestServer(t, svr)
-
-		svr.rootCoordClientCreator = func(ctx context.Context) (types.RootCoordClient, error) {
-			return newMockRootCoordClient(), nil
+		svr.mixCoordCreator = func(ctx context.Context) (types.MixCoord, error) {
+			return newMockMixCoord(), nil
 		}
-
 		req := &datapb.GetRecoveryInfoRequestV2{
 			CollectionID: 0,
 		}
@@ -1107,28 +847,26 @@ func TestGetRecoveryInfoV2(t *testing.T) {
 		svr := newTestServer(t)
 		defer closeTestServer(t, svr)
 
-		svr.rootCoordClientCreator = func(ctx context.Context) (types.RootCoordClient, error) {
-			return newMockRootCoordClient(), nil
+		svr.mixCoordCreator = func(ctx context.Context) (types.MixCoord, error) {
+			return newMockMixCoord(), nil
 		}
 
 		svr.meta.AddCollection(&collectionInfo{
 			Schema: newTestSchema(),
 		})
 
-		err := svr.meta.UpdateChannelCheckpoint("vchan1", &msgpb.MsgPosition{
+		err := svr.meta.UpdateChannelCheckpoint(context.TODO(), "vchan1", &msgpb.MsgPosition{
 			ChannelName: "vchan1",
 			Timestamp:   10,
 			MsgID:       []byte{0, 0, 0, 0, 0, 0, 0, 0},
 		})
 		assert.NoError(t, err)
 
-		err = svr.meta.indexMeta.CreateIndex(&model.Index{
-			TenantID:     "",
+		indexReq := &indexpb.CreateIndexRequest{
 			CollectionID: 0,
 			FieldID:      2,
-			IndexID:      0,
-			IndexName:    "",
-		})
+		}
+		_, err = svr.meta.indexMeta.CreateIndex(context.TODO(), indexReq, 0, false)
 		assert.NoError(t, err)
 
 		seg1 := createSegment(0, 0, 0, 100, 10, "vchan1", commonpb.SegmentState_Flushed)
@@ -1171,22 +909,22 @@ func TestGetRecoveryInfoV2(t *testing.T) {
 		assert.NoError(t, err)
 		err = svr.meta.AddSegment(context.TODO(), NewSegmentInfo(seg2))
 		assert.NoError(t, err)
-		err = svr.meta.indexMeta.AddSegmentIndex(&model.SegmentIndex{
+		err = svr.meta.indexMeta.AddSegmentIndex(context.TODO(), &model.SegmentIndex{
 			SegmentID: seg1.ID,
 			BuildID:   seg1.ID,
 		})
 		assert.NoError(t, err)
-		err = svr.meta.indexMeta.FinishTask(&indexpb.IndexTaskInfo{
+		err = svr.meta.indexMeta.FinishTask(&workerpb.IndexTaskInfo{
 			BuildID: seg1.ID,
 			State:   commonpb.IndexState_Finished,
 		})
 		assert.NoError(t, err)
-		err = svr.meta.indexMeta.AddSegmentIndex(&model.SegmentIndex{
+		err = svr.meta.indexMeta.AddSegmentIndex(context.TODO(), &model.SegmentIndex{
 			SegmentID: seg2.ID,
 			BuildID:   seg2.ID,
 		})
 		assert.NoError(t, err)
-		err = svr.meta.indexMeta.FinishTask(&indexpb.IndexTaskInfo{
+		err = svr.meta.indexMeta.FinishTask(&workerpb.IndexTaskInfo{
 			BuildID: seg2.ID,
 			State:   commonpb.IndexState_Finished,
 		})
@@ -1214,17 +952,15 @@ func TestGetRecoveryInfoV2(t *testing.T) {
 	t.Run("test get recovery of unflushed segments ", func(t *testing.T) {
 		svr := newTestServer(t)
 		defer closeTestServer(t, svr)
-
-		svr.rootCoordClientCreator = func(ctx context.Context) (types.RootCoordClient, error) {
-			return newMockRootCoordClient(), nil
+		svr.mixCoordCreator = func(ctx context.Context) (types.MixCoord, error) {
+			return newMockMixCoord(), nil
 		}
-
 		svr.meta.AddCollection(&collectionInfo{
 			ID:     0,
 			Schema: newTestSchema(),
 		})
 
-		err := svr.meta.UpdateChannelCheckpoint("vchan1", &msgpb.MsgPosition{
+		err := svr.meta.UpdateChannelCheckpoint(context.TODO(), "vchan1", &msgpb.MsgPosition{
 			ChannelName: "vchan1",
 			Timestamp:   0,
 			MsgID:       []byte{0, 0, 0, 0, 0, 0, 0, 0},
@@ -1291,14 +1027,12 @@ func TestGetRecoveryInfoV2(t *testing.T) {
 	t.Run("test get binlogs", func(t *testing.T) {
 		svr := newTestServer(t)
 		defer closeTestServer(t, svr)
-
+		svr.mixCoordCreator = func(ctx context.Context) (types.MixCoord, error) {
+			return newMockMixCoord(), nil
+		}
 		svr.meta.AddCollection(&collectionInfo{
 			Schema: newTestSchema(),
 		})
-
-		svr.rootCoordClientCreator = func(ctx context.Context) (types.RootCoordClient, error) {
-			return newMockRootCoordClient(), nil
-		}
 
 		binlogReq := &datapb.SaveBinlogPathsRequest{
 			SegmentID:    0,
@@ -1347,20 +1081,19 @@ func TestGetRecoveryInfoV2(t *testing.T) {
 		err := svr.meta.AddSegment(context.TODO(), NewSegmentInfo(segment))
 		assert.NoError(t, err)
 
-		err = svr.meta.indexMeta.CreateIndex(&model.Index{
-			TenantID:     "",
+		indexReq := &indexpb.CreateIndexRequest{
 			CollectionID: 0,
 			FieldID:      2,
-			IndexID:      0,
-			IndexName:    "",
-		})
+		}
+
+		_, err = svr.meta.indexMeta.CreateIndex(context.TODO(), indexReq, 0, false)
 		assert.NoError(t, err)
-		err = svr.meta.indexMeta.AddSegmentIndex(&model.SegmentIndex{
+		err = svr.meta.indexMeta.AddSegmentIndex(context.TODO(), &model.SegmentIndex{
 			SegmentID: segment.ID,
 			BuildID:   segment.ID,
 		})
 		assert.NoError(t, err)
-		err = svr.meta.indexMeta.FinishTask(&indexpb.IndexTaskInfo{
+		err = svr.meta.indexMeta.FinishTask(&workerpb.IndexTaskInfo{
 			BuildID: segment.ID,
 			State:   commonpb.IndexState_Finished,
 		})
@@ -1391,8 +1124,8 @@ func TestGetRecoveryInfoV2(t *testing.T) {
 		svr := newTestServer(t)
 		defer closeTestServer(t, svr)
 
-		svr.rootCoordClientCreator = func(ctx context.Context) (types.RootCoordClient, error) {
-			return newMockRootCoordClient(), nil
+		svr.mixCoordCreator = func(ctx context.Context) (types.MixCoord, error) {
+			return newMockMixCoord(), nil
 		}
 
 		svr.meta.AddCollection(&collectionInfo{
@@ -1400,7 +1133,7 @@ func TestGetRecoveryInfoV2(t *testing.T) {
 			Schema: newTestSchema(),
 		})
 
-		err := svr.meta.UpdateChannelCheckpoint("vchan1", &msgpb.MsgPosition{
+		err := svr.meta.UpdateChannelCheckpoint(context.TODO(), "vchan1", &msgpb.MsgPosition{
 			ChannelName: "vchan1",
 			Timestamp:   0,
 			MsgID:       []byte{0, 0, 0, 0, 0, 0, 0, 0},
@@ -1435,9 +1168,8 @@ func TestGetRecoveryInfoV2(t *testing.T) {
 	t.Run("with fake segments", func(t *testing.T) {
 		svr := newTestServer(t)
 		defer closeTestServer(t, svr)
-
-		svr.rootCoordClientCreator = func(ctx context.Context) (types.RootCoordClient, error) {
-			return newMockRootCoordClient(), nil
+		svr.mixCoordCreator = func(ctx context.Context) (types.MixCoord, error) {
+			return newMockMixCoord(), nil
 		}
 
 		svr.meta.AddCollection(&collectionInfo{
@@ -1445,7 +1177,7 @@ func TestGetRecoveryInfoV2(t *testing.T) {
 			Schema: newTestSchema(),
 		})
 
-		err := svr.meta.UpdateChannelCheckpoint("vchan1", &msgpb.MsgPosition{
+		err := svr.meta.UpdateChannelCheckpoint(context.TODO(), "vchan1", &msgpb.MsgPosition{
 			ChannelName: "vchan1",
 			Timestamp:   0,
 			MsgID:       []byte{0, 0, 0, 0, 0, 0, 0, 0},
@@ -1480,8 +1212,8 @@ func TestGetRecoveryInfoV2(t *testing.T) {
 		svr := newTestServer(t)
 		defer closeTestServer(t, svr)
 
-		svr.rootCoordClientCreator = func(ctx context.Context) (types.RootCoordClient, error) {
-			return newMockRootCoordClient(), nil
+		svr.mixCoordCreator = func(ctx context.Context) (types.MixCoord, error) {
+			return newMockMixCoord(), nil
 		}
 
 		svr.meta.AddCollection(&collectionInfo{
@@ -1489,7 +1221,7 @@ func TestGetRecoveryInfoV2(t *testing.T) {
 			Schema: newTestSchema(),
 		})
 
-		err := svr.meta.UpdateChannelCheckpoint("vchan1", &msgpb.MsgPosition{
+		err := svr.meta.UpdateChannelCheckpoint(context.TODO(), "vchan1", &msgpb.MsgPosition{
 			ChannelName: "vchan1",
 			Timestamp:   0,
 			MsgID:       []byte{0, 0, 0, 0, 0, 0, 0, 0},
@@ -1513,35 +1245,28 @@ func TestGetRecoveryInfoV2(t *testing.T) {
 		assert.NoError(t, err)
 		err = svr.meta.AddSegment(context.TODO(), NewSegmentInfo(seg5))
 		assert.NoError(t, err)
-		err = svr.meta.indexMeta.CreateIndex(&model.Index{
-			TenantID:        "",
-			CollectionID:    0,
-			FieldID:         2,
-			IndexID:         0,
-			IndexName:       "_default_idx_2",
-			IsDeleted:       false,
-			CreateTime:      0,
-			TypeParams:      nil,
-			IndexParams:     nil,
-			IsAutoIndex:     false,
-			UserIndexParams: nil,
-		})
+		indexReq := &indexpb.CreateIndexRequest{
+			CollectionID: 0,
+			FieldID:      2,
+			IndexName:    "_default_idx_2",
+		}
+		_, err = svr.meta.indexMeta.CreateIndex(context.TODO(), indexReq, 0, false)
 		assert.NoError(t, err)
 		svr.meta.indexMeta.updateSegmentIndex(&model.SegmentIndex{
-			SegmentID:     seg4.ID,
-			CollectionID:  0,
-			PartitionID:   0,
-			NumRows:       100,
-			IndexID:       0,
-			BuildID:       0,
-			NodeID:        0,
-			IndexVersion:  1,
-			IndexState:    commonpb.IndexState_Finished,
-			FailReason:    "",
-			IsDeleted:     false,
-			CreateTime:    0,
-			IndexFileKeys: nil,
-			IndexSize:     0,
+			SegmentID:           seg4.ID,
+			CollectionID:        0,
+			PartitionID:         0,
+			NumRows:             100,
+			IndexID:             0,
+			BuildID:             0,
+			NodeID:              0,
+			IndexVersion:        1,
+			IndexState:          commonpb.IndexState_Finished,
+			FailReason:          "",
+			IsDeleted:           false,
+			CreatedUTCTime:      0,
+			IndexFileKeys:       nil,
+			IndexSerializedSize: 0,
 		})
 
 		ch := &channelMeta{Name: "vchan1", CollectionID: 0}
@@ -1583,6 +1308,12 @@ func TestImportV2(t *testing.T) {
 		assert.NoError(t, err)
 		assert.NotEqual(t, int32(0), resp.GetStatus().GetCode())
 		s.stateCode.Store(commonpb.StateCode_Healthy)
+		mockHandler := NewNMockHandler(t)
+		mockHandler.EXPECT().GetCollection(mock.Anything, mock.Anything).Return(&collectionInfo{
+			ID:            1000,
+			VChannelNames: []string{"foo_1v1"},
+		}, nil).Maybe()
+		s.handler = mockHandler
 
 		// parse timeout failed
 		resp, err = s.ImportV2(ctx, &internalpb.ImportRequestInternal{
@@ -1618,23 +1349,29 @@ func TestImportV2(t *testing.T) {
 		assert.True(t, errors.Is(merr.Error(resp.GetStatus()), merr.ErrImportFailed))
 
 		// alloc failed
-		alloc := NewNMockAllocator(t)
-		alloc.EXPECT().allocN(mock.Anything).Return(0, 0, mockErr)
+		catalog := mocks.NewDataCoordCatalog(t)
+		catalog.EXPECT().ListImportJobs(mock.Anything).Return(nil, nil)
+		catalog.EXPECT().ListPreImportTasks(mock.Anything).Return(nil, nil)
+		catalog.EXPECT().ListImportTasks(mock.Anything).Return(nil, nil)
+		s.importMeta, err = NewImportMeta(context.TODO(), catalog, nil, nil)
+		assert.NoError(t, err)
+		alloc := allocator.NewMockAllocator(t)
+		alloc.EXPECT().AllocN(mock.Anything).Return(0, 0, mockErr)
 		s.allocator = alloc
 		resp, err = s.ImportV2(ctx, &internalpb.ImportRequestInternal{})
 		assert.NoError(t, err)
 		assert.True(t, errors.Is(merr.Error(resp.GetStatus()), merr.ErrImportFailed))
-		alloc = NewNMockAllocator(t)
-		alloc.EXPECT().allocN(mock.Anything).Return(0, 0, nil)
+		alloc = allocator.NewMockAllocator(t)
+		alloc.EXPECT().AllocN(mock.Anything).Return(0, 0, nil)
 		s.allocator = alloc
 
 		// add job failed
-		catalog := mocks.NewDataCoordCatalog(t)
-		catalog.EXPECT().ListImportJobs().Return(nil, nil)
-		catalog.EXPECT().ListPreImportTasks().Return(nil, nil)
-		catalog.EXPECT().ListImportTasks().Return(nil, nil)
-		catalog.EXPECT().SaveImportJob(mock.Anything).Return(mockErr)
-		s.importMeta, err = NewImportMeta(catalog)
+		catalog = mocks.NewDataCoordCatalog(t)
+		catalog.EXPECT().ListImportJobs(mock.Anything).Return(nil, nil)
+		catalog.EXPECT().ListPreImportTasks(mock.Anything).Return(nil, nil)
+		catalog.EXPECT().ListImportTasks(mock.Anything).Return(nil, nil)
+		catalog.EXPECT().SaveImportJob(mock.Anything, mock.Anything).Return(mockErr)
+		s.importMeta, err = NewImportMeta(context.TODO(), catalog, nil, nil)
 		assert.NoError(t, err)
 		resp, err = s.ImportV2(ctx, &internalpb.ImportRequestInternal{
 			Files: []*internalpb.ImportFile{
@@ -1646,12 +1383,12 @@ func TestImportV2(t *testing.T) {
 		})
 		assert.NoError(t, err)
 		assert.True(t, errors.Is(merr.Error(resp.GetStatus()), merr.ErrImportFailed))
-		jobs := s.importMeta.GetJobBy()
+		jobs := s.importMeta.GetJobBy(context.TODO())
 		assert.Equal(t, 0, len(jobs))
 		catalog.ExpectedCalls = lo.Filter(catalog.ExpectedCalls, func(call *mock.Call, _ int) bool {
 			return call.Method != "SaveImportJob"
 		})
-		catalog.EXPECT().SaveImportJob(mock.Anything).Return(nil)
+		catalog.EXPECT().SaveImportJob(mock.Anything, mock.Anything).Return(nil)
 
 		// normal case
 		resp, err = s.ImportV2(ctx, &internalpb.ImportRequestInternal{
@@ -1661,11 +1398,19 @@ func TestImportV2(t *testing.T) {
 					Paths: []string{"a.json"},
 				},
 			},
+			ChannelNames: []string{"foo_1v1"},
 		})
 		assert.NoError(t, err)
 		assert.Equal(t, int32(0), resp.GetStatus().GetCode())
-		jobs = s.importMeta.GetJobBy()
+		jobs = s.importMeta.GetJobBy(context.TODO())
 		assert.Equal(t, 1, len(jobs))
+
+		// number of jobs reached the limit
+		// Params.Save(paramtable.Get().DataCoordCfg.MaxImportJobNum.Key, "1")
+		// resp, err = s.ImportV2(ctx, &internalpb.ImportRequestInternal{})
+		// assert.NoError(t, err)
+		// assert.True(t, errors.Is(merr.Error(resp.GetStatus()), merr.ErrImportFailed))
+		// Params.Reset(paramtable.Get().DataCoordCfg.MaxImportJobNum.Key)
 	})
 
 	t.Run("GetImportProgress", func(t *testing.T) {
@@ -1686,11 +1431,17 @@ func TestImportV2(t *testing.T) {
 
 		// job does not exist
 		catalog := mocks.NewDataCoordCatalog(t)
-		catalog.EXPECT().ListImportJobs().Return(nil, nil)
-		catalog.EXPECT().ListPreImportTasks().Return(nil, nil)
-		catalog.EXPECT().ListImportTasks().Return(nil, nil)
-		catalog.EXPECT().SaveImportJob(mock.Anything).Return(nil)
-		s.importMeta, err = NewImportMeta(catalog)
+		catalog.EXPECT().ListImportJobs(mock.Anything).Return(nil, nil)
+		catalog.EXPECT().ListPreImportTasks(mock.Anything).Return(nil, nil)
+		catalog.EXPECT().ListImportTasks(mock.Anything).Return(nil, nil)
+		catalog.EXPECT().SaveImportJob(mock.Anything, mock.Anything).Return(nil)
+		wal := mock_streaming.NewMockWALAccesser(t)
+		b := mock_streaming.NewMockBroadcast(t)
+		wal.EXPECT().Broadcast().Return(b).Maybe()
+		// streaming.SetWALForTest(wal)
+		// defer streaming.RecoverWALForTest()
+
+		s.importMeta, err = NewImportMeta(context.TODO(), catalog, nil, nil)
 		assert.NoError(t, err)
 		resp, err = s.GetImportProgress(ctx, &internalpb.GetImportProgressRequest{
 			JobID: "-1",
@@ -1706,7 +1457,7 @@ func TestImportV2(t *testing.T) {
 				State:  internalpb.ImportJobState_Failed,
 			},
 		}
-		err = s.importMeta.AddJob(job)
+		err = s.importMeta.AddJob(context.TODO(), job)
 		assert.NoError(t, err)
 		resp, err = s.GetImportProgress(ctx, &internalpb.GetImportProgressRequest{
 			JobID: "0",
@@ -1728,12 +1479,12 @@ func TestImportV2(t *testing.T) {
 
 		// normal case
 		catalog := mocks.NewDataCoordCatalog(t)
-		catalog.EXPECT().ListImportJobs().Return(nil, nil)
-		catalog.EXPECT().ListPreImportTasks().Return(nil, nil)
-		catalog.EXPECT().ListImportTasks().Return(nil, nil)
-		catalog.EXPECT().SaveImportJob(mock.Anything).Return(nil)
-		catalog.EXPECT().SavePreImportTask(mock.Anything).Return(nil)
-		s.importMeta, err = NewImportMeta(catalog)
+		catalog.EXPECT().ListImportJobs(mock.Anything).Return(nil, nil)
+		catalog.EXPECT().ListPreImportTasks(mock.Anything).Return(nil, nil)
+		catalog.EXPECT().ListImportTasks(mock.Anything).Return(nil, nil)
+		catalog.EXPECT().SaveImportJob(mock.Anything, mock.Anything).Return(nil)
+		catalog.EXPECT().SavePreImportTask(mock.Anything, mock.Anything).Return(nil)
+		s.importMeta, err = NewImportMeta(context.TODO(), catalog, nil, nil)
 		assert.NoError(t, err)
 		var job ImportJob = &importJob{
 			ImportJob: &datapb.ImportJob{
@@ -1742,16 +1493,16 @@ func TestImportV2(t *testing.T) {
 				Schema:       &schemapb.CollectionSchema{},
 			},
 		}
-		err = s.importMeta.AddJob(job)
+		err = s.importMeta.AddJob(context.TODO(), job)
 		assert.NoError(t, err)
-		var task ImportTask = &preImportTask{
-			PreImportTask: &datapb.PreImportTask{
-				JobID:  0,
-				TaskID: 1,
-				State:  datapb.ImportTaskStateV2_Failed,
-			},
+		taskProto := &datapb.PreImportTask{
+			JobID:  0,
+			TaskID: 1,
+			State:  datapb.ImportTaskStateV2_Failed,
 		}
-		err = s.importMeta.AddTask(task)
+		var task ImportTask = &preImportTask{}
+		task.(*preImportTask).task.Store(taskProto)
+		err = s.importMeta.AddTask(context.TODO(), task)
 		assert.NoError(t, err)
 		resp, err = s.ListImports(ctx, &internalpb.ListImportsRequestInternal{
 			CollectionID: 1,
@@ -1763,6 +1514,58 @@ func TestImportV2(t *testing.T) {
 		assert.Equal(t, 1, len(resp.GetReasons()))
 		assert.Equal(t, 1, len(resp.GetProgresses()))
 	})
+}
+
+func TestGetChannelRecoveryInfo(t *testing.T) {
+	ctx := context.Background()
+
+	// server not healthy
+	s := &Server{}
+	s.stateCode.Store(commonpb.StateCode_Initializing)
+	resp, err := s.GetChannelRecoveryInfo(ctx, nil)
+	assert.NoError(t, err)
+	assert.NotEqual(t, int32(0), resp.GetStatus().GetCode())
+	s.stateCode.Store(commonpb.StateCode_Healthy)
+
+	// get collection failed
+	broker := broker.NewMockBroker(t)
+	broker.EXPECT().DescribeCollectionInternal(mock.Anything, mock.Anything).Return(nil, errors.New("mock err"))
+	s.broker = broker
+	resp, err = s.GetChannelRecoveryInfo(ctx, &datapb.GetChannelRecoveryInfoRequest{
+		Vchannel: "ch-1",
+	})
+	assert.NoError(t, err)
+	assert.Error(t, merr.Error(resp.GetStatus()))
+
+	// normal case
+	channelInfo := &datapb.VchannelInfo{
+		CollectionID:        0,
+		ChannelName:         "ch-1",
+		SeekPosition:        &msgpb.MsgPosition{Timestamp: 10},
+		UnflushedSegmentIds: []int64{1},
+		FlushedSegmentIds:   []int64{2},
+		DroppedSegmentIds:   []int64{3},
+		IndexedSegmentIds:   []int64{4},
+	}
+
+	broker.EXPECT().DescribeCollectionInternal(mock.Anything, mock.Anything).Unset()
+	broker.EXPECT().DescribeCollectionInternal(mock.Anything, mock.Anything).
+		Return(&milvuspb.DescribeCollectionResponse{
+			Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success},
+			Schema: &schemapb.CollectionSchema{},
+		}, nil)
+	handler := NewNMockHandler(t)
+	handler.EXPECT().GetDataVChanPositions(mock.Anything, mock.Anything).Return(channelInfo)
+	s.handler = handler
+
+	assert.NoError(t, err)
+	resp, err = s.GetChannelRecoveryInfo(ctx, &datapb.GetChannelRecoveryInfoRequest{
+		Vchannel: "ch-1",
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, int32(0), resp.GetStatus().GetCode())
+	assert.NotNil(t, resp.GetSchema())
+	assert.Equal(t, channelInfo, resp.GetInfo())
 }
 
 type GcControlServiceSuite struct {

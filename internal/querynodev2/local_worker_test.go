@@ -22,18 +22,20 @@ import (
 	"testing"
 
 	"github.com/samber/lo"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
 	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/internal/proto/indexpb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
-	"github.com/milvus-io/milvus/internal/proto/segcorepb"
+	"github.com/milvus-io/milvus/internal/mocks/util/mock_segcore"
 	"github.com/milvus-io/milvus/internal/querynodev2/segments"
 	"github.com/milvus-io/milvus/internal/util/dependency"
-	"github.com/milvus-io/milvus/pkg/util/etcd"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/segcorepb"
+	"github.com/milvus-io/milvus/pkg/v2/util/etcd"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 type LocalWorkerTestSuite struct {
@@ -51,6 +53,7 @@ type LocalWorkerTestSuite struct {
 	// dependency
 	node       *QueryNode
 	worker     *LocalWorker
+	mockLoader *segments.MockLoader
 	etcdClient *clientv3.Client
 	// context
 	ctx    context.Context
@@ -71,7 +74,7 @@ func (suite *LocalWorkerTestSuite) BeforeTest(suiteName, testName string) {
 	paramtable.Init()
 	suite.params = paramtable.Get()
 	// close GC at test to avoid data race
-	suite.params.Save(suite.params.QueryNodeCfg.GCEnabled.Key, "false")
+	suite.params.Save(suite.params.CommonCfg.GCEnabled.Key, "false")
 
 	suite.ctx, suite.cancel = context.WithCancel(context.Background())
 	// init node
@@ -93,16 +96,21 @@ func (suite *LocalWorkerTestSuite) BeforeTest(suiteName, testName string) {
 	err = suite.node.Start()
 	suite.NoError(err)
 
-	suite.schema = segments.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64, true)
-	suite.indexMeta = segments.GenTestIndexMeta(suite.collectionID, suite.schema)
-	collection := segments.NewCollection(suite.collectionID, suite.schema, suite.indexMeta, &querypb.LoadMetaInfo{
+	suite.schema = mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64, true)
+	suite.indexMeta = mock_segcore.GenTestIndexMeta(suite.collectionID, suite.schema)
+	collection, err := segments.NewCollection(suite.collectionID, suite.schema, suite.indexMeta, &querypb.LoadMetaInfo{
 		LoadType: querypb.LoadType_LoadCollection,
 	})
+	suite.NoError(err)
 	loadMata := &querypb.LoadMetaInfo{
 		LoadType:     querypb.LoadType_LoadCollection,
 		CollectionID: suite.collectionID,
 	}
 	suite.node.manager.Collection.PutOrRef(suite.collectionID, collection.Schema(), suite.indexMeta, loadMata)
+
+	suite.mockLoader = segments.NewMockLoader(suite.T())
+	suite.node.loader = suite.mockLoader
+
 	suite.worker = NewLocalWorker(suite.node)
 }
 
@@ -113,8 +121,12 @@ func (suite *LocalWorkerTestSuite) AfterTest(suiteName, testName string) {
 }
 
 func (suite *LocalWorkerTestSuite) TestLoadSegment() {
+	suite.mockLoader.EXPECT().
+		Load(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return([]segments.Segment{}, nil).Once()
+
 	// load empty
-	schema := segments.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64, true)
+	schema := mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64, true)
 	req := &querypb.LoadSegmentsRequest{
 		Base: &commonpb.MsgBase{
 			TargetID: suite.node.session.GetServerID(),

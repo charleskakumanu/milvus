@@ -15,10 +15,11 @@
 #include <vector>
 #include <memory>
 
+#include "common/QueryResult.h"
 #include "common/Types.h"
+#include "index/ScalarIndex.h"
 
 using milvus::index::ScalarIndex;
-
 namespace {
 
 bool
@@ -139,7 +140,9 @@ template <typename T>
 inline void
 assert_reverse(ScalarIndex<T>* index, const std::vector<T>& arr) {
     for (size_t offset = 0; offset < arr.size(); ++offset) {
-        ASSERT_EQ(index->Reverse_Lookup(offset), arr[offset]);
+        auto raw = index->Reverse_Lookup(offset);
+        ASSERT_TRUE(raw.has_value());
+        ASSERT_EQ(raw.value(), arr[offset]);
     }
 }
 
@@ -147,7 +150,9 @@ template <>
 inline void
 assert_reverse(ScalarIndex<float>* index, const std::vector<float>& arr) {
     for (size_t offset = 0; offset < arr.size(); ++offset) {
-        ASSERT_TRUE(compare_float(index->Reverse_Lookup(offset), arr[offset]));
+        auto raw = index->Reverse_Lookup(offset);
+        ASSERT_TRUE(raw.has_value());
+        ASSERT_TRUE(compare_float(raw.value(), arr[offset]));
     }
 }
 
@@ -155,7 +160,9 @@ template <>
 inline void
 assert_reverse(ScalarIndex<double>* index, const std::vector<double>& arr) {
     for (size_t offset = 0; offset < arr.size(); ++offset) {
-        ASSERT_TRUE(compare_double(index->Reverse_Lookup(offset), arr[offset]));
+        auto raw = index->Reverse_Lookup(offset);
+        ASSERT_TRUE(raw.has_value());
+        ASSERT_TRUE(compare_double(raw.value(), arr[offset]));
     }
 }
 
@@ -164,7 +171,9 @@ inline void
 assert_reverse(ScalarIndex<std::string>* index,
                const std::vector<std::string>& arr) {
     for (size_t offset = 0; offset < arr.size(); ++offset) {
-        ASSERT_TRUE(arr[offset].compare(index->Reverse_Lookup(offset)) == 0);
+        auto raw = index->Reverse_Lookup(offset);
+        ASSERT_TRUE(raw.has_value());
+        ASSERT_TRUE(arr[offset].compare(raw.value()) == 0);
     }
 }
 

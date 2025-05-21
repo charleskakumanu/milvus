@@ -14,12 +14,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/config"
-	"github.com/milvus-io/milvus/pkg/log"
-	mqcommon "github.com/milvus-io/milvus/pkg/mq/common"
-	"github.com/milvus-io/milvus/pkg/mq/msgstream/mqwrapper"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/config"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	mqcommon "github.com/milvus-io/milvus/pkg/v2/mq/common"
+	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream/mqwrapper"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 var Params = paramtable.Get()
@@ -27,12 +27,12 @@ var Params = paramtable.Get()
 func TestMain(m *testing.M) {
 	paramtable.Init()
 	mockCluster, err := kafka.NewMockCluster(1)
-	defer mockCluster.Close()
 	if err != nil {
 		// nolint
 		fmt.Printf("Failed to create MockCluster: %s\n", err)
 		os.Exit(1)
 	}
+	defer mockCluster.Close()
 
 	broker := mockCluster.BootstrapServers()
 	Params.Save("kafka.brokerList", broker)
@@ -64,7 +64,7 @@ func BytesToInt(b []byte) int {
 
 // Consume1 will consume random messages and record the last MessageID it received
 func Consume1(ctx context.Context, t *testing.T, kc *kafkaClient, topic string, subName string, c chan mqcommon.MessageID, total *int) {
-	consumer, err := kc.Subscribe(mqwrapper.ConsumerOptions{
+	consumer, err := kc.Subscribe(ctx, mqwrapper.ConsumerOptions{
 		Topic:                       topic,
 		SubscriptionName:            subName,
 		BufSize:                     1024,
@@ -103,7 +103,7 @@ func Consume1(ctx context.Context, t *testing.T, kc *kafkaClient, topic string, 
 
 // Consume2 will consume messages from specified MessageID
 func Consume2(ctx context.Context, t *testing.T, kc *kafkaClient, topic string, subName string, msgID mqcommon.MessageID, total *int) {
-	consumer, err := kc.Subscribe(mqwrapper.ConsumerOptions{
+	consumer, err := kc.Subscribe(ctx, mqwrapper.ConsumerOptions{
 		Topic:                       topic,
 		SubscriptionName:            subName,
 		BufSize:                     1024,
@@ -139,7 +139,7 @@ func Consume2(ctx context.Context, t *testing.T, kc *kafkaClient, topic string, 
 }
 
 func Consume3(ctx context.Context, t *testing.T, kc *kafkaClient, topic string, subName string, total *int) {
-	consumer, err := kc.Subscribe(mqwrapper.ConsumerOptions{
+	consumer, err := kc.Subscribe(ctx, mqwrapper.ConsumerOptions{
 		Topic:                       topic,
 		SubscriptionName:            subName,
 		BufSize:                     1024,
@@ -196,7 +196,7 @@ func TestKafkaClient_ConsumeWithAck(t *testing.T) {
 	Consume1(ctx1, t, kc, topic, subName, c, &total1)
 
 	lastMsgID := <-c
-	log.Info("lastMsgID", zap.Any("lastMsgID", lastMsgID.(*kafkaID).messageID))
+	log.Info("lastMsgID", zap.Any("lastMsgID", lastMsgID.(*KafkaID).MessageID))
 
 	ctx2, cancel2 := context.WithTimeout(ctx, 3*time.Second)
 	Consume2(ctx2, t, kc, topic, subName, lastMsgID, &total2)
@@ -418,7 +418,7 @@ func createConsumer(t *testing.T,
 	groupID string,
 	initPosition mqcommon.SubscriptionInitialPosition,
 ) mqwrapper.Consumer {
-	consumer, err := kc.Subscribe(mqwrapper.ConsumerOptions{
+	consumer, err := kc.Subscribe(context.TODO(), mqwrapper.ConsumerOptions{
 		Topic:                       topic,
 		SubscriptionName:            groupID,
 		BufSize:                     1024,
@@ -429,7 +429,7 @@ func createConsumer(t *testing.T,
 }
 
 func createProducer(t *testing.T, kc *kafkaClient, topic string) mqwrapper.Producer {
-	producer, err := kc.CreateProducer(mqcommon.ProducerOptions{Topic: topic})
+	producer, err := kc.CreateProducer(context.TODO(), mqcommon.ProducerOptions{Topic: topic})
 	assert.NoError(t, err)
 	assert.NotNil(t, producer)
 	return producer

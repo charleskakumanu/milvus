@@ -24,13 +24,15 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
+	"github.com/milvus-io/milvus/internal/coordinator/snmanager"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	"github.com/milvus-io/milvus/internal/querycoordv2/session"
 	"github.com/milvus-io/milvus/internal/querycoordv2/utils"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/internal/util/streamingutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 func (s *Server) ListCheckers(ctx context.Context, req *querypb.ListCheckersRequest) (*querypb.ListCheckersResponse, error) {
@@ -194,6 +196,33 @@ func (s *Server) ResumeBalance(ctx context.Context, req *querypb.ResumeBalanceRe
 	return merr.Success(), nil
 }
 
+// CheckBalanceStatus checks whether balance is active or suspended
+func (s *Server) CheckBalanceStatus(ctx context.Context, req *querypb.CheckBalanceStatusRequest) (*querypb.CheckBalanceStatusResponse, error) {
+	log := log.Ctx(ctx)
+	log.Info("CheckBalanceStatus request received")
+
+	errMsg := "failed to check balance status"
+	if err := merr.CheckHealthy(s.State()); err != nil {
+		log.Warn(errMsg, zap.Error(err))
+		return &querypb.CheckBalanceStatusResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+
+	isActive, err := s.checkerController.IsActive(utils.BalanceChecker)
+	if err != nil {
+		log.Warn(errMsg, zap.Error(err))
+		return &querypb.CheckBalanceStatusResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+
+	return &querypb.CheckBalanceStatusResponse{
+		Status:   merr.Success(),
+		IsActive: isActive,
+	}, nil
+}
+
 // suspend node from resource operation, for given node, suspend load_segment/sub_channel operations
 func (s *Server) SuspendNode(ctx context.Context, req *querypb.SuspendNodeRequest) (*commonpb.Status, error) {
 	log := log.Ctx(ctx)
@@ -212,12 +241,7 @@ func (s *Server) SuspendNode(ctx context.Context, req *querypb.SuspendNodeReques
 		return merr.Status(err), nil
 	}
 
-	err := s.nodeMgr.Suspend(req.GetNodeID())
-	if err != nil {
-		log.Warn(errMsg, zap.Error(err))
-		return merr.Status(err), nil
-	}
-
+	s.meta.ResourceManager.HandleNodeDown(ctx, req.GetNodeID())
 	return merr.Success(), nil
 }
 
@@ -232,17 +256,19 @@ func (s *Server) ResumeNode(ctx context.Context, req *querypb.ResumeNodeRequest)
 		return merr.Status(errors.Wrap(err, errMsg)), nil
 	}
 
-	if s.nodeMgr.Get(req.GetNodeID()) == nil {
+	info := s.nodeMgr.Get(req.GetNodeID())
+	if info == nil {
 		err := merr.WrapErrNodeNotFound(req.GetNodeID(), errMsg)
 		log.Warn(errMsg, zap.Error(err))
 		return merr.Status(err), nil
 	}
 
-	err := s.nodeMgr.Resume(req.GetNodeID())
-	if err != nil {
-		log.Warn(errMsg, zap.Error(err))
-		return merr.Status(errors.Wrap(err, errMsg)), nil
+	if info.IsEmbeddedQueryNodeInStreamingNode() {
+		return merr.Status(
+			merr.WrapErrParameterInvalidMsg("embedded query node in streaming node can't be resumed")), nil
 	}
+
+	s.meta.ResourceManager.HandleNodeUp(ctx, req.GetNodeID())
 
 	return merr.Success(), nil
 }
@@ -266,12 +292,12 @@ func (s *Server) TransferSegment(ctx context.Context, req *querypb.TransferSegme
 
 	// check whether srcNode is healthy
 	srcNode := req.GetSourceNodeID()
-	if err := s.isStoppingNode(srcNode); err != nil {
+	if err := s.isStoppingNode(ctx, srcNode); err != nil {
 		err := merr.WrapErrNodeNotAvailable(srcNode, "the source node is invalid")
 		return merr.Status(err), nil
 	}
 
-	replicas := s.meta.ReplicaManager.GetByNode(req.GetSourceNodeID())
+	replicas := s.meta.ReplicaManager.GetByNode(ctx, req.GetSourceNodeID())
 	for _, replica := range replicas {
 		// when no dst node specified, default to use all other nodes in same
 		dstNodeSet := typeutil.NewUniqueSet()
@@ -279,9 +305,16 @@ func (s *Server) TransferSegment(ctx context.Context, req *querypb.TransferSegme
 			dstNodeSet.Insert(replica.GetRWNodes()...)
 		} else {
 			// check whether dstNode is healthy
-			if err := s.isStoppingNode(req.GetTargetNodeID()); err != nil {
+			if err := s.isStoppingNode(ctx, req.GetTargetNodeID()); err != nil {
 				err := merr.WrapErrNodeNotAvailable(srcNode, "the target node is invalid")
 				return merr.Status(err), nil
+			}
+			if streamingutil.IsStreamingServiceEnabled() {
+				sqn := snmanager.StaticStreamingNodeManager.GetStreamingQueryNodeIDs()
+				if sqn.Contain(req.GetTargetNodeID()) {
+					return merr.Status(
+						merr.WrapErrParameterInvalidMsg("embedded query node in streaming node can't be the destination of transfer segment")), nil
+				}
 			}
 			dstNodeSet.Insert(req.GetTargetNodeID())
 		}
@@ -301,7 +334,7 @@ func (s *Server) TransferSegment(ctx context.Context, req *querypb.TransferSegme
 				return merr.Status(err), nil
 			}
 
-			existInTarget := s.targetMgr.GetSealedSegment(segment.GetCollectionID(), segment.GetID(), meta.CurrentTarget) != nil
+			existInTarget := s.targetMgr.GetSealedSegment(ctx, segment.GetCollectionID(), segment.GetID(), meta.CurrentTarget) != nil
 			if !existInTarget {
 				log.Info("segment doesn't exist in current target, skip it", zap.Int64("segmentID", req.GetSegmentID()))
 			} else {
@@ -338,20 +371,24 @@ func (s *Server) TransferChannel(ctx context.Context, req *querypb.TransferChann
 
 	// check whether srcNode is healthy
 	srcNode := req.GetSourceNodeID()
-	if err := s.isStoppingNode(srcNode); err != nil {
+	if err := s.isStoppingNode(ctx, srcNode); err != nil {
 		err := merr.WrapErrNodeNotAvailable(srcNode, "the source node is invalid")
 		return merr.Status(err), nil
 	}
 
-	replicas := s.meta.ReplicaManager.GetByNode(req.GetSourceNodeID())
+	replicas := s.meta.ReplicaManager.GetByNode(ctx, req.GetSourceNodeID())
 	for _, replica := range replicas {
 		// when no dst node specified, default to use all other nodes in same
 		dstNodeSet := typeutil.NewUniqueSet()
 		if req.GetToAllNodes() {
-			dstNodeSet.Insert(replica.GetRWNodes()...)
+			if streamingutil.IsStreamingServiceEnabled() {
+				dstNodeSet.Insert(replica.GetRWSQNodes()...)
+			} else {
+				dstNodeSet.Insert(replica.GetRWNodes()...)
+			}
 		} else {
 			// check whether dstNode is healthy
-			if err := s.isStoppingNode(req.GetTargetNodeID()); err != nil {
+			if err := s.isStoppingNode(ctx, req.GetTargetNodeID()); err != nil {
 				err := merr.WrapErrNodeNotAvailable(srcNode, "the target node is invalid")
 				return merr.Status(err), nil
 			}
@@ -371,7 +408,7 @@ func (s *Server) TransferChannel(ctx context.Context, req *querypb.TransferChann
 				err := merr.WrapErrChannelNotFound(req.GetChannelName(), "channel not found in source node")
 				return merr.Status(err), nil
 			}
-			existInTarget := s.targetMgr.GetDmChannel(channel.GetCollectionID(), channel.GetChannelName(), meta.CurrentTarget) != nil
+			existInTarget := s.targetMgr.GetDmChannel(ctx, channel.GetCollectionID(), channel.GetChannelName(), meta.CurrentTarget) != nil
 			if !existInTarget {
 				log.Info("channel doesn't exist in current target, skip it", zap.String("channelName", channel.GetChannelName()))
 			} else {
@@ -423,38 +460,29 @@ func (s *Server) CheckQueryNodeDistribution(ctx context.Context, req *querypb.Ch
 		return ch.GetChannelName(), ch
 	})
 	for _, ch := range channelOnSrc {
+		if s.targetMgr.GetDmChannel(ctx, ch.GetCollectionID(), ch.GetChannelName(), meta.CurrentTargetFirst) == nil {
+			continue
+		}
+
 		if _, ok := channelDstMap[ch.GetChannelName()]; !ok {
 			return merr.Status(merr.WrapErrChannelLack(ch.GetChannelName())), nil
 		}
 	}
-	channelSrcMap := lo.SliceToMap(channelOnSrc, func(ch *meta.DmChannel) (string, *meta.DmChannel) {
-		return ch.GetChannelName(), ch
-	})
-	for _, ch := range channelOnDst {
-		if _, ok := channelSrcMap[ch.GetChannelName()]; !ok {
-			return merr.Status(merr.WrapErrChannelLack(ch.GetChannelName())), nil
-		}
-	}
 
-	// check segment list
+	// check whether all segment exist in source node has been loaded in target node
 	segmentOnSrc := s.dist.SegmentDistManager.GetByFilter(meta.WithNodeID(req.GetSourceNodeID()))
 	segmentOnDst := s.dist.SegmentDistManager.GetByFilter(meta.WithNodeID(req.GetTargetNodeID()))
 	segmentDstMap := lo.SliceToMap(segmentOnDst, func(s *meta.Segment) (int64, *meta.Segment) {
 		return s.GetID(), s
 	})
-	for _, s := range segmentOnSrc {
-		if _, ok := segmentDstMap[s.GetID()]; !ok {
-			return merr.Status(merr.WrapErrSegmentLack(s.GetID())), nil
+	for _, segment := range segmentOnSrc {
+		if s.targetMgr.GetSealedSegment(ctx, segment.GetCollectionID(), segment.GetID(), meta.CurrentTargetFirst) == nil {
+			continue
 		}
-	}
-	segmentSrcMap := lo.SliceToMap(segmentOnSrc, func(s *meta.Segment) (int64, *meta.Segment) {
-		return s.GetID(), s
-	})
-	for _, s := range segmentOnDst {
-		if _, ok := segmentSrcMap[s.GetID()]; !ok {
-			return merr.Status(merr.WrapErrSegmentLack(s.GetID())), nil
-		}
-	}
 
+		if _, ok := segmentDstMap[segment.GetID()]; !ok {
+			return merr.Status(merr.WrapErrSegmentLack(segment.GetID())), nil
+		}
+	}
 	return merr.Success(), nil
 }

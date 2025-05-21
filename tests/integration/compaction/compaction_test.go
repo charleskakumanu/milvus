@@ -21,7 +21,7 @@ import (
 
 	"github.com/stretchr/testify/suite"
 
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/tests/integration"
 )
 
@@ -33,16 +33,17 @@ func (s *CompactionSuite) SetupSuite() {
 	s.MiniClusterSuite.SetupSuite()
 
 	paramtable.Init()
-	paramtable.Get().Save(paramtable.Get().DataCoordCfg.GlobalCompactionInterval.Key, "1")
+	paramtable.Get().Save(paramtable.Get().DataCoordCfg.MixCompactionTriggerInterval.Key, "1")
+	paramtable.Get().Save(paramtable.Get().DataCoordCfg.L0CompactionTriggerInterval.Key, "1")
 }
 
 func (s *CompactionSuite) TearDownSuite() {
 	s.MiniClusterSuite.TearDownSuite()
 
-	paramtable.Get().Reset(paramtable.Get().DataCoordCfg.GlobalCompactionInterval.Key)
+	paramtable.Get().Reset(paramtable.Get().DataCoordCfg.L0CompactionTriggerInterval.Key)
+	paramtable.Get().Reset(paramtable.Get().DataCoordCfg.MixCompactionTriggerInterval.Key)
 }
 
 func TestCompaction(t *testing.T) {
-	t.Skip("https://github.com/milvus-io/milvus/issues/33716")
 	suite.Run(t, new(CompactionSuite))
 }

@@ -17,8 +17,8 @@
 package binlog
 
 import (
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 type Filter func(row map[int64]interface{}) bool
@@ -31,10 +31,8 @@ func FilterWithDelete(r *reader) (Filter, error) {
 	return func(row map[int64]interface{}) bool {
 		rowPk := row[pkField.GetFieldID()]
 		rowTs := row[common.TimeStampField]
-		for i, pk := range r.deleteData.Pks {
-			if pk.GetValue() == rowPk && int64(r.deleteData.Tss[i]) > rowTs.(int64) {
-				return false
-			}
+		if ts, ok := r.deleteData[rowPk]; ok && int64(ts) > rowTs.(int64) {
+			return false
 		}
 		return true
 	}, nil

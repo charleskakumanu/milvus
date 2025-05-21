@@ -22,61 +22,54 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/hardware"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/metricsinfo"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/hardware"
+	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
-func (c *Core) getSystemInfoMetrics(ctx context.Context, req *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error) {
+func (c *Core) getSystemInfoMetrics(ctx context.Context, req *milvuspb.GetMetricsRequest) (string, error) {
+	used, total, err := hardware.GetDiskUsage(paramtable.Get().LocalStorageCfg.Path.GetValue())
+	if err != nil {
+		log.Ctx(ctx).Warn("get disk usage failed", zap.Error(err))
+	}
+
+	ioWait, err := hardware.GetIOWait()
+	if err != nil {
+		log.Ctx(ctx).Warn("get iowait failed", zap.Error(err))
+	}
+
 	rootCoordTopology := metricsinfo.RootCoordTopology{
 		Self: metricsinfo.RootCoordInfos{
 			BaseComponentInfos: metricsinfo.BaseComponentInfos{
-				Name: metricsinfo.ConstructComponentName(typeutil.RootCoordRole, c.session.ServerID),
+				Name: metricsinfo.ConstructComponentName(typeutil.RootCoordRole, c.session.GetServerID()),
 				HardwareInfos: metricsinfo.HardwareMetrics{
-					IP:           c.session.Address,
-					CPUCoreCount: hardware.GetCPUNum(),
-					CPUCoreUsage: hardware.GetCPUUsage(),
-					Memory:       hardware.GetMemoryCount(),
-					MemoryUsage:  hardware.GetUsedMemoryCount(),
-					Disk:         hardware.GetDiskCount(),
-					DiskUsage:    hardware.GetDiskUsage(),
+					IP:               c.session.GetAddress(),
+					CPUCoreCount:     hardware.GetCPUNum(),
+					CPUCoreUsage:     hardware.GetCPUUsage(),
+					Memory:           hardware.GetMemoryCount(),
+					MemoryUsage:      hardware.GetUsedMemoryCount(),
+					Disk:             total,
+					DiskUsage:        used,
+					IOWaitPercentage: ioWait,
 				},
 				SystemInfo:  metricsinfo.DeployMetrics{},
 				CreatedTime: paramtable.GetCreateTime().String(),
 				UpdatedTime: paramtable.GetUpdateTime().String(),
 				Type:        typeutil.RootCoordRole,
-				ID:          c.session.ServerID,
+				ID:          c.session.GetServerID(),
 			},
 			SystemConfigurations: metricsinfo.RootCoordConfiguration{
 				MinSegmentSizeToEnableIndex: Params.RootCoordCfg.MinSegmentSizeToEnableIndex.GetAsInt64(),
 			},
 		},
 		Connections: metricsinfo.ConnTopology{
-			Name: metricsinfo.ConstructComponentName(typeutil.RootCoordRole, c.session.ServerID),
+			Name: metricsinfo.ConstructComponentName(typeutil.RootCoordRole, c.session.GetServerID()),
 			// TODO(dragondriver): fill ConnectedComponents if necessary
 			ConnectedComponents: []metricsinfo.ConnectionInfo{},
 		},
 	}
 	metricsinfo.FillDeployMetricsWithEnv(&rootCoordTopology.Self.SystemInfo)
-
-	resp, err := metricsinfo.MarshalTopology(rootCoordTopology)
-	if err != nil {
-		log.Warn("Failed to marshal system info metrics of root coordinator",
-			zap.Error(err))
-
-		return &milvuspb.GetMetricsResponse{
-			Status:        merr.Status(err),
-			Response:      "",
-			ComponentName: metricsinfo.ConstructComponentName(typeutil.RootCoordRole, c.session.ServerID),
-		}, nil
-	}
-
-	return &milvuspb.GetMetricsResponse{
-		Status:        merr.Success(),
-		Response:      resp,
-		ComponentName: metricsinfo.ConstructComponentName(typeutil.RootCoordRole, c.session.ServerID),
-	}, nil
+	return metricsinfo.MarshalTopology(rootCoordTopology)
 }

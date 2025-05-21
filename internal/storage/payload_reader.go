@@ -6,20 +6,20 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/apache/arrow/go/v12/arrow"
-	"github.com/apache/arrow/go/v12/arrow/array"
-	"github.com/apache/arrow/go/v12/arrow/memory"
-	"github.com/apache/arrow/go/v12/parquet"
-	"github.com/apache/arrow/go/v12/parquet/file"
-	"github.com/apache/arrow/go/v12/parquet/pqarrow"
+	"github.com/apache/arrow/go/v17/arrow"
+	"github.com/apache/arrow/go/v17/arrow/array"
+	"github.com/apache/arrow/go/v17/arrow/memory"
+	"github.com/apache/arrow/go/v17/parquet"
+	"github.com/apache/arrow/go/v17/parquet/file"
+	"github.com/apache/arrow/go/v17/parquet/pqarrow"
 	"github.com/cockroachdb/errors"
-	"github.com/golang/protobuf/proto"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 // PayloadReader reads data from payload
@@ -88,6 +88,9 @@ func (r *PayloadReader) GetDataFromPayload() (interface{}, []bool, int, error) {
 		return val, nil, dim, err
 	case schemapb.DataType_SparseFloatVector:
 		val, dim, err := r.GetSparseFloatVectorFromPayload()
+		return val, nil, dim, err
+	case schemapb.DataType_Int8Vector:
+		val, dim, err := r.GetInt8VectorFromPayload()
 		return val, nil, dim, err
 	case schemapb.DataType_String, schemapb.DataType_VarChar:
 		val, validData, err := r.GetStringFromPayload()
@@ -618,7 +621,7 @@ func (r *PayloadReader) GetSparseFloatVectorFromPayload() (*SparseFloatVectorFie
 
 	for _, value := range values {
 		if len(value)%8 != 0 {
-			return nil, -1, fmt.Errorf("invalid bytesData length")
+			return nil, -1, errors.New("invalid bytesData length")
 		}
 
 		fieldData.Contents = append(fieldData.Contents, value)
@@ -629,6 +632,36 @@ func (r *PayloadReader) GetSparseFloatVectorFromPayload() (*SparseFloatVectorFie
 	}
 
 	return fieldData, int(fieldData.Dim), nil
+}
+
+// GetInt8VectorFromPayload returns vector, dimension, error
+func (r *PayloadReader) GetInt8VectorFromPayload() ([]int8, int, error) {
+	if r.colType != schemapb.DataType_Int8Vector {
+		return nil, -1, fmt.Errorf("failed to get int8 vector from datatype %v", r.colType.String())
+	}
+	col, err := r.reader.RowGroup(0).Column(0)
+	if err != nil {
+		return nil, -1, err
+	}
+
+	dim := col.Descriptor().TypeLength()
+
+	values := make([]parquet.FixedLenByteArray, r.numRows)
+	valuesRead, err := ReadDataFromAllRowGroups[parquet.FixedLenByteArray, *file.FixedLenByteArrayColumnChunkReader](r.reader, values, 0, r.numRows)
+	if err != nil {
+		return nil, -1, err
+	}
+
+	if valuesRead != r.numRows {
+		return nil, -1, fmt.Errorf("expect %d rows, but got valuesRead = %d", r.numRows, valuesRead)
+	}
+
+	ret := make([]int8, int64(dim)*r.numRows)
+	for i := 0; i < int(r.numRows); i++ {
+		int8Vals := arrow.Int8Traits.CastFromBytes(values[i])
+		copy(ret[i*dim:(i+1)*dim], int8Vals)
+	}
+	return ret, dim, nil
 }
 
 func (r *PayloadReader) GetPayloadLengthFromReader() (int, error) {
@@ -717,7 +750,7 @@ func (s *DataSet[T, E]) HasNext() bool {
 
 func (s *DataSet[T, E]) NextBatch(batch int64) ([]T, error) {
 	if s.groupID > s.reader.NumRowGroups() || (s.groupID == s.reader.NumRowGroups() && s.cnt >= s.numRows) || s.numRows == 0 {
-		return nil, fmt.Errorf("has no more data")
+		return nil, errors.New("has no more data")
 	}
 
 	if s.groupID == 0 || s.cnt >= s.numRows {

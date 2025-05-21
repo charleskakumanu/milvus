@@ -21,25 +21,24 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/samber/lo"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/metric"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/metric"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/tests/integration"
 )
 
-func (s *CompactionSuite) TestMixCompaction() {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute*10)
-	defer cancel()
+func (s *CompactionSuite) assertMixCompaction(ctx context.Context, collectionName string) {
 	c := s.Cluster
 
 	const (
@@ -52,8 +51,6 @@ func (s *CompactionSuite) TestMixCompaction() {
 		metricType = metric.L2
 		vecType    = schemapb.DataType_FloatVector
 	)
-
-	collectionName := "TestCompaction_" + funcutil.GenRandomStr()
 
 	schema := integration.ConstructSchemaOfVecDataType(collectionName, dim, true, vecType)
 	marshaledSchema, err := proto.Marshal(schema)
@@ -70,6 +67,17 @@ func (s *CompactionSuite) TestMixCompaction() {
 	err = merr.CheckRPCCall(createCollectionStatus, err)
 	s.NoError(err)
 	log.Info("CreateCollection result", zap.Any("createCollectionStatus", createCollectionStatus))
+
+	// create index
+	createIndexStatus, err := c.Proxy.CreateIndex(ctx, &milvuspb.CreateIndexRequest{
+		CollectionName: collectionName,
+		FieldName:      integration.FloatVecField,
+		IndexName:      "_default",
+		ExtraParams:    integration.ConstructIndexParam(dim, indexType, metricType),
+	})
+	err = merr.CheckRPCCall(createIndexStatus, err)
+	s.NoError(err)
+	s.WaitForIndexBuilt(ctx, collectionName, integration.FloatVecField)
 
 	// show collection
 	showCollectionsResp, err := c.Proxy.ShowCollections(ctx, &milvuspb.ShowCollectionsRequest{})
@@ -110,41 +118,42 @@ func (s *CompactionSuite) TestMixCompaction() {
 		log.Info("insert done", zap.Int("i", i))
 	}
 
-	// create index
-	createIndexStatus, err := c.Proxy.CreateIndex(ctx, &milvuspb.CreateIndexRequest{
-		CollectionName: collectionName,
-		FieldName:      integration.FloatVecField,
-		IndexName:      "_default",
-		ExtraParams:    integration.ConstructIndexParam(dim, indexType, metricType),
-	})
-	err = merr.CheckRPCCall(createIndexStatus, err)
-	s.NoError(err)
-	s.WaitForIndexBuilt(ctx, collectionName, integration.FloatVecField)
-
-	segments, err := c.MetaWatcher.ShowSegments()
-	s.NoError(err)
-	s.NotEmpty(segments)
-	s.Equal(rowNum/batch, len(segments))
-	for _, segment := range segments {
-		log.Info("show segment result", zap.String("segment", segment.String()))
-	}
-
-	// wait for compaction completed
-	showSegments := func() bool {
-		segments, err = c.MetaWatcher.ShowSegments()
+	showSegments := func() {
+		segments, err := c.MetaWatcher.ShowSegments()
 		s.NoError(err)
 		s.NotEmpty(segments)
+		// The stats task of segments will create a new segment, potentially triggering compaction simultaneously,
+		// which may lead to an increase or decrease in the number of segments.
+		s.True(len(segments) > 0)
+
+		for _, segment := range segments {
+			log.Info("show segment result", zap.Any("segment", segment))
+		}
+	}
+
+	showSegments()
+
+	// wait for compaction completed
+	waitCompaction := func() bool {
+		segments, err := c.MetaWatcher.ShowSegments()
+		s.NoError(err)
+		s.NotEmpty(segments)
+
 		compactFromSegments := lo.Filter(segments, func(segment *datapb.SegmentInfo, _ int) bool {
 			return segment.GetState() == commonpb.SegmentState_Dropped
 		})
 		compactToSegments := lo.Filter(segments, func(segment *datapb.SegmentInfo, _ int) bool {
 			return segment.GetState() == commonpb.SegmentState_Flushed
 		})
+
 		log.Info("ShowSegments result", zap.Int("len(compactFromSegments)", len(compactFromSegments)),
 			zap.Int("len(compactToSegments)", len(compactToSegments)))
-		return len(compactToSegments) == 1
+
+		// The small segments can be merged based on dataCoord.compaction.min.segment
+		return len(compactToSegments) <= paramtable.Get().DataCoordCfg.MinSegmentToMerge.GetAsInt()
 	}
-	for !showSegments() {
+
+	for !waitCompaction() {
 		select {
 		case <-ctx.Done():
 			s.Fail("waiting for compaction timeout")
@@ -152,6 +161,23 @@ func (s *CompactionSuite) TestMixCompaction() {
 		case <-time.After(1 * time.Second):
 		}
 	}
+
+	showSegments()
+}
+
+func (s *CompactionSuite) assertQuery(ctx context.Context, collectionName string) {
+	c := s.Cluster
+
+	const (
+		dim    = 128
+		dbName = ""
+		rowNum = 10000
+		batch  = 1000
+
+		indexType  = integration.IndexFaissIvfFlat
+		metricType = metric.L2
+		vecType    = schemapb.DataType_FloatVector
+	)
 
 	// load
 	loadStatus, err := c.Proxy.LoadCollection(ctx, &milvuspb.LoadCollectionRequest{
@@ -193,13 +219,36 @@ func (s *CompactionSuite) TestMixCompaction() {
 	})
 	err = merr.CheckRPCCall(status, err)
 	s.NoError(err)
+}
+
+func (s *CompactionSuite) TestMixCompaction() {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute*10)
+	defer cancel()
+
+	collectionName := "TestCompaction_" + funcutil.GenRandomStr()
+	s.assertMixCompaction(ctx, collectionName)
+	s.assertQuery(ctx, collectionName)
 
 	// drop collection
-	status, err = c.Proxy.DropCollection(ctx, &milvuspb.DropCollectionRequest{
-		CollectionName: collectionName,
-	})
-	err = merr.CheckRPCCall(status, err)
-	s.NoError(err)
+	// status, err = c.Proxy.DropCollection(ctx, &milvuspb.DropCollectionRequest{
+	//	 CollectionName: collectionName,
+	// })
+	// err = merr.CheckRPCCall(status, err)
+	// s.NoError(err)
 
 	log.Info("Test compaction succeed")
+}
+
+func (s *CompactionSuite) TestMixCompactionV2() {
+	paramtable.Get().Save(paramtable.Get().CommonCfg.EnableStorageV2.Key, "true")
+	defer paramtable.Get().Reset(paramtable.Get().CommonCfg.EnableStorageV2.Key)
+	// disable index based compaction for v2 because we don't support v2 reader yet.
+	paramtable.Get().Save(paramtable.Get().DataCoordCfg.IndexBasedCompaction.Key, "false")
+	defer paramtable.Get().Reset(paramtable.Get().DataCoordCfg.IndexBasedCompaction.Key)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute*10)
+	defer cancel()
+
+	collectionName := "TestCompaction_" + funcutil.GenRandomStr()
+	s.assertMixCompaction(ctx, collectionName)
 }

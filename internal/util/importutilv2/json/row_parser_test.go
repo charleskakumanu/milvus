@@ -17,7 +17,6 @@
 package json
 
 import (
-	"encoding/json"
 	"strings"
 	"testing"
 
@@ -25,7 +24,8 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/pkg/common"
+	"github.com/milvus-io/milvus/internal/json"
+	"github.com/milvus-io/milvus/pkg/v2/common"
 )
 
 func TestRowParser_Parse_Valid(t *testing.T) {
@@ -49,6 +49,46 @@ func TestRowParser_Parse_Valid(t *testing.T) {
 				IsDynamic: true,
 				DataType:  schemapb.DataType_JSON,
 			},
+			{
+				FieldID:  4,
+				Name:     "name",
+				DataType: schemapb.DataType_VarChar,
+				TypeParams: []*commonpb.KeyValuePair{
+					{
+						Key:   "max_length",
+						Value: "256",
+					},
+				},
+			},
+			{
+				FieldID:     5,
+				Name:        "arrayField",
+				DataType:    schemapb.DataType_Array,
+				ElementType: schemapb.DataType_Int32,
+				TypeParams: []*commonpb.KeyValuePair{
+					{
+						Key:   "max_capacity",
+						Value: "256",
+					},
+				},
+			},
+			{
+				FieldID:  6,
+				Name:     "null_fid",
+				DataType: schemapb.DataType_VarChar,
+				Nullable: true,
+				DefaultValue: &schemapb.ValueField{
+					Data: &schemapb.ValueField_StringData{
+						StringData: "a",
+					},
+				},
+				TypeParams: []*commonpb.KeyValuePair{
+					{
+						Key:   "max_length",
+						Value: "256",
+					},
+				},
+			},
 		},
 	}
 	r, err := NewRowParser(schema)
@@ -60,13 +100,14 @@ func TestRowParser_Parse_Valid(t *testing.T) {
 	}
 
 	cases := []testCase{
-		{name: `{"id": 1, "vector": [], "x": 8, "$meta": "{\"y\": 8}"}`, dyFields: []string{"x", "y"}},
-		{name: `{"id": 1, "vector": [], "x": 8, "$meta": {}}`, dyFields: []string{"x"}},
-		{name: `{"id": 1, "vector": [], "$meta": "{\"x\": 8}"}`, dyFields: []string{"x"}},
-		{name: `{"id": 1, "vector": [], "$meta": {"x": 8}}`, dyFields: []string{"x"}},
-		{name: `{"id": 1, "vector": [], "$meta": {}}`, dyFields: nil},
-		{name: `{"id": 1, "vector": [], "x": 8}`, dyFields: []string{"x"}},
-		{name: `{"id": 1, "vector": []}`, dyFields: nil},
+		{name: `{"id": 1, "vector": [], "arrayField": [1, 2, 3], "x": 8, "$meta": "{\"y\": 8}", "name": "testName"}`, dyFields: []string{"x", "y"}},
+		{name: `{"id": 1, "vector": [], "arrayField": [1, 2, 3], "x": 8, "$meta": "{\"y\": 8}", "name": "testName"}`, dyFields: []string{"x", "y"}},
+		{name: `{"id": 1, "vector": [], "arrayField": [1, 2, 3], "x": 8, "$meta": {}, "name": "testName"}`, dyFields: []string{"x"}},
+		{name: `{"id": 1, "vector": [], "arrayField": [1, 2, 3], "$meta": "{\"x\": 8}", "name": "testName"}`, dyFields: []string{"x"}},
+		{name: `{"id": 1, "vector": [], "arrayField": [1, 2, 3], "$meta": {"x": 8} , "name": "testName"}`, dyFields: []string{"x"}},
+		{name: `{"id": 1, "vector": [], "arrayField": [1, 2, 3], "$meta": {}, "name": "testName"}`, dyFields: nil},
+		{name: `{"id": 1, "vector": [], "arrayField": [1, 2, 3], "x": 8 , "name": "testName"}`, dyFields: []string{"x"}},
+		{name: `{"id": 1, "vector": [], "arrayField": [1, 2, 3], "name": "testName"}`, dyFields: nil},
 	}
 
 	for _, c := range cases {
@@ -74,6 +115,7 @@ func TestRowParser_Parse_Valid(t *testing.T) {
 			var mp map[string]interface{}
 
 			desc := json.NewDecoder(strings.NewReader(c.name))
+
 			desc.UseNumber()
 			err = desc.Decode(&mp)
 			assert.NoError(t, err)
@@ -120,6 +162,29 @@ func TestRowParser_Parse_Invalid(t *testing.T) {
 				IsDynamic: true,
 				DataType:  schemapb.DataType_JSON,
 			},
+			{
+				FieldID:  4,
+				Name:     "name",
+				DataType: schemapb.DataType_VarChar,
+				TypeParams: []*commonpb.KeyValuePair{
+					{
+						Key:   "max_length",
+						Value: "4",
+					},
+				},
+			},
+			{
+				FieldID:     5,
+				Name:        "arrayField",
+				DataType:    schemapb.DataType_Array,
+				ElementType: schemapb.DataType_Int32,
+				TypeParams: []*commonpb.KeyValuePair{
+					{
+						Key:   "max_capacity",
+						Value: "4",
+					},
+				},
+			},
 		},
 	}
 	r, err := NewRowParser(schema)
@@ -131,10 +196,13 @@ func TestRowParser_Parse_Invalid(t *testing.T) {
 	}
 
 	cases := []testCase{
-		{name: `{"id": 1, "vector": [], "x": 6, "$meta": {"x": 8}}`, expectErr: "duplicated key is not allowed"},
-		{name: `{"id": 1, "vector": [], "x": 6, "$meta": "{\"x\": 8}"}`, expectErr: "duplicated key is not allowed"},
-		{name: `{"id": 1, "vector": [], "x": 6, "$meta": "{*&%%&$*(&"}`, expectErr: "not a JSON format string"},
-		{name: `{"id": 1, "vector": [], "x": 6, "$meta": []}`, expectErr: "not a JSON object"},
+		{name: `{"id": 1, "vector": [], "arrayField": [1, 2, 3, 4], "x": 6, "$meta": {"x": 8}, "name": "test"}`, expectErr: "duplicated key is not allowed"},
+		{name: `{"id": 1, "vector": [], "arrayField": [1, 2, 3, 4], "x": 6, "$meta": "{\"x\": 8}", "name": "test"}`, expectErr: "duplicated key is not allowed"},
+		{name: `{"id": 1, "vector": [], "arrayField": [1, 2, 3, 4], "x": 6, "$meta": "{*&%%&$*(&", "name": "test"}`, expectErr: "not a JSON format string"},
+		{name: `{"id": 1, "vector": [], "arrayField": [1, 2, 3, 4], "x": 6, "$meta": [], "name": "test"}`, expectErr: "not a JSON object"},
+		{name: `{"id": 1, "vector": [], "arrayField": [1, 2, 3, 4], "x": 8, "$meta": "{\"y\": 8}", "name": "testName"}`, expectErr: "value length(8) for field name exceeds max_length(4)"},
+		{name: `{"id": 1, "vector": [], "arrayField": [1, 2, 3, 4, 5], "x": 8, "$meta": "{\"z\": 9}", "name": "test"}`, expectErr: "array capacity(5) for field arrayField exceeds max_capacity(4)"},
+		{name: `{"id": 1, "vector": [], "x": 8, "$meta": "{\"z\": 9}", "name": "test"}`, expectErr: "value of field 'arrayField' is missed"},
 	}
 
 	for _, c := range cases {
@@ -149,6 +217,21 @@ func TestRowParser_Parse_Invalid(t *testing.T) {
 			_, err = r.Parse(mp)
 			assert.Error(t, err)
 			assert.True(t, strings.Contains(err.Error(), c.expectErr))
+		})
+	}
+
+	cases = []testCase{
+		{name: `{"id": 1, "vector": [], "arrayField": [1, 2, 3], "name": "\xc3\x28"}`, expectErr: "Syntax error"}, // test invalid uft-8
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var mp map[string]interface{}
+
+			desc := json.NewDecoder(strings.NewReader(c.name))
+			desc.UseNumber()
+			err = desc.Decode(&mp)
+			assert.Error(t, err)
+			assert.True(t, strings.Contains(err.Error(), c.expectErr), "error: %s, expectErr: %s", err.Error(), c.expectErr)
 		})
 	}
 }

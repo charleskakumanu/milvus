@@ -19,7 +19,7 @@
 package msgstream
 
 import (
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 )
@@ -27,7 +27,7 @@ import (
 // LoadCollectionMsg is a message pack that contains load collection request
 type LoadCollectionMsg struct {
 	BaseMsg
-	milvuspb.LoadCollectionRequest
+	*milvuspb.LoadCollectionRequest
 }
 
 // interface implementation validation
@@ -51,7 +51,7 @@ func (l *LoadCollectionMsg) SourceID() int64 {
 
 func (l *LoadCollectionMsg) Marshal(input TsMsg) (MarshalType, error) {
 	loadCollectionMsg := input.(*LoadCollectionMsg)
-	loadCollectionRequest := &loadCollectionMsg.LoadCollectionRequest
+	loadCollectionRequest := loadCollectionMsg.LoadCollectionRequest
 	mb, err := proto.Marshal(loadCollectionRequest)
 	if err != nil {
 		return nil, err
@@ -60,12 +60,12 @@ func (l *LoadCollectionMsg) Marshal(input TsMsg) (MarshalType, error) {
 }
 
 func (l *LoadCollectionMsg) Unmarshal(input MarshalType) (TsMsg, error) {
-	loadCollectionRequest := milvuspb.LoadCollectionRequest{}
+	loadCollectionRequest := &milvuspb.LoadCollectionRequest{}
 	in, err := convertToByteArray(input)
 	if err != nil {
 		return nil, err
 	}
-	err = proto.Unmarshal(in, &loadCollectionRequest)
+	err = proto.Unmarshal(in, loadCollectionRequest)
 	if err != nil {
 		return nil, err
 	}
@@ -77,13 +77,13 @@ func (l *LoadCollectionMsg) Unmarshal(input MarshalType) (TsMsg, error) {
 }
 
 func (l *LoadCollectionMsg) Size() int {
-	return proto.Size(&l.LoadCollectionRequest)
+	return proto.Size(l.LoadCollectionRequest)
 }
 
 // ReleaseCollectionMsg is a message pack that contains release collection request
 type ReleaseCollectionMsg struct {
 	BaseMsg
-	milvuspb.ReleaseCollectionRequest
+	*milvuspb.ReleaseCollectionRequest
 }
 
 var _ TsMsg = &ReleaseCollectionMsg{}
@@ -106,7 +106,7 @@ func (r *ReleaseCollectionMsg) SourceID() int64 {
 
 func (r *ReleaseCollectionMsg) Marshal(input TsMsg) (MarshalType, error) {
 	releaseCollectionMsg := input.(*ReleaseCollectionMsg)
-	releaseCollectionRequest := &releaseCollectionMsg.ReleaseCollectionRequest
+	releaseCollectionRequest := releaseCollectionMsg.ReleaseCollectionRequest
 	mb, err := proto.Marshal(releaseCollectionRequest)
 	if err != nil {
 		return nil, err
@@ -115,12 +115,12 @@ func (r *ReleaseCollectionMsg) Marshal(input TsMsg) (MarshalType, error) {
 }
 
 func (r *ReleaseCollectionMsg) Unmarshal(input MarshalType) (TsMsg, error) {
-	releaseCollectionRequest := milvuspb.ReleaseCollectionRequest{}
+	releaseCollectionRequest := &milvuspb.ReleaseCollectionRequest{}
 	in, err := convertToByteArray(input)
 	if err != nil {
 		return nil, err
 	}
-	err = proto.Unmarshal(in, &releaseCollectionRequest)
+	err = proto.Unmarshal(in, releaseCollectionRequest)
 	if err != nil {
 		return nil, err
 	}
@@ -132,12 +132,12 @@ func (r *ReleaseCollectionMsg) Unmarshal(input MarshalType) (TsMsg, error) {
 }
 
 func (r *ReleaseCollectionMsg) Size() int {
-	return proto.Size(&r.ReleaseCollectionRequest)
+	return proto.Size(r.ReleaseCollectionRequest)
 }
 
 type FlushMsg struct {
 	BaseMsg
-	milvuspb.FlushRequest
+	*milvuspb.FlushRequest
 }
 
 var _ TsMsg = &FlushMsg{}
@@ -160,7 +160,7 @@ func (f *FlushMsg) SourceID() int64 {
 
 func (f *FlushMsg) Marshal(input TsMsg) (MarshalType, error) {
 	flushMsg := input.(*FlushMsg)
-	flushRequest := &flushMsg.FlushRequest
+	flushRequest := flushMsg.FlushRequest
 	mb, err := proto.Marshal(flushRequest)
 	if err != nil {
 		return nil, err
@@ -169,12 +169,12 @@ func (f *FlushMsg) Marshal(input TsMsg) (MarshalType, error) {
 }
 
 func (f *FlushMsg) Unmarshal(input MarshalType) (TsMsg, error) {
-	flushRequest := milvuspb.FlushRequest{}
+	flushRequest := &milvuspb.FlushRequest{}
 	in, err := convertToByteArray(input)
 	if err != nil {
 		return nil, err
 	}
-	err = proto.Unmarshal(in, &flushRequest)
+	err = proto.Unmarshal(in, flushRequest)
 	if err != nil {
 		return nil, err
 	}
@@ -186,5 +186,168 @@ func (f *FlushMsg) Unmarshal(input MarshalType) (TsMsg, error) {
 }
 
 func (f *FlushMsg) Size() int {
-	return proto.Size(&f.FlushRequest)
+	return proto.Size(f.FlushRequest)
+}
+
+type AlterCollectionMsg struct {
+	BaseMsg
+	*milvuspb.AlterCollectionRequest
+}
+
+var _ TsMsg = &AlterCollectionMsg{}
+
+func (a *AlterCollectionMsg) ID() UniqueID {
+	return a.Base.MsgID
+}
+
+func (a *AlterCollectionMsg) SetID(id UniqueID) {
+	a.Base.MsgID = id
+}
+
+func (a *AlterCollectionMsg) Type() MsgType {
+	return a.Base.MsgType
+}
+
+func (a *AlterCollectionMsg) SourceID() int64 {
+	return a.Base.SourceID
+}
+
+func (a *AlterCollectionMsg) Marshal(input TsMsg) (MarshalType, error) {
+	alterCollectionMsg := input.(*AlterCollectionMsg)
+	alterCollectionRequest := alterCollectionMsg.AlterCollectionRequest
+	mb, err := proto.Marshal(alterCollectionRequest)
+	if err != nil {
+		return nil, err
+	}
+	return mb, nil
+}
+
+func (a *AlterCollectionMsg) Unmarshal(input MarshalType) (TsMsg, error) {
+	alterCollectionRequest := &milvuspb.AlterCollectionRequest{}
+	in, err := convertToByteArray(input)
+	if err != nil {
+		return nil, err
+	}
+	err = proto.Unmarshal(in, alterCollectionRequest)
+	if err != nil {
+		return nil, err
+	}
+	alterCollectionMsg := &AlterCollectionMsg{AlterCollectionRequest: alterCollectionRequest}
+	alterCollectionMsg.BeginTimestamp = alterCollectionMsg.GetBase().GetTimestamp()
+	alterCollectionMsg.EndTimestamp = alterCollectionMsg.GetBase().GetTimestamp()
+
+	return alterCollectionMsg, nil
+}
+
+func (a *AlterCollectionMsg) Size() int {
+	return proto.Size(a.AlterCollectionRequest)
+}
+
+type AlterCollectionFieldMsg struct {
+	BaseMsg
+	*milvuspb.AlterCollectionFieldRequest
+}
+
+var _ TsMsg = &AlterCollectionFieldMsg{}
+
+func (a *AlterCollectionFieldMsg) ID() UniqueID {
+	return a.Base.MsgID
+}
+
+func (a *AlterCollectionFieldMsg) SetID(id UniqueID) {
+	a.Base.MsgID = id
+}
+
+func (a *AlterCollectionFieldMsg) Type() MsgType {
+	return a.Base.MsgType
+}
+
+func (a *AlterCollectionFieldMsg) SourceID() int64 {
+	return a.Base.SourceID
+}
+
+func (a *AlterCollectionFieldMsg) Marshal(input TsMsg) (MarshalType, error) {
+	alterCollectionFieldMsg := input.(*AlterCollectionFieldMsg)
+	alterCollectionFieldRequest := alterCollectionFieldMsg.AlterCollectionFieldRequest
+	mb, err := proto.Marshal(alterCollectionFieldRequest)
+	if err != nil {
+		return nil, err
+	}
+	return mb, nil
+}
+
+func (a *AlterCollectionFieldMsg) Unmarshal(input MarshalType) (TsMsg, error) {
+	alterCollectionFieldRequest := &milvuspb.AlterCollectionFieldRequest{}
+	in, err := convertToByteArray(input)
+	if err != nil {
+		return nil, err
+	}
+	err = proto.Unmarshal(in, alterCollectionFieldRequest)
+	if err != nil {
+		return nil, err
+	}
+	alterCollectionFieldMsg := &AlterCollectionFieldMsg{AlterCollectionFieldRequest: alterCollectionFieldRequest}
+	alterCollectionFieldMsg.BeginTimestamp = alterCollectionFieldMsg.GetBase().GetTimestamp()
+	alterCollectionFieldMsg.EndTimestamp = alterCollectionFieldMsg.GetBase().GetTimestamp()
+
+	return alterCollectionFieldMsg, nil
+}
+
+func (a *AlterCollectionFieldMsg) Size() int {
+	return proto.Size(a.AlterCollectionFieldRequest)
+}
+
+// TODO fubang maybe it will break the cdc replication
+type RenameCollectionMsg struct {
+	BaseMsg
+	*milvuspb.RenameCollectionRequest
+}
+
+var _ TsMsg = &RenameCollectionMsg{}
+
+func (r *RenameCollectionMsg) ID() UniqueID {
+	return r.Base.MsgID
+}
+
+func (r *RenameCollectionMsg) SetID(id UniqueID) {
+	r.Base.MsgID = id
+}
+
+func (r *RenameCollectionMsg) Type() MsgType {
+	return r.Base.MsgType
+}
+
+func (r *RenameCollectionMsg) SourceID() int64 {
+	return r.Base.SourceID
+}
+
+func (r *RenameCollectionMsg) Marshal(input TsMsg) (MarshalType, error) {
+	renameCollectionMsg := input.(*RenameCollectionMsg)
+	renameCollectionRequest := renameCollectionMsg.RenameCollectionRequest
+	mb, err := proto.Marshal(renameCollectionRequest)
+	if err != nil {
+		return nil, err
+	}
+	return mb, nil
+}
+
+func (r *RenameCollectionMsg) Unmarshal(input MarshalType) (TsMsg, error) {
+	renameCollectionRequest := &milvuspb.RenameCollectionRequest{}
+	in, err := convertToByteArray(input)
+	if err != nil {
+		return nil, err
+	}
+	err = proto.Unmarshal(in, renameCollectionRequest)
+	if err != nil {
+		return nil, err
+	}
+	renameCollectionMsg := &RenameCollectionMsg{RenameCollectionRequest: renameCollectionRequest}
+	renameCollectionMsg.BeginTimestamp = renameCollectionMsg.GetBase().GetTimestamp()
+	renameCollectionMsg.EndTimestamp = renameCollectionMsg.GetBase().GetTimestamp()
+
+	return renameCollectionMsg, nil
+}
+
+func (r *RenameCollectionMsg) Size() int {
+	return proto.Size(r.RenameCollectionRequest)
 }

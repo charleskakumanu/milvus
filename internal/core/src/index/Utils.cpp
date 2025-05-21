@@ -63,6 +63,7 @@ BIN_List() {
     return ret;
 }
 
+// TODO caiyd: should list supported list
 std::vector<std::tuple<IndexType, MetricType>>
 unsupported_index_combinations() {
     static std::vector<std::tuple<IndexType, MetricType>> ret{
@@ -128,7 +129,14 @@ int64_t
 GetDimFromConfig(const Config& config) {
     auto dimension = GetValueFromConfig<std::string>(config, "dim");
     AssertInfo(dimension.has_value(), "dimension not exist in config");
-    return (std::stoi(dimension.value()));
+    try {
+        return (std::stoi(dimension.value()));
+    } catch (const std::logic_error& e) {
+        auto err_message = fmt::format(
+            "invalided dimension:{}, error:{}", dimension.value(), e.what());
+        LOG_ERROR(err_message);
+        throw std::logic_error(err_message);
+    }
 }
 
 std::string
@@ -151,7 +159,16 @@ GetIndexEngineVersionFromConfig(const Config& config) {
         GetValueFromConfig<std::string>(config, INDEX_ENGINE_VERSION);
     AssertInfo(index_engine_version.has_value(),
                "index_engine not exist in config");
-    return (std::stoi(index_engine_version.value()));
+    try {
+        return (std::stoi(index_engine_version.value()));
+    } catch (const std::logic_error& e) {
+        auto err_message =
+            fmt::format("invalided index engine version:{}, error:{}",
+                        index_engine_version.value(),
+                        e.what());
+        LOG_ERROR(err_message);
+        throw std::logic_error(err_message);
+    }
 }
 
 int32_t
@@ -160,7 +177,15 @@ GetBitmapCardinalityLimitFromConfig(const Config& config) {
         config, index::BITMAP_INDEX_CARDINALITY_LIMIT);
     AssertInfo(bitmap_limit.has_value(),
                "bitmap cardinality limit not exist in config");
-    return (std::stoi(bitmap_limit.value()));
+    try {
+        return (std::stoi(bitmap_limit.value()));
+    } catch (const std::logic_error& e) {
+        auto err_message = fmt::format("invalided bitmap limit:{}, error:{}",
+                                       bitmap_limit.value(),
+                                       e.what());
+        LOG_ERROR(err_message);
+        throw std::logic_error(err_message);
+    }
 }
 
 // TODO :: too ugly
@@ -238,35 +263,77 @@ ParseConfigFromIndexParams(
     return config;
 }
 
-void
-AssembleIndexDatas(std::map<std::string, FieldDataPtr>& index_datas) {
+std::map<std::string, IndexDataCodec>
+CompactIndexDatas(
+    std::map<std::string, std::unique_ptr<storage::DataCodec>>& index_datas) {
+    std::map<std::string, IndexDataCodec> index_file_slices;
+    std::unordered_set<std::string> compacted_files;
     if (index_datas.find(INDEX_FILE_SLICE_META) != index_datas.end()) {
-        auto slice_meta = index_datas.at(INDEX_FILE_SLICE_META);
+        auto slice_meta = std::move(index_datas.at(INDEX_FILE_SLICE_META));
         Config meta_data = Config::parse(std::string(
-            static_cast<const char*>(slice_meta->Data()), slice_meta->Size()));
-
+            reinterpret_cast<const char*>(slice_meta->PayloadData()),
+            slice_meta->PayloadSize()));
+        compacted_files.insert(INDEX_FILE_SLICE_META);
         for (auto& item : meta_data[META]) {
             std::string prefix = item[NAME];
             int slice_num = item[SLICE_NUM];
             auto total_len = static_cast<size_t>(item[TOTAL_LEN]);
-
-            auto new_field_data =
-                storage::CreateFieldData(DataType::INT8, 1, total_len);
-
+            auto data_len = 0;
+            index_file_slices.insert({prefix, IndexDataCodec{}});
+            auto& index_data_codec = index_file_slices.at(prefix);
             for (auto i = 0; i < slice_num; ++i) {
                 std::string file_name = GenSlicedFileName(prefix, i);
                 AssertInfo(index_datas.find(file_name) != index_datas.end(),
                            "lost index slice data");
-                auto data = index_datas.at(file_name);
-                auto len = data->Size();
-                new_field_data->FillFieldData(data->Data(), len);
-                index_datas.erase(file_name);
+                index_data_codec.codecs_.push_back(
+                    std::move(index_datas.at(file_name)));
+                compacted_files.insert(file_name);
+                data_len += index_data_codec.codecs_.back()->PayloadSize();
             }
             AssertInfo(
-                new_field_data->IsFull(),
+                total_len == data_len,
                 "index len is inconsistent after disassemble and assemble");
-            index_datas[prefix] = new_field_data;
+            if (index_datas.count(prefix) > 0) {
+                index_data_codec.codecs_.push_back(
+                    std::move(index_datas[prefix]));
+                compacted_files.insert(prefix);
+            }
+            index_data_codec.size_ = data_len;
         }
+    }
+    for (auto& index_data : index_datas) {
+        if (compacted_files.find(index_data.first) == compacted_files.end()) {
+            index_file_slices.insert({index_data.first, IndexDataCodec{}});
+            auto& index_data_codec = index_file_slices.at(index_data.first);
+            index_data_codec.size_ = index_data.second->PayloadSize();
+            index_data_codec.codecs_.push_back(std::move(index_data.second));
+        }
+    }
+    return index_file_slices;
+}
+
+void
+AssembleIndexDatas(
+    std::map<std::string, std::unique_ptr<storage::DataCodec>>& index_datas,
+    BinarySet& index_binary_set) {
+    auto index_file_slices = CompactIndexDatas(index_datas);
+    AssembleIndexDatas(index_file_slices, index_binary_set);
+}
+
+void
+AssembleIndexDatas(std::map<std::string, IndexDataCodec>& index_file_slices,
+                   BinarySet& index_binary_set) {
+    for (auto& [key, index_slices] : index_file_slices) {
+        auto index_size = index_slices.size_;
+        auto buf = std::shared_ptr<uint8_t[]>(new uint8_t[index_size]);
+        int64_t offset = 0;
+        for (auto&& index_slice : index_slices.codecs_) {
+            std::memcpy(buf.get() + offset,
+                        index_slice->PayloadData(),
+                        index_slice->PayloadSize());
+            offset += index_slice->PayloadSize();
+        }
+        index_binary_set.Append(key, buf, index_size);
     }
 }
 
@@ -282,15 +349,15 @@ AssembleIndexDatas(std::map<std::string, FieldDataChannelPtr>& index_datas,
         index_datas.erase(INDEX_FILE_SLICE_META);
         Config metadata = Config::parse(
             std::string(static_cast<const char*>(raw_metadata->Data()),
-                        raw_metadata->Size()));
+                        raw_metadata->DataSize()));
 
         for (auto& item : metadata[META]) {
             std::string prefix = item[NAME];
             int slice_num = item[SLICE_NUM];
             auto total_len = static_cast<size_t>(item[TOTAL_LEN]);
-
+            // build index skip null value, so not need to set nullable == true
             auto new_field_data =
-                storage::CreateFieldData(DataType::INT8, 1, total_len);
+                storage::CreateFieldData(DataType::INT8, false, 1, total_len);
 
             for (auto i = 0; i < slice_num; ++i) {
                 std::string file_name = GenSlicedFileName(prefix, i);
@@ -299,7 +366,7 @@ AssembleIndexDatas(std::map<std::string, FieldDataChannelPtr>& index_datas,
                 auto& channel = it->second;
                 auto data_array = storage::CollectFieldDataChannel(channel);
                 auto data = storage::MergeFieldData(data_array);
-                auto len = data->Size();
+                auto len = data->DataSize();
                 new_field_data->FillFieldData(data->Data(), len);
                 index_datas.erase(file_name);
             }
@@ -335,6 +402,40 @@ ReadDataFromFD(int fd, void* buf, size_t size, size_t chunk_size) {
         buf = static_cast<char*>(buf) + size_read;
         size -= static_cast<std::size_t>(size_read);
     }
+}
+
+bool
+CheckAndUpdateKnowhereRangeSearchParam(const SearchInfo& search_info,
+                                       const int64_t topk,
+                                       const MetricType& metric_type,
+                                       knowhere::Json& search_config) {
+    const auto radius =
+        index::GetValueFromConfig<float>(search_info.search_params_, RADIUS);
+    if (!radius.has_value()) {
+        return false;
+    }
+
+    search_config[RADIUS] = radius.value();
+    // `range_search_k` is only used as one of the conditions for iterator early termination.
+    // not gurantee to return exactly `range_search_k` results, which may be more or less.
+    // set it to -1 will return all results in the range.
+    search_config[knowhere::meta::RANGE_SEARCH_K] = topk;
+
+    const auto range_filter =
+        GetValueFromConfig<float>(search_info.search_params_, RANGE_FILTER);
+    if (range_filter.has_value()) {
+        search_config[RANGE_FILTER] = range_filter.value();
+        CheckRangeSearchParam(
+            search_config[RADIUS], search_config[RANGE_FILTER], metric_type);
+    }
+
+    const auto page_retain_order =
+        GetValueFromConfig<bool>(search_info.search_params_, PAGE_RETAIN_ORDER);
+    if (page_retain_order.has_value()) {
+        search_config[knowhere::meta::RETAIN_ITERATOR_ORDER] =
+            page_retain_order.value();
+    }
+    return true;
 }
 
 }  // namespace milvus::index

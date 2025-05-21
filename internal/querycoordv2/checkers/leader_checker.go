@@ -22,12 +22,13 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	"github.com/milvus-io/milvus/internal/querycoordv2/session"
 	"github.com/milvus-io/milvus/internal/querycoordv2/task"
 	"github.com/milvus-io/milvus/internal/querycoordv2/utils"
-	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/internal/util/streamingutil"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/log"
 )
 
 var _ Checker = (*LeaderChecker)(nil)
@@ -37,14 +38,14 @@ type LeaderChecker struct {
 	*checkerActivation
 	meta    *meta.Meta
 	dist    *meta.DistributionManager
-	target  *meta.TargetManager
+	target  meta.TargetManagerInterface
 	nodeMgr *session.NodeManager
 }
 
 func NewLeaderChecker(
 	meta *meta.Meta,
 	dist *meta.DistributionManager,
-	target *meta.TargetManager,
+	target meta.TargetManagerInterface,
 	nodeMgr *session.NodeManager,
 ) *LeaderChecker {
 	return &LeaderChecker{
@@ -64,9 +65,9 @@ func (c *LeaderChecker) Description() string {
 	return "LeaderChecker checks the difference of leader view between dist, and try to correct it"
 }
 
-func (c *LeaderChecker) readyToCheck(collectionID int64) bool {
-	metaExist := (c.meta.GetCollection(collectionID) != nil)
-	targetExist := c.target.IsNextTargetExist(collectionID) || c.target.IsCurrentTargetExist(collectionID)
+func (c *LeaderChecker) readyToCheck(ctx context.Context, collectionID int64) bool {
+	metaExist := (c.meta.GetCollection(ctx, collectionID) != nil)
+	targetExist := c.target.IsNextTargetExist(ctx, collectionID) || c.target.IsCurrentTargetExist(ctx, collectionID, common.AllPartitionsID)
 
 	return metaExist && targetExist
 }
@@ -76,22 +77,26 @@ func (c *LeaderChecker) Check(ctx context.Context) []task.Task {
 		return nil
 	}
 
-	collectionIDs := c.meta.CollectionManager.GetAll()
+	collectionIDs := c.meta.CollectionManager.GetAll(ctx)
 	tasks := make([]task.Task, 0)
 
 	for _, collectionID := range collectionIDs {
-		if !c.readyToCheck(collectionID) {
+		if !c.readyToCheck(ctx, collectionID) {
 			continue
 		}
-		collection := c.meta.CollectionManager.GetCollection(collectionID)
+		collection := c.meta.CollectionManager.GetCollection(ctx, collectionID)
 		if collection == nil {
 			log.Warn("collection released during check leader", zap.Int64("collection", collectionID))
 			continue
 		}
 
-		replicas := c.meta.ReplicaManager.GetByCollection(collectionID)
+		replicas := c.meta.ReplicaManager.GetByCollection(ctx, collectionID)
 		for _, replica := range replicas {
-			for _, node := range replica.GetRWNodes() {
+			nodes := replica.GetRWNodes()
+			if streamingutil.IsStreamingServiceEnabled() {
+				nodes = replica.GetRWSQNodes()
+			}
+			for _, node := range nodes {
 				leaderViews := c.dist.LeaderViewManager.GetByFilter(meta.WithCollectionID2LeaderView(replica.GetCollectionID()), meta.WithNodeID2LeaderView(node))
 				for _, leaderView := range leaderViews {
 					dist := c.dist.SegmentDistManager.GetByFilter(meta.WithChannel(leaderView.Channel), meta.WithReplica(replica))
@@ -108,7 +113,7 @@ func (c *LeaderChecker) Check(ctx context.Context) []task.Task {
 
 func (c *LeaderChecker) findNeedSyncPartitionStats(ctx context.Context, replica *meta.Replica, leaderView *meta.LeaderView, nodeID int64) []task.Task {
 	ret := make([]task.Task, 0)
-	curDmlChannel := c.target.GetDmChannel(leaderView.CollectionID, leaderView.Channel, meta.CurrentTarget)
+	curDmlChannel := c.target.GetDmChannel(ctx, leaderView.CollectionID, leaderView.Channel, meta.CurrentTarget)
 	if curDmlChannel == nil {
 		return ret
 	}
@@ -120,6 +125,11 @@ func (c *LeaderChecker) findNeedSyncPartitionStats(ctx context.Context, replica 
 		psVersionInLView := partStatsInLView[partID]
 		if psVersionInLView < psVersionInTarget {
 			partStatsToUpdate[partID] = psVersionInTarget
+		} else {
+			log.Ctx(ctx).RatedDebug(60, "no need to update part stats for partition",
+				zap.Int64("partitionID", partID),
+				zap.Int64("psVersionInLView", psVersionInLView),
+				zap.Int64("psVersionInTarget", psVersionInTarget))
 		}
 	}
 	if len(partStatsToUpdate) > 0 {
@@ -138,6 +148,9 @@ func (c *LeaderChecker) findNeedSyncPartitionStats(ctx context.Context, replica 
 		t.SetPriority(task.TaskPriorityLow)
 		t.SetReason("sync partition stats versions")
 		ret = append(ret, t)
+		log.Ctx(ctx).Debug("Created leader actions for partitionStats",
+			zap.Int64("collectionID", leaderView.CollectionID),
+			zap.Any("action", action.String()))
 	}
 
 	return ret
@@ -154,21 +167,21 @@ func (c *LeaderChecker) findNeedLoadedSegments(ctx context.Context, replica *met
 
 	latestNodeDist := utils.FindMaxVersionSegments(dist)
 	for _, s := range latestNodeDist {
-		segment := c.target.GetSealedSegment(leaderView.CollectionID, s.GetID(), meta.CurrentTargetFirst)
-		existInTarget := segment != nil
-		isL0Segment := existInTarget && segment.GetLevel() == datapb.SegmentLevel_L0
-		// shouldn't set l0 segment location to delegator. l0 segment should be reload in delegator
-		if !existInTarget || isL0Segment {
+		segment := c.target.GetSealedSegment(ctx, leaderView.CollectionID, s.GetID(), meta.CurrentTargetFirst)
+		if segment == nil {
 			continue
 		}
 
-		// when segment's version in leader view doesn't match segment's version in dist
-		// which means leader view store wrong segment location in leader view, then we should update segment location and segment's version
+		// The routing table on the delegator points to the nodes where segments are loaded. There are two scenarios that require updating the routing table on the delegator:
+		// 1. Missing Segment Routing - The routing table lacks the route for a specific segment.
+		// 2. Outdated Segment Routing - A segment has multiple copies loaded, but the routing table points to a node that does not host the most recently loaded copy.
+		// This ensures the routing table remains accurate and up-to-date, reflecting the latest segment distribution.
 		version, ok := leaderView.Segments[s.GetID()]
-		if !ok || version.GetVersion() != s.Version {
+		if !ok || version.GetNodeID() != s.Node {
 			log.RatedDebug(10, "leader checker append a segment to set",
 				zap.Int64("segmentID", s.GetID()),
 				zap.Int64("nodeID", s.Node))
+
 			action := task.NewLeaderAction(leaderView.ID, s.Node, task.ActionTypeGrow, s.GetInsertChannel(), s.GetID(), time.Now().UnixNano())
 			t := task.NewLeaderSegmentTask(
 				ctx,
@@ -204,10 +217,9 @@ func (c *LeaderChecker) findNeedRemovedSegments(ctx context.Context, replica *me
 
 	for sid, s := range leaderView.Segments {
 		_, ok := distMap[sid]
-		segment := c.target.GetSealedSegment(leaderView.CollectionID, sid, meta.CurrentTargetFirst)
+		segment := c.target.GetSealedSegment(ctx, leaderView.CollectionID, sid, meta.CurrentTargetFirst)
 		existInTarget := segment != nil
-		isL0Segment := existInTarget && segment.GetLevel() == datapb.SegmentLevel_L0
-		if ok || existInTarget || isL0Segment {
+		if ok || existInTarget {
 			continue
 		}
 		log.Debug("leader checker append a segment to remove",

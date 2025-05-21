@@ -23,11 +23,11 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/proxypb"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/ratelimitutil"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/proxypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/ratelimitutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 type RateLimiterNode struct {
@@ -97,6 +97,11 @@ func (rln *RateLimiterNode) GetQuotaExceededError(rt internalpb.RateType) error 
 		if errCode, ok := rln.quotaStates.Get(milvuspb.QuotaState_DenyToRead); ok {
 			return merr.WrapErrServiceQuotaExceeded(ratelimitutil.GetQuotaErrorString(errCode))
 		}
+	case internalpb.RateType_DDLCollection, internalpb.RateType_DDLPartition,
+		internalpb.RateType_DDLIndex, internalpb.RateType_DDLCompaction, internalpb.RateType_DDLFlush:
+		if errCode, ok := rln.quotaStates.Get(milvuspb.QuotaState_DenyToDDL); ok {
+			return merr.WrapErrServiceQuotaExceeded(ratelimitutil.GetQuotaErrorString(errCode))
+		}
 	}
 	return merr.WrapErrServiceQuotaExceeded(fmt.Sprintf("rate type: %s", rt.String()))
 }
@@ -156,6 +161,8 @@ func (rln *RateLimiterNode) GetID() int64 {
 	return rln.id
 }
 
+const clearInvalidNodeInterval = 1 * time.Minute
+
 // RateLimiterTree is implemented based on RateLimiterNode to operate multilevel rate limiters
 //
 // it contains the following four levels generally:
@@ -167,11 +174,13 @@ func (rln *RateLimiterNode) GetID() int64 {
 type RateLimiterTree struct {
 	root *RateLimiterNode
 	mu   sync.RWMutex
+
+	lastClearTime time.Time
 }
 
 // NewRateLimiterTree returns a new RateLimiterTree.
 func NewRateLimiterTree(root *RateLimiterNode) *RateLimiterTree {
-	return &RateLimiterTree{root: root}
+	return &RateLimiterTree{root: root, lastClearTime: time.Now()}
 }
 
 // GetRootLimiters get root limiters
@@ -182,6 +191,13 @@ func (m *RateLimiterTree) GetRootLimiters() *RateLimiterNode {
 func (m *RateLimiterTree) ClearInvalidLimiterNode(req *proxypb.LimiterNode) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	if time.Since(m.lastClearTime) < clearInvalidNodeInterval {
+		return
+	}
+	defer func() {
+		m.lastClearTime = time.Now()
+	}()
 
 	reqDBLimits := req.GetChildren()
 	removeDBLimits := make([]int64, 0)

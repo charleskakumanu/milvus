@@ -19,11 +19,13 @@ package meta
 import (
 	"sync"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/samber/lo"
+	"google.golang.org/protobuf/proto"
 
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/internal/util/metrics"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 type channelDistCriterion struct {
@@ -128,6 +130,13 @@ func (channel *DmChannel) Clone() *DmChannel {
 		Node:         channel.Node,
 		Version:      channel.Version,
 	}
+}
+
+func newDmChannelMetricsFrom(channel *DmChannel) *metricsinfo.DmChannel {
+	dmChannel := metrics.NewDMChannelFrom(channel.VchannelInfo)
+	dmChannel.NodeID = channel.Node
+	dmChannel.Version = channel.Version
+	return dmChannel
 }
 
 type nodeChannels struct {
@@ -289,4 +298,26 @@ func (m *ChannelDistManager) updateCollectionIndex() {
 			}
 		}
 	}
+}
+
+func (m *ChannelDistManager) GetChannelDist(collectionID int64) []*metricsinfo.DmChannel {
+	m.rwmutex.RLock()
+	defer m.rwmutex.RUnlock()
+
+	var ret []*metricsinfo.DmChannel
+	if collectionID > 0 {
+		if channels, ok := m.collectionIndex[collectionID]; ok {
+			for _, channel := range channels {
+				ret = append(ret, newDmChannelMetricsFrom(channel))
+			}
+		}
+		return ret
+	}
+
+	for _, channels := range m.collectionIndex {
+		for _, channel := range channels {
+			ret = append(ret, newDmChannelMetricsFrom(channel))
+		}
+	}
+	return ret
 }

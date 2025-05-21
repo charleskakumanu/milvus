@@ -8,7 +8,7 @@ import copy
 import numpy as np
 import requests
 from sklearn import preprocessing
-from pymilvus import Milvus, DataType
+from pymilvus import MilvusClient, DataType
 from utils.util_log import test_log as log
 from utils.util_k8s import init_k8s_client_config
 
@@ -57,6 +57,8 @@ default_index_params = [
 def create_target_index(index, field_name):
     index["field_name"] = field_name
 
+def gpu_support():
+    return ["GPU_IVF_FLAT", "GPU_IVF_PQ"]
 
 def binary_support():
     return ["BIN_FLAT", "BIN_IVF_FLAT"]
@@ -113,9 +115,9 @@ def get_milvus(host, port, uri=None, handler=None, **kwargs):
         handler = "GRPC"
     try_connect = kwargs.get("try_connect", True)
     if uri is not None:
-        milvus = Milvus(uri=uri, handler=handler, try_connect=try_connect)
+        milvus = MilvusClient(uri=uri, handler=handler, try_connect=try_connect)
     else:
-        milvus = Milvus(host=host, port=port, handler=handler, try_connect=try_connect)
+        milvus = MilvusClient(uri=f"http://{host}:{port}", handler=handler, try_connect=try_connect)
     return milvus
 
 
@@ -759,15 +761,17 @@ def gen_index():
     return index_params
 
 
-def gen_simple_index():
-    index_params = []
-    for i in range(len(all_index_types)):
-        if all_index_types[i] in binary_support():
-            continue
-        dic = {"index_type": all_index_types[i], "metric_type": "L2"}
-        dic.update({"params": default_index_params[i]})
-        index_params.append(dic)
-    return index_params
+# def gen_simple_index():
+#     index_params = []
+#     for i in range(len(all_index_types)):
+#         if all_index_types[i] in binary_support():
+#             continue
+#         if all_index_types[i] in gpu_support():
+#             continue
+#         dic = {"index_type": all_index_types[i], "metric_type": "L2"}
+#         dic.update({"params": default_index_params[i]})
+#         index_params.append(dic)
+#     return index_params
 
 
 def gen_binary_index():

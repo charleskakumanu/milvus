@@ -19,13 +19,13 @@ package grpcclient
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/cockroachdb/errors"
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
-	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
@@ -38,17 +38,17 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/tracer"
-	"github.com/milvus-io/milvus/pkg/util"
-	"github.com/milvus-io/milvus/pkg/util/crypto"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/util/generic"
-	"github.com/milvus-io/milvus/pkg/util/interceptor"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/retry"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/tracer"
+	"github.com/milvus-io/milvus/pkg/v2/util"
+	"github.com/milvus-io/milvus/pkg/v2/util/crypto"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/generic"
+	"github.com/milvus-io/milvus/pkg/v2/util/interceptor"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/retry"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 type GrpcComponent interface {
@@ -85,6 +85,8 @@ type GrpcClient[T GrpcComponent] interface {
 	GetRole() string
 	SetGetAddrFunc(func() (string, error))
 	EnableEncryption()
+	SetInternalTLSCertPool(cp *x509.CertPool)
+	SetInternalTLSServerName(cp string)
 	SetNewGrpcClientFunc(func(cc *grpc.ClientConn) T)
 	ReCall(ctx context.Context, caller func(client T) (any, error)) (any, error)
 	Call(ctx context.Context, caller func(client T) (any, error)) (any, error)
@@ -102,9 +104,12 @@ type ClientBase[T interface {
 	newGrpcClient func(cc *grpc.ClientConn) T
 
 	// grpcClient             T
-	grpcClient *clientConnWrapper[T]
-	encryption bool
-	addr       atomic.String
+	grpcClient            *clientConnWrapper[T]
+	encryption            bool
+	cpInternalTLS         *x509.CertPool
+	addr                  atomic.String
+	internalTLSServerName string
+
 	// conn                   *grpc.ClientConn
 	grpcClientMtx sync.RWMutex
 	role          string
@@ -188,6 +193,14 @@ func (c *ClientBase[T]) EnableEncryption() {
 	c.encryption = true
 }
 
+func (c *ClientBase[T]) SetInternalTLSCertPool(cp *x509.CertPool) {
+	c.cpInternalTLS = cp
+}
+
+func (c *ClientBase[T]) SetInternalTLSServerName(cp string) {
+	c.internalTLSServerName = cp
+}
+
 // SetNewGrpcClientFunc sets newGrpcClient of client
 func (c *ClientBase[T]) SetNewGrpcClientFunc(f func(cc *grpc.ClientConn) T) {
 	c.newGrpcClient = f
@@ -250,7 +263,6 @@ func (c *ClientBase[T]) connect(ctx context.Context) error {
 		return err
 	}
 
-	opts := tracer.GetInterceptorOpts()
 	dialContext, cancel := context.WithTimeout(ctx, c.DialTimeout)
 
 	var conn *grpc.ClientConn
@@ -259,11 +271,17 @@ func (c *ClientBase[T]) connect(ctx context.Context) error {
 		compress = Zstd
 	}
 	if c.encryption {
+		log.Ctx(ctx).Debug("Running in internalTLS mode with encryption enabled")
 		conn, err = grpc.DialContext(
 			dialContext,
 			addr,
 			// #nosec G402
-			grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{})),
+			grpc.WithTransportCredentials(credentials.NewTLS(
+				&tls.Config{
+					RootCAs:    c.cpInternalTLS,
+					ServerName: c.internalTLSServerName,
+				},
+			)),
 			grpc.WithBlock(),
 			grpc.WithDefaultCallOptions(
 				grpc.MaxCallRecvMsgSize(c.ClientMaxRecvSize),
@@ -271,12 +289,10 @@ func (c *ClientBase[T]) connect(ctx context.Context) error {
 				grpc.UseCompressor(compress),
 			),
 			grpc.WithUnaryInterceptor(grpc_middleware.ChainUnaryClient(
-				otelgrpc.UnaryClientInterceptor(opts...),
 				interceptor.ClusterInjectionUnaryClientInterceptor(),
 				interceptor.ServerIDInjectionUnaryClientInterceptor(c.GetNodeID()),
 			)),
 			grpc.WithStreamInterceptor(grpc_middleware.ChainStreamClient(
-				otelgrpc.StreamClientInterceptor(opts...),
 				interceptor.ClusterInjectionStreamClientInterceptor(),
 				interceptor.ServerIDInjectionStreamClientInterceptor(c.GetNodeID()),
 			)),
@@ -298,6 +314,7 @@ func (c *ClientBase[T]) connect(ctx context.Context) error {
 			grpc.FailOnNonTempDialError(true),
 			grpc.WithReturnConnectionError(),
 			grpc.WithDisableRetry(),
+			grpc.WithStatsHandler(tracer.GetDynamicOtelGrpcClientStatsHandler()),
 		)
 	} else {
 		conn, err = grpc.DialContext(
@@ -311,12 +328,10 @@ func (c *ClientBase[T]) connect(ctx context.Context) error {
 				grpc.UseCompressor(compress),
 			),
 			grpc.WithUnaryInterceptor(grpc_middleware.ChainUnaryClient(
-				otelgrpc.UnaryClientInterceptor(opts...),
 				interceptor.ClusterInjectionUnaryClientInterceptor(),
 				interceptor.ServerIDInjectionUnaryClientInterceptor(c.GetNodeID()),
 			)),
 			grpc.WithStreamInterceptor(grpc_middleware.ChainStreamClient(
-				otelgrpc.StreamClientInterceptor(opts...),
 				interceptor.ClusterInjectionStreamClientInterceptor(),
 				interceptor.ServerIDInjectionStreamClientInterceptor(c.GetNodeID()),
 			)),
@@ -338,6 +353,7 @@ func (c *ClientBase[T]) connect(ctx context.Context) error {
 			grpc.FailOnNonTempDialError(true),
 			grpc.WithReturnConnectionError(),
 			grpc.WithDisableRetry(),
+			grpc.WithStatsHandler(tracer.GetDynamicOtelGrpcClientStatsHandler()),
 		)
 	}
 

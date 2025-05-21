@@ -20,7 +20,6 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/json"
 	"fmt"
 	"net/http/httptest"
 	"os"
@@ -45,14 +44,16 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	grpcproxyclient "github.com/milvus-io/milvus/internal/distributed/proxy/client"
 	"github.com/milvus-io/milvus/internal/distributed/proxy/httpserver"
+	"github.com/milvus-io/milvus/internal/json"
 	"github.com/milvus-io/milvus/internal/mocks"
 	"github.com/milvus-io/milvus/internal/proxy"
+	"github.com/milvus-io/milvus/internal/util/hookutil"
 	milvusmock "github.com/milvus-io/milvus/internal/util/mock"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/util/metricsinfo"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/uniquegenerator"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/uniquegenerator"
 )
 
 func TestMain(m *testing.M) {
@@ -176,6 +177,9 @@ func waitForServerReady() {
 }
 
 func runAndWaitForServerReady(server *Server) error {
+	if err := server.Prepare(); err != nil {
+		return err
+	}
 	err := server.Run()
 	if err != nil {
 		return err
@@ -199,9 +203,7 @@ func Test_NewServer(t *testing.T) {
 		mockProxy.EXPECT().Register().Return(nil)
 		mockProxy.EXPECT().SetEtcdClient(mock.Anything).Return()
 		mockProxy.EXPECT().GetRateLimiter().Return(nil, nil)
-		mockProxy.EXPECT().SetDataCoordClient(mock.Anything).Return()
-		mockProxy.EXPECT().SetRootCoordClient(mock.Anything).Return()
-		mockProxy.EXPECT().SetQueryCoordClient(mock.Anything).Return()
+		mockProxy.EXPECT().SetMixCoordClient(mock.Anything).Return()
 		mockProxy.EXPECT().UpdateStateCode(mock.Anything).Return()
 		mockProxy.EXPECT().SetAddress(mock.Anything).Return()
 		err := runAndWaitForServerReady(server)
@@ -687,9 +689,7 @@ func Test_NewServer(t *testing.T) {
 		mockProxy.EXPECT().Register().Return(nil)
 		mockProxy.EXPECT().SetEtcdClient(mock.Anything).Return()
 		mockProxy.EXPECT().GetRateLimiter().Return(nil, nil)
-		mockProxy.EXPECT().SetDataCoordClient(mock.Anything).Return()
-		mockProxy.EXPECT().SetRootCoordClient(mock.Anything).Return()
-		mockProxy.EXPECT().SetQueryCoordClient(mock.Anything).Return()
+		mockProxy.EXPECT().SetMixCoordClient(mock.Anything).Return()
 		mockProxy.EXPECT().UpdateStateCode(mock.Anything).Return()
 		mockProxy.EXPECT().SetAddress(mock.Anything).Return()
 		// Update config and start server again to test with different config set.
@@ -715,7 +715,7 @@ func TestServer_Check(t *testing.T) {
 	assert.Equal(t, grpc_health_v1.HealthCheckResponse_SERVING, ret.Status)
 
 	mockProxy.ExpectedCalls = nil
-	mockProxy.EXPECT().GetComponentStates(mock.Anything, mock.Anything).Return(nil, fmt.Errorf("mock grpc unexpected error"))
+	mockProxy.EXPECT().GetComponentStates(mock.Anything, mock.Anything).Return(nil, errors.New("mock grpc unexpected error"))
 
 	ret, err = server.Check(ctx, req)
 	assert.Error(t, err)
@@ -769,7 +769,7 @@ func TestServer_Watch(t *testing.T) {
 	assert.Equal(t, grpc_health_v1.HealthCheckResponse_SERVING, ret.Status)
 
 	mockProxy.ExpectedCalls = nil
-	mockProxy.EXPECT().GetComponentStates(mock.Anything, mock.Anything).Return(nil, fmt.Errorf("mock grpc unexpected error"))
+	mockProxy.EXPECT().GetComponentStates(mock.Anything, mock.Anything).Return(nil, errors.New("mock grpc unexpected error"))
 
 	err = server.Watch(req, watchServer)
 	ret = <-resultChan
@@ -823,9 +823,7 @@ func Test_NewServer_HTTPServer_Enabled(t *testing.T) {
 	mockProxy.EXPECT().Register().Return(nil)
 	mockProxy.EXPECT().SetEtcdClient(mock.Anything).Return()
 	mockProxy.EXPECT().GetRateLimiter().Return(nil, nil)
-	mockProxy.EXPECT().SetDataCoordClient(mock.Anything).Return()
-	mockProxy.EXPECT().SetRootCoordClient(mock.Anything).Return()
-	mockProxy.EXPECT().SetQueryCoordClient(mock.Anything).Return()
+	mockProxy.EXPECT().SetMixCoordClient(mock.Anything).Return()
 	mockProxy.EXPECT().UpdateStateCode(mock.Anything).Return()
 	mockProxy.EXPECT().SetAddress(mock.Anything).Return()
 
@@ -864,8 +862,8 @@ func getServer(t *testing.T) *Server {
 	}, nil).Maybe()
 	server.proxy = mockProxy
 
-	mockRC := mocks.NewMockRootCoordClient(t)
-	mockRC.EXPECT().GetComponentStates(mock.Anything, mock.Anything, mock.Anything).Return(&milvuspb.ComponentStates{
+	mockMC := mocks.NewMockMixCoordClient(t)
+	mockMC.EXPECT().GetComponentStates(mock.Anything, mock.Anything, mock.Anything).Return(&milvuspb.ComponentStates{
 		State: &milvuspb.ComponentInfo{
 			NodeID:    int64(uniquegenerator.GetUniqueIntGeneratorIns().GetInt()),
 			Role:      "MockRootCoord",
@@ -875,33 +873,7 @@ func getServer(t *testing.T) *Server {
 		SubcomponentStates: nil,
 		Status:             &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success},
 	}, nil).Maybe()
-	server.rootCoordClient = mockRC
-
-	mockDC := mocks.NewMockDataCoordClient(t)
-	mockDC.EXPECT().GetComponentStates(mock.Anything, mock.Anything, mock.Anything).Return(&milvuspb.ComponentStates{
-		State: &milvuspb.ComponentInfo{
-			NodeID:    int64(uniquegenerator.GetUniqueIntGeneratorIns().GetInt()),
-			Role:      "MockDataCoord",
-			StateCode: commonpb.StateCode_Healthy,
-			ExtraInfo: nil,
-		},
-		SubcomponentStates: nil,
-		Status:             &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success},
-	}, nil).Maybe()
-	server.dataCoordClient = mockDC
-
-	mockQC := mocks.NewMockQueryCoordClient(t)
-	server.queryCoordClient = mockQC
-	mockQC.EXPECT().GetComponentStates(mock.Anything, mock.Anything, mock.Anything).Return(&milvuspb.ComponentStates{
-		State: &milvuspb.ComponentInfo{
-			NodeID:    int64(uniquegenerator.GetUniqueIntGeneratorIns().GetInt()),
-			Role:      "MockQueryCoord",
-			StateCode: commonpb.StateCode_Healthy,
-			ExtraInfo: nil,
-		},
-		SubcomponentStates: nil,
-		Status:             &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success},
-	}, nil).Maybe()
+	server.mixCoordClient = mockMC
 	return server
 }
 
@@ -916,9 +888,7 @@ func Test_NewServer_TLS_TwoWay(t *testing.T) {
 	mockProxy.EXPECT().Register().Return(nil)
 	mockProxy.EXPECT().SetEtcdClient(mock.Anything).Return()
 	mockProxy.EXPECT().GetRateLimiter().Return(nil, nil)
-	mockProxy.EXPECT().SetDataCoordClient(mock.Anything).Return()
-	mockProxy.EXPECT().SetRootCoordClient(mock.Anything).Return()
-	mockProxy.EXPECT().SetQueryCoordClient(mock.Anything).Return()
+	mockProxy.EXPECT().SetMixCoordClient(mock.Anything).Return()
 	mockProxy.EXPECT().UpdateStateCode(mock.Anything).Return()
 	mockProxy.EXPECT().SetAddress(mock.Anything).Return()
 
@@ -946,9 +916,7 @@ func Test_NewServer_TLS_OneWay(t *testing.T) {
 	mockProxy.EXPECT().Register().Return(nil)
 	mockProxy.EXPECT().SetEtcdClient(mock.Anything).Return()
 	mockProxy.EXPECT().GetRateLimiter().Return(nil, nil)
-	mockProxy.EXPECT().SetDataCoordClient(mock.Anything).Return()
-	mockProxy.EXPECT().SetRootCoordClient(mock.Anything).Return()
-	mockProxy.EXPECT().SetQueryCoordClient(mock.Anything).Return()
+	mockProxy.EXPECT().SetMixCoordClient(mock.Anything).Return()
 	mockProxy.EXPECT().UpdateStateCode(mock.Anything).Return()
 	mockProxy.EXPECT().SetAddress(mock.Anything).Return()
 
@@ -1011,9 +979,7 @@ func Test_NewHTTPServer_TLS_TwoWay(t *testing.T) {
 	mockProxy.EXPECT().Register().Return(nil)
 	mockProxy.EXPECT().SetEtcdClient(mock.Anything).Return()
 	mockProxy.EXPECT().GetRateLimiter().Return(nil, nil)
-	mockProxy.EXPECT().SetDataCoordClient(mock.Anything).Return()
-	mockProxy.EXPECT().SetRootCoordClient(mock.Anything).Return()
-	mockProxy.EXPECT().SetQueryCoordClient(mock.Anything).Return()
+	mockProxy.EXPECT().SetMixCoordClient(mock.Anything).Return()
 	mockProxy.EXPECT().UpdateStateCode(mock.Anything).Return()
 	mockProxy.EXPECT().SetAddress(mock.Anything).Return()
 
@@ -1035,7 +1001,8 @@ func Test_NewHTTPServer_TLS_TwoWay(t *testing.T) {
 	paramtable.Get().Save(proxy.Params.HTTPCfg.Port.Key, "19529")
 	err = runAndWaitForServerReady(server)
 	assert.NotNil(t, err)
-	server.Stop()
+	err = server.Stop()
+	assert.Nil(t, err)
 }
 
 func Test_NewHTTPServer_TLS_OneWay(t *testing.T) {
@@ -1048,9 +1015,7 @@ func Test_NewHTTPServer_TLS_OneWay(t *testing.T) {
 	mockProxy.EXPECT().Register().Return(nil)
 	mockProxy.EXPECT().SetEtcdClient(mock.Anything).Return()
 	mockProxy.EXPECT().GetRateLimiter().Return(nil, nil)
-	mockProxy.EXPECT().SetDataCoordClient(mock.Anything).Return()
-	mockProxy.EXPECT().SetRootCoordClient(mock.Anything).Return()
-	mockProxy.EXPECT().SetQueryCoordClient(mock.Anything).Return()
+	mockProxy.EXPECT().SetMixCoordClient(mock.Anything).Return()
 	mockProxy.EXPECT().UpdateStateCode(mock.Anything).Return()
 	mockProxy.EXPECT().SetAddress(mock.Anything).Return()
 
@@ -1063,12 +1028,14 @@ func Test_NewHTTPServer_TLS_OneWay(t *testing.T) {
 	paramtable.Get().Save(proxy.Params.HTTPCfg.Port.Key, "8080")
 
 	err := runAndWaitForServerReady(server)
+	fmt.Printf("err: %v\n", err)
 	assert.Nil(t, err)
 	assert.NotNil(t, server.grpcExternalServer)
 	err = server.Stop()
 	assert.Nil(t, err)
 
 	paramtable.Get().Save(proxy.Params.HTTPCfg.Port.Key, "19529")
+	fmt.Printf("err: %v\n", err)
 	err = runAndWaitForServerReady(server)
 	assert.NotNil(t, err)
 	server.Stop()
@@ -1079,8 +1046,8 @@ func Test_NewHTTPServer_TLS_FileNotExisted(t *testing.T) {
 
 	mockProxy := server.proxy.(*mocks.MockProxy)
 	mockProxy.EXPECT().Stop().Return(nil)
-	mockProxy.EXPECT().SetEtcdClient(mock.Anything).Return()
-	mockProxy.EXPECT().SetAddress(mock.Anything).Return()
+	mockProxy.EXPECT().SetEtcdClient(mock.Anything).Return().Maybe()
+	mockProxy.EXPECT().SetAddress(mock.Anything).Return().Maybe()
 	Params := &paramtable.Get().ProxyGrpcServerCfg
 
 	paramtable.Get().Save(Params.TLSMode.Key, "1")
@@ -1165,8 +1132,8 @@ func TestHttpAuthenticate(t *testing.T) {
 	}
 
 	{
-		proxy.SetMockAPIHook("foo", nil)
-		defer proxy.SetMockAPIHook("", nil)
+		hookutil.SetMockAPIHook("foo", nil)
+		defer hookutil.SetMockAPIHook("", nil)
 		ctx.Request.Header.Set("Authorization", "Bearer 123456")
 		authenticate(ctx)
 		ctxName, _ := ctx.Get(httpserver.ContextUsername)
@@ -1184,7 +1151,7 @@ func Test_Service_GracefulStop(t *testing.T) {
 	mockProxy.ExpectedCalls = nil
 	mockProxy.EXPECT().GetComponentStates(mock.Anything, mock.Anything).Run(func(_a0 context.Context, _a1 *milvuspb.GetComponentStatesRequest) {
 		fmt.Println("rpc start")
-		time.Sleep(10 * time.Second)
+		time.Sleep(3 * time.Second)
 		atomic.AddInt32(&count, 1)
 		fmt.Println("rpc done")
 	}).Return(&milvuspb.ComponentStates{Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success}}, nil)
@@ -1195,9 +1162,7 @@ func Test_Service_GracefulStop(t *testing.T) {
 	mockProxy.EXPECT().Register().Return(nil)
 	mockProxy.EXPECT().SetEtcdClient(mock.Anything).Return()
 	mockProxy.EXPECT().GetRateLimiter().Return(nil, nil)
-	mockProxy.EXPECT().SetDataCoordClient(mock.Anything).Return()
-	mockProxy.EXPECT().SetRootCoordClient(mock.Anything).Return()
-	mockProxy.EXPECT().SetQueryCoordClient(mock.Anything).Return()
+	mockProxy.EXPECT().SetMixCoordClient(mock.Anything).Return()
 	mockProxy.EXPECT().UpdateStateCode(mock.Anything).Return()
 	mockProxy.EXPECT().SetAddress(mock.Anything).Return()
 
@@ -1219,7 +1184,9 @@ func Test_Service_GracefulStop(t *testing.T) {
 		enableRegisterProxyServer = false
 	}()
 
-	err := server.Run()
+	err := server.Prepare()
+	assert.Nil(t, err)
+	err = server.Run()
 	assert.Nil(t, err)
 
 	proxyClient, err := grpcproxyclient.NewClient(ctx, fmt.Sprintf("localhost:%s", Params.Port.GetValue()), 0)

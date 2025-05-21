@@ -25,13 +25,13 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/uniquegenerator"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/uniquegenerator"
 )
 
 func TestCreateAlias_all(t *testing.T) {
-	rc := NewRootCoordMock()
+	rc := NewMixCoordMock()
 
 	defer rc.Close()
 	ctx := context.Background()
@@ -44,9 +44,9 @@ func TestCreateAlias_all(t *testing.T) {
 			CollectionName: collectionName,
 			Alias:          "alias1",
 		},
-		ctx:       ctx,
-		result:    merr.Success(),
-		rootCoord: rc,
+		ctx:      ctx,
+		result:   merr.Success(),
+		mixCoord: rc,
 	}
 
 	assert.NoError(t, task.OnEnqueue())
@@ -72,12 +72,12 @@ func TestCreateAlias_all(t *testing.T) {
 	task.CreateAliasRequest.CollectionName = collectionName
 
 	assert.NoError(t, task.PreExecute(ctx))
-	assert.NoError(t, task.Execute(ctx))
+	assert.Error(t, task.Execute(ctx))
 	assert.NoError(t, task.PostExecute(ctx))
 }
 
 func TestDropAlias_all(t *testing.T) {
-	rc := NewRootCoordMock()
+	rc := NewMixCoordMock()
 
 	defer rc.Close()
 	ctx := context.Background()
@@ -87,9 +87,9 @@ func TestDropAlias_all(t *testing.T) {
 			Base:  nil,
 			Alias: "alias1",
 		},
-		ctx:       ctx,
-		result:    merr.Success(),
-		rootCoord: rc,
+		ctx:      ctx,
+		result:   merr.Success(),
+		mixCoord: rc,
 	}
 
 	assert.NoError(t, task.OnEnqueue())
@@ -107,13 +107,12 @@ func TestDropAlias_all(t *testing.T) {
 	assert.Equal(t, ts, task.EndTs())
 
 	assert.NoError(t, task.PreExecute(ctx))
-	assert.NoError(t, task.Execute(ctx))
+	assert.Error(t, task.Execute(ctx))
 	assert.NoError(t, task.PostExecute(ctx))
 }
 
 func TestAlterAlias_all(t *testing.T) {
-	rc := NewRootCoordMock()
-
+	rc := NewMixCoordMock()
 	defer rc.Close()
 	ctx := context.Background()
 	prefix := "TestAlterAlias_all"
@@ -125,9 +124,9 @@ func TestAlterAlias_all(t *testing.T) {
 			CollectionName: collectionName,
 			Alias:          "alias1",
 		},
-		ctx:       ctx,
-		result:    merr.Success(),
-		rootCoord: rc,
+		ctx:      ctx,
+		result:   merr.Success(),
+		mixCoord: rc,
 	}
 
 	assert.NoError(t, task.OnEnqueue())
@@ -153,14 +152,12 @@ func TestAlterAlias_all(t *testing.T) {
 	task.AlterAliasRequest.CollectionName = collectionName
 
 	assert.NoError(t, task.PreExecute(ctx))
-	assert.NoError(t, task.Execute(ctx))
+	assert.Error(t, task.Execute(ctx))
 	assert.NoError(t, task.PostExecute(ctx))
 }
 
 func TestDescribeAlias_all(t *testing.T) {
-	rc := NewRootCoordMock()
-
-	defer rc.Close()
+	rc := NewMixCoordMock()
 	ctx := context.Background()
 	task := &DescribeAliasTask{
 		Condition: NewTaskCondition(ctx),
@@ -174,7 +171,7 @@ func TestDescribeAlias_all(t *testing.T) {
 				ErrorCode: commonpb.ErrorCode_Success,
 			},
 		},
-		rootCoord: rc,
+		mixCoord: rc,
 	}
 
 	assert.NoError(t, task.OnEnqueue())
@@ -193,13 +190,12 @@ func TestDescribeAlias_all(t *testing.T) {
 	assert.Equal(t, ts, task.EndTs())
 
 	assert.NoError(t, task.PreExecute(ctx))
-	assert.NoError(t, task.Execute(ctx))
+	assert.Error(t, task.Execute(ctx))
 	assert.NoError(t, task.PostExecute(ctx))
 }
 
 func TestListAliases_all(t *testing.T) {
-	rc := NewRootCoordMock()
-
+	rc := NewMixCoordMock()
 	defer rc.Close()
 	ctx := context.Background()
 	task := &ListAliasesTask{
@@ -213,7 +209,7 @@ func TestListAliases_all(t *testing.T) {
 				ErrorCode: commonpb.ErrorCode_Success,
 			},
 		},
-		rootCoord: rc,
+		mixCoord: rc,
 	}
 
 	assert.NoError(t, task.OnEnqueue())

@@ -17,6 +17,7 @@
 package pipeline
 
 import (
+	"context"
 	"fmt"
 	"sort"
 
@@ -27,10 +28,10 @@ import (
 	"github.com/milvus-io/milvus/internal/querynodev2/segments"
 	"github.com/milvus-io/milvus/internal/storage"
 	base "github.com/milvus-io/milvus/internal/util/pipeline"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/metrics"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/metrics"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 type insertNode struct {
@@ -62,7 +63,7 @@ func (iNode *insertNode) addInsertData(insertDatas map[UniqueID]*delegator.Inser
 	} else {
 		err := typeutil.MergeFieldData(iData.InsertRecord.FieldsData, insertRecord.FieldsData)
 		if err != nil {
-			log.Error("failed to merge field data", zap.Error(err))
+			log.Error("failed to merge field data", zap.String("channel", iNode.channel), zap.Error(err))
 			panic(err)
 		}
 		iData.InsertRecord.NumRows += insertRecord.NumRows
@@ -77,7 +78,7 @@ func (iNode *insertNode) addInsertData(insertDatas map[UniqueID]*delegator.Inser
 	iData.PrimaryKeys = append(iData.PrimaryKeys, pks...)
 	iData.RowIDs = append(iData.RowIDs, msg.RowIDs...)
 	iData.Timestamps = append(iData.Timestamps, msg.Timestamps...)
-	log.Debug("pipeline fetch insert msg",
+	log.Ctx(context.TODO()).Debug("pipeline fetch insert msg",
 		zap.Int64("collectionID", iNode.collectionID),
 		zap.Int64("segmentID", msg.SegmentID),
 		zap.Int("insertRowNum", len(pks)),
@@ -90,29 +91,35 @@ func (iNode *insertNode) Operate(in Msg) Msg {
 	metrics.QueryNodeWaitProcessingMsgCount.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.InsertLabel).Dec()
 	nodeMsg := in.(*insertNodeMsg)
 
-	sort.Slice(nodeMsg.insertMsgs, func(i, j int) bool {
-		return nodeMsg.insertMsgs[i].BeginTs() < nodeMsg.insertMsgs[j].BeginTs()
-	})
+	if len(nodeMsg.insertMsgs) > 0 {
+		sort.Slice(nodeMsg.insertMsgs, func(i, j int) bool {
+			return nodeMsg.insertMsgs[i].BeginTs() < nodeMsg.insertMsgs[j].BeginTs()
+		})
 
-	insertDatas := make(map[UniqueID]*delegator.InsertData)
-	collection := iNode.manager.Collection.Get(iNode.collectionID)
-	if collection == nil {
-		log.Error("insertNode with collection not exist", zap.Int64("collection", iNode.collectionID))
-		panic("insertNode with collection not exist")
+		// build insert data if no embedding node
+		if nodeMsg.insertDatas == nil {
+			collection := iNode.manager.Collection.Get(iNode.collectionID)
+			if collection == nil {
+				log.Error("insertNode with collection not exist", zap.Int64("collection", iNode.collectionID))
+				panic("insertNode with collection not exist")
+			}
+
+			nodeMsg.insertDatas = make(map[UniqueID]*delegator.InsertData)
+			// get InsertData and merge datas of same segment
+			for _, msg := range nodeMsg.insertMsgs {
+				iNode.addInsertData(nodeMsg.insertDatas, msg, collection)
+			}
+		}
+
+		iNode.delegator.ProcessInsert(nodeMsg.insertDatas)
 	}
-
-	// get InsertData and merge datas of same segment
-	for _, msg := range nodeMsg.insertMsgs {
-		iNode.addInsertData(insertDatas, msg, collection)
-	}
-
-	iNode.delegator.ProcessInsert(insertDatas)
-
 	metrics.QueryNodeWaitProcessingMsgCount.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.DeleteLabel).Inc()
 
 	return &deleteNodeMsg{
-		deleteMsgs: nodeMsg.deleteMsgs,
-		timeRange:  nodeMsg.timeRange,
+		deleteMsgs:    nodeMsg.deleteMsgs,
+		timeRange:     nodeMsg.timeRange,
+		schema:        nodeMsg.schema,
+		schemaVersion: nodeMsg.schemaVersion,
 	}
 }
 

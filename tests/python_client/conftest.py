@@ -25,7 +25,7 @@ def pytest_addoption(parser):
     parser.addoption("--user", action="store", default="", help="user name for connection")
     parser.addoption("--password", action="store", default="", help="password for connection")
     parser.addoption("--db_name", action="store", default="default", help="database name for connection")
-    parser.addoption("--secure", type=bool, action="store", default=False, help="secure for connection")
+    parser.addoption("--secure", action="store", default=False, help="secure for connection")
     parser.addoption("--milvus_ns", action="store", default="chaos-testing", help="milvus_ns")
     parser.addoption("--http_port", action="store", default=19121, help="http's port")
     parser.addoption("--handler", action="store", default="GRPC", help="handler of request")
@@ -45,11 +45,14 @@ def pytest_addoption(parser):
     parser.addoption('--term_expr', action='store', default="term_expr", help="expr of query quest")
     parser.addoption('--check_content', action='store', default="check_content", help="content of check")
     parser.addoption('--field_name', action='store', default="field_name", help="field_name of index")
-    parser.addoption('--replica_num', type='int', action='store', default=ct.default_replica_num, help="memory replica number")
+    parser.addoption('--replica_num', action='store', default=ct.default_replica_num, help="memory replica number")
     parser.addoption('--minio_host', action='store', default="localhost", help="minio service's ip")
-    parser.addoption('--uri', action='store', default="", help="uri for high level api")
-    parser.addoption('--token', action='store', default="", help="token for high level api")
+    parser.addoption('--minio_bucket', action='store', default="milvus-bucket", help="minio bucket name")
+    parser.addoption('--uri', action='store', default="", help="uri for milvus client")
+    parser.addoption('--token', action='store', default="root:Milvus", help="token for milvus client")
     parser.addoption("--request_duration", action="store", default="10m", help="request_duration")
+    # a tei endpoint for text embedding, default is http://10.104.26.196:80 which is deployed in house
+    parser.addoption("--tei_endpoint", action="store", default="http://10.104.26.196:80", help="tei endpoint")
 
 
 @pytest.fixture
@@ -188,6 +191,10 @@ def field_name(request):
 def minio_host(request):
     return request.config.getoption("--minio_host")
 
+@pytest.fixture
+def minio_bucket(request):
+    return request.config.getoption("--minio_bucket")
+
 
 @pytest.fixture
 def uri(request):
@@ -198,10 +205,14 @@ def uri(request):
 def token(request):
     return request.config.getoption("--token")
 
+
 @pytest.fixture
 def request_duration(request):
     return request.config.getoption("--request_duration")
 
+@pytest.fixture
+def tei_endpoint(request):
+    return request.config.getoption("--tei_endpoint")
 
 """ fixture func """
 
@@ -219,6 +230,7 @@ def initialize_env(request):
     replica_num = request.config.getoption("--replica_num")
     uri = request.config.getoption("--uri")
     token = request.config.getoption("--token")
+    minio_bucket = request.config.getoption("--minio_bucket")
 
     """ params check """
     assert ip_check(host) and number_check(port)
@@ -231,17 +243,11 @@ def initialize_env(request):
 
     log.info("#" * 80)
     log.info("[initialize_milvus] Log cleaned up, start testing...")
-    param_info.prepare_param_info(host, port, handler, replica_num, user, password, secure, uri, token)
-
-
-@pytest.fixture(params=cf.gen_simple_index())
-def get_index_param(request):
-    yield request.param
+    param_info.prepare_param_info(host, port, handler, replica_num, user, password, secure, uri, token, minio_bucket)
 
 
 # TODO: construct invalid index params for all index types
 @pytest.fixture(params=[{"metric_type": "L3", "index_type": "IVF_FLAT"},
-                        {"metric_type": "L2", "index_type": "IVF_FLAT", "err_params": {"nlist": 10}},
                         {"metric_type": "L2", "index_type": "IVF_FLAT", "params": {"nlist": -1}}])
 def get_invalid_index_params(request):
     yield request.param
@@ -333,7 +339,7 @@ def check_server_connection(request):
 #     yield
 
 
-@pytest.fixture(scope="module")
+# @pytest.fixture(scope="module")
 def connect(request):
     host = request.config.getoption("--host")
     service_name = request.config.getoption("--service")
@@ -360,7 +366,7 @@ def connect(request):
     return milvus
 
 
-@pytest.fixture(scope="module")
+# @pytest.fixture(scope="module")
 def dis_connect(request):
     host = request.config.getoption("--host")
     service_name = request.config.getoption("--service")

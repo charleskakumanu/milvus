@@ -6,24 +6,24 @@ import (
 	"strconv"
 
 	"github.com/cockroachdb/errors"
-	"github.com/golang/protobuf/proto"
 	"go.opentelemetry.io/otel"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/types"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/commonpbutil"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/timerecord"
-	"github.com/milvus-io/milvus/pkg/util/tsoutil"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/timerecord"
+	"github.com/milvus-io/milvus/pkg/v2/util/tsoutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 const (
@@ -43,16 +43,15 @@ type getStatisticsTask struct {
 	// partition ids that are not loaded into query node, require get statistics from DataCoord
 	unloadedPartitionIDs []UniqueID
 
-	ctx context.Context
-	dc  types.DataCoordClient
-	tr  *timerecord.TimeRecorder
+	ctx  context.Context
+	mixc types.MixCoordClient
+	tr   *timerecord.TimeRecorder
 
 	fromDataCoord bool
 	fromQueryNode bool
 
 	// if query from shard
 	*internalpb.GetStatisticsRequest
-	qc        types.QueryCoordClient
 	resultBuf *typeutil.ConcurrentSet[*internalpb.GetStatisticsResponse]
 
 	lb LBPolicy
@@ -94,6 +93,9 @@ func (g *getStatisticsTask) OnEnqueue() error {
 	g.GetStatisticsRequest = &internalpb.GetStatisticsRequest{
 		Base: commonpbutil.NewMsgBase(),
 	}
+
+	g.Base.MsgType = commonpb.MsgType_GetPartitionStatistics
+	g.Base.SourceID = paramtable.GetNodeID()
 	return nil
 }
 
@@ -106,10 +108,6 @@ func (g *getStatisticsTask) PreExecute(ctx context.Context) error {
 
 	ctx, sp := otel.Tracer(typeutil.ProxyRole).Start(ctx, "Proxy-GetStatistics-PreExecute")
 	defer sp.End()
-
-	// TODO: Maybe we should create a new MsgType: GetStatistics?
-	g.Base.MsgType = commonpb.MsgType_GetPartitionStatistics
-	g.Base.SourceID = paramtable.GetNodeID()
 
 	collID, err := globalMetaCache.GetCollectionID(ctx, g.request.GetDbName(), g.collectionName)
 	if err != nil { // err is not nil if collection not exists
@@ -132,7 +130,7 @@ func (g *getStatisticsTask) PreExecute(ctx context.Context) error {
 	}
 
 	// check if collection/partitions are loaded into query node
-	loaded, unloaded, err := checkFullLoaded(ctx, g.qc, g.request.GetDbName(), g.collectionName, g.GetStatisticsRequest.CollectionID, partIDs)
+	loaded, unloaded, err := checkFullLoaded(ctx, g.mixc, g.request.GetDbName(), g.collectionName, g.GetStatisticsRequest.CollectionID, partIDs)
 	log := log.Ctx(ctx).With(
 		zap.String("collectionName", g.collectionName),
 		zap.Int64("collectionID", g.CollectionID),
@@ -179,7 +177,7 @@ func (g *getStatisticsTask) Execute(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		log.Debug("get collection statistics from DataCoord execute done")
+		log.Ctx(ctx).Debug("get collection statistics from DataCoord execute done")
 	}
 	return nil
 }
@@ -195,13 +193,13 @@ func (g *getStatisticsTask) PostExecute(ctx context.Context) error {
 	toReduceResults := make([]*internalpb.GetStatisticsResponse, 0)
 	select {
 	case <-g.TraceCtx().Done():
-		log.Debug("wait to finish timeout!")
+		log.Ctx(ctx).Debug("wait to finish timeout!")
 		return nil
 	default:
-		log.Debug("all get statistics are finished or canceled")
+		log.Ctx(ctx).Debug("all get statistics are finished or canceled")
 		g.resultBuf.Range(func(res *internalpb.GetStatisticsResponse) bool {
 			toReduceResults = append(toReduceResults, res)
-			log.Debug("proxy receives one get statistic response",
+			log.Ctx(ctx).Debug("proxy receives one get statistic response",
 				zap.Int64("sourceID", res.GetBase().GetSourceID()))
 			return true
 		})
@@ -221,7 +219,7 @@ func (g *getStatisticsTask) PostExecute(ctx context.Context) error {
 		Stats:  result,
 	}
 
-	log.Debug("get statistics post execute done", zap.Any("result", result))
+	log.Ctx(ctx).Debug("get statistics post execute done", zap.Any("result", result))
 	return nil
 }
 
@@ -238,7 +236,7 @@ func (g *getStatisticsTask) getStatisticsFromDataCoord(ctx context.Context) erro
 		PartitionIDs: partIDs,
 	}
 
-	result, err := g.dc.GetPartitionStatistics(ctx, req)
+	result, err := g.mixc.GetPartitionStatistics(ctx, req)
 	if err != nil {
 		return err
 	}
@@ -284,7 +282,7 @@ func (g *getStatisticsTask) getStatisticsShard(ctx context.Context, nodeID int64
 	}
 	result, err := qn.GetStatistics(ctx, req)
 	if err != nil {
-		log.Warn("QueryNode statistic return error",
+		log.Ctx(ctx).Warn("QueryNode statistic return error",
 			zap.Int64("nodeID", nodeID),
 			zap.String("channel", channel),
 			zap.Error(err))
@@ -292,14 +290,14 @@ func (g *getStatisticsTask) getStatisticsShard(ctx context.Context, nodeID int64
 		return err
 	}
 	if result.GetStatus().GetErrorCode() == commonpb.ErrorCode_NotShardLeader {
-		log.Warn("QueryNode is not shardLeader",
+		log.Ctx(ctx).Warn("QueryNode is not shardLeader",
 			zap.Int64("nodeID", nodeID),
 			zap.String("channel", channel))
 		globalMetaCache.DeprecateShardCache(g.request.GetDbName(), g.collectionName)
 		return errInvalidShardLeaders
 	}
 	if result.GetStatus().GetErrorCode() != commonpb.ErrorCode_Success {
-		log.Warn("QueryNode statistic result error",
+		log.Ctx(ctx).Warn("QueryNode statistic result error",
 			zap.Int64("nodeID", nodeID),
 			zap.String("reason", result.GetStatus().GetReason()))
 		return errors.Wrapf(merr.Error(result.GetStatus()), "fail to get statistic on QueryNode ID=%d", nodeID)
@@ -327,7 +325,7 @@ func checkFullLoaded(ctx context.Context, qc types.QueryCoordClient, dbName stri
 
 	// If request to search partitions
 	if len(searchPartitionIDs) > 0 {
-		resp, err := qc.ShowPartitions(ctx, &querypb.ShowPartitionsRequest{
+		resp, err := qc.ShowLoadPartitions(ctx, &querypb.ShowPartitionsRequest{
 			Base: commonpbutil.NewMsgBase(
 				commonpbutil.WithMsgType(commonpb.MsgType_ShowPartitions),
 				commonpbutil.WithSourceID(paramtable.GetNodeID()),
@@ -353,7 +351,7 @@ func checkFullLoaded(ctx context.Context, qc types.QueryCoordClient, dbName stri
 	}
 
 	// If request to search collection
-	resp, err := qc.ShowPartitions(ctx, &querypb.ShowPartitionsRequest{
+	resp, err := qc.ShowLoadPartitions(ctx, &querypb.ShowPartitionsRequest{
 		Base: commonpbutil.NewMsgBase(
 			commonpbutil.WithMsgType(commonpb.MsgType_ShowPartitions),
 			commonpbutil.WithSourceID(paramtable.GetNodeID()),
@@ -593,9 +591,9 @@ type getCollectionStatisticsTask struct {
 	baseTask
 	Condition
 	*milvuspb.GetCollectionStatisticsRequest
-	ctx       context.Context
-	dataCoord types.DataCoordClient
-	result    *milvuspb.GetCollectionStatisticsResponse
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *milvuspb.GetCollectionStatisticsResponse
 
 	collectionID UniqueID
 }
@@ -634,12 +632,12 @@ func (g *getCollectionStatisticsTask) SetTs(ts Timestamp) {
 
 func (g *getCollectionStatisticsTask) OnEnqueue() error {
 	g.Base = commonpbutil.NewMsgBase()
+	g.Base.MsgType = commonpb.MsgType_GetCollectionStatistics
+	g.Base.SourceID = paramtable.GetNodeID()
 	return nil
 }
 
 func (g *getCollectionStatisticsTask) PreExecute(ctx context.Context) error {
-	g.Base.MsgType = commonpb.MsgType_GetCollectionStatistics
-	g.Base.SourceID = paramtable.GetNodeID()
 	return nil
 }
 
@@ -657,12 +655,9 @@ func (g *getCollectionStatisticsTask) Execute(ctx context.Context) error {
 		CollectionID: collID,
 	}
 
-	result, err := g.dataCoord.GetCollectionStatistics(ctx, req)
-	if err != nil {
+	result, err := g.mixCoord.GetCollectionStatistics(ctx, req)
+	if err = merr.CheckRPCCall(result, err); err != nil {
 		return err
-	}
-	if result.GetStatus().GetErrorCode() != commonpb.ErrorCode_Success {
-		return merr.Error(result.GetStatus())
 	}
 	g.result = &milvuspb.GetCollectionStatisticsResponse{
 		Status: merr.Success(),
@@ -679,9 +674,9 @@ type getPartitionStatisticsTask struct {
 	baseTask
 	Condition
 	*milvuspb.GetPartitionStatisticsRequest
-	ctx       context.Context
-	dataCoord types.DataCoordClient
-	result    *milvuspb.GetPartitionStatisticsResponse
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *milvuspb.GetPartitionStatisticsResponse
 
 	collectionID UniqueID
 }
@@ -720,12 +715,12 @@ func (g *getPartitionStatisticsTask) SetTs(ts Timestamp) {
 
 func (g *getPartitionStatisticsTask) OnEnqueue() error {
 	g.Base = commonpbutil.NewMsgBase()
+	g.Base.MsgType = commonpb.MsgType_GetPartitionStatistics
+	g.Base.SourceID = paramtable.GetNodeID()
 	return nil
 }
 
 func (g *getPartitionStatisticsTask) PreExecute(ctx context.Context) error {
-	g.Base.MsgType = commonpb.MsgType_GetPartitionStatistics
-	g.Base.SourceID = paramtable.GetNodeID()
 	return nil
 }
 
@@ -748,7 +743,7 @@ func (g *getPartitionStatisticsTask) Execute(ctx context.Context) error {
 		PartitionIDs: []int64{partitionID},
 	}
 
-	result, _ := g.dataCoord.GetPartitionStatistics(ctx, req)
+	result, _ := g.mixCoord.GetPartitionStatistics(ctx, req)
 	if result == nil {
 		return errors.New("get partition statistics resp is nil")
 	}

@@ -19,11 +19,17 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #include "common/EasyAssert.h"
 #include "common/Types.h"
 
 namespace milvus {
+using TypeParams = std::map<std::string, std::string>;
+using TokenizerParams = std::string;
+
+TokenizerParams
+ParseTokenizerParams(const TypeParams& params);
 
 class FieldMeta {
  public:
@@ -35,42 +41,89 @@ class FieldMeta {
     FieldMeta&
     operator=(FieldMeta&&) = default;
 
-    FieldMeta(const FieldName& name, FieldId id, DataType type)
-        : name_(name), id_(id), type_(type) {
+    FieldMeta(FieldName name,
+              FieldId id,
+              DataType type,
+              bool nullable,
+              std::optional<DefaultValueType> default_value)
+        : name_(std::move(name)),
+          id_(id),
+          type_(type),
+          nullable_(nullable),
+          default_value_(std::move(default_value)) {
         Assert(!IsVectorDataType(type_));
     }
 
-    FieldMeta(const FieldName& name,
+    FieldMeta(FieldName name,
               FieldId id,
               DataType type,
-              int64_t max_length)
-        : name_(name),
+              int64_t max_length,
+              bool nullable,
+              std::optional<DefaultValueType> default_value)
+        : name_(std::move(name)),
           id_(id),
           type_(type),
-          string_info_(StringInfo{max_length}) {
+          nullable_(nullable),
+          string_info_(StringInfo{max_length}),
+          default_value_(std::move(default_value)) {
         Assert(IsStringDataType(type_));
     }
 
-    FieldMeta(const FieldName& name,
+    FieldMeta(FieldName name,
               FieldId id,
               DataType type,
-              DataType element_type)
-        : name_(name), id_(id), type_(type), element_type_(element_type) {
+              int64_t max_length,
+              bool nullable,
+              bool enable_match,
+              bool enable_analyzer,
+              std::map<std::string, std::string>& params,
+              std::optional<DefaultValueType> default_value)
+        : name_(std::move(name)),
+          id_(id),
+          type_(type),
+          nullable_(nullable),
+          string_info_(StringInfo{
+              max_length,
+              enable_match,
+              enable_analyzer,
+              std::move(params),
+          }),
+          default_value_(std::move(default_value)) {
+        Assert(IsStringDataType(type_));
+    }
+
+    FieldMeta(FieldName name,
+              FieldId id,
+              DataType type,
+              DataType element_type,
+              bool nullable,
+              std::optional<DefaultValueType> default_value)
+        : name_(std::move(name)),
+          id_(id),
+          type_(type),
+          element_type_(element_type),
+          nullable_(nullable),
+          default_value_(std::move(default_value)) {
         Assert(IsArrayDataType(type_));
     }
 
     // pass in any value for dim for sparse vector is ok as it'll never be used:
     // get_dim() not allowed to be invoked on a sparse vector field.
-    FieldMeta(const FieldName& name,
+    FieldMeta(FieldName name,
               FieldId id,
               DataType type,
               int64_t dim,
-              std::optional<knowhere::MetricType> metric_type)
-        : name_(name),
+              std::optional<knowhere::MetricType> metric_type,
+              bool nullable,
+              std::optional<DefaultValueType> default_value)
+        : name_(std::move(name)),
           id_(id),
           type_(type),
-          vector_info_(VectorInfo{dim, std::move(metric_type)}) {
+          nullable_(nullable),
+          vector_info_(VectorInfo{dim, std::move(metric_type)}),
+          default_value_(std::move(default_value)) {
         Assert(IsVectorDataType(type_));
+        Assert(!nullable);
     }
 
     int64_t
@@ -88,6 +141,18 @@ class FieldMeta {
         Assert(string_info_.has_value());
         return string_info_->max_length;
     }
+
+    bool
+    enable_match() const;
+
+    bool
+    enable_analyzer() const;
+
+    bool
+    enable_growing_jsonStats() const;
+
+    TokenizerParams
+    get_analyzer_params() const;
 
     std::optional<knowhere::MetricType>
     get_metric_type() const {
@@ -122,8 +187,28 @@ class FieldMeta {
     }
 
     bool
+    is_json() const {
+        return type_ == DataType::JSON;
+    }
+
+    bool
     is_string() const {
         return IsStringDataType(type_);
+    }
+
+    bool
+    is_nullable() const {
+        return nullable_;
+    }
+
+    bool
+    has_default_value() const {
+        return default_value_.has_value();
+    }
+
+    std::optional<DefaultValueType>
+    default_value() const {
+        return default_value_;
     }
 
     size_t
@@ -136,6 +221,7 @@ class FieldMeta {
         if (is_vector()) {
             return GetDataTypeSize(type_, get_dim());
         } else if (is_string()) {
+            Assert(string_info_.has_value());
             return string_info_->max_length;
         } else if (IsVariableDataType(type_)) {
             return type_ == DataType::ARRAY ? ARRAY_SIZE : JSON_SIZE;
@@ -144,6 +230,10 @@ class FieldMeta {
         }
     }
 
+ public:
+    static FieldMeta
+    ParseFrom(const milvus::proto::schema::FieldSchema& schema_proto);
+
  private:
     struct VectorInfo {
         int64_t dim_;
@@ -151,11 +241,16 @@ class FieldMeta {
     };
     struct StringInfo {
         int64_t max_length;
+        bool enable_match;
+        bool enable_analyzer;
+        std::map<std::string, std::string> params;
     };
     FieldName name_;
     FieldId id_;
     DataType type_ = DataType::NONE;
     DataType element_type_ = DataType::NONE;
+    bool nullable_;
+    std::optional<DefaultValueType> default_value_;
     std::optional<VectorInfo> vector_info_;
     std::optional<StringInfo> string_info_;
 };

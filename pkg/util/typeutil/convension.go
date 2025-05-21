@@ -22,12 +22,12 @@ import (
 	"math"
 	"reflect"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/x448/float16"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/log"
 )
 
 // Generic Clone for proto message
@@ -164,4 +164,44 @@ func SparseFloatBytesToMap(b []byte) map[uint32]float32 {
 		values[idx] = f
 	}
 	return values
+}
+
+// Float32ArrayToBytes serialize vector into byte slice, used in search placeholder
+// LittleEndian is used for convention
+func Float32ArrayToBytes(fv []float32) []byte {
+	data := make([]byte, 0, 4*len(fv)) // float32 occupies 4 bytes
+	buf := make([]byte, 4)
+	for _, f := range fv {
+		binary.LittleEndian.PutUint32(buf, math.Float32bits(f))
+		data = append(data, buf...)
+	}
+	return data
+}
+
+// Float32ArrayToFloat16Bytes converts float32 vector `fv` to float16 vector
+func Float32ArrayToFloat16Bytes(fv []float32) []byte {
+	data := make([]byte, 0, 2*len(fv)) // float16 occupies 2 bytes
+	for _, f := range fv {
+		data = append(data, Float32ToFloat16Bytes(f)...)
+	}
+	return data
+}
+
+// Float32ArrayToBFloat16Bytes converts float32 vector `fv` to bfloat16 vector
+func Float32ArrayToBFloat16Bytes(fv []float32) []byte {
+	data := make([]byte, 0, 2*len(fv)) // bfloat16 occupies 2 bytes
+	for _, f := range fv {
+		data = append(data, Float32ToBFloat16Bytes(f)...)
+	}
+	return data
+}
+
+// Int8ArrayToBytes serialize vector into byte slice, used in search placeholder
+// LittleEndian is used for convention
+func Int8ArrayToBytes(iv []int8) []byte {
+	data := make([]byte, 0, len(iv))
+	for _, i := range iv {
+		data = append(data, byte(i))
+	}
+	return data
 }

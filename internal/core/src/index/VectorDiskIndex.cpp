@@ -74,45 +74,6 @@ VectorDiskAnnIndex<T>::VectorDiskAnnIndex(
 }
 
 template <typename T>
-VectorDiskAnnIndex<T>::VectorDiskAnnIndex(
-    const IndexType& index_type,
-    const MetricType& metric_type,
-    const IndexVersion& version,
-    std::shared_ptr<milvus_storage::Space> space,
-    const storage::FileManagerContext& file_manager_context)
-    : space_(space), VectorIndex(index_type, metric_type) {
-    CheckMetricTypeSupport<T>(metric_type);
-    file_manager_ = std::make_shared<storage::DiskFileManagerImpl>(
-        file_manager_context, file_manager_context.space_);
-    AssertInfo(file_manager_ != nullptr, "create file manager failed!");
-    auto local_chunk_manager =
-        storage::LocalChunkManagerSingleton::GetInstance().GetChunkManager();
-    auto local_index_path_prefix = file_manager_->GetLocalIndexObjectPrefix();
-
-    // As we have guarded dup-load in QueryNode,
-    // this assertion failed only if the Milvus rebooted in the same pod,
-    // need to remove these files then re-load the segment
-    if (local_chunk_manager->Exist(local_index_path_prefix)) {
-        local_chunk_manager->RemoveDir(local_index_path_prefix);
-    }
-    CheckCompatible(version);
-    local_chunk_manager->CreateDir(local_index_path_prefix);
-    auto diskann_index_pack =
-        knowhere::Pack(std::shared_ptr<knowhere::FileManager>(file_manager_));
-    auto get_index_obj = knowhere::IndexFactory::Instance().Create<T>(
-        GetIndexType(), version, diskann_index_pack);
-    if (get_index_obj.has_value()) {
-        index_ = get_index_obj.value();
-    } else {
-        auto err = get_index_obj.error();
-        if (err == knowhere::Status::invalid_index_error) {
-            PanicInfo(ErrorCode::Unsupported, get_index_obj.what());
-        }
-        PanicInfo(ErrorCode::KnowhereError, get_index_obj.what());
-    }
-}
-
-template <typename T>
 void
 VectorDiskAnnIndex<T>::Load(const BinarySet& binary_set /* not used */,
                             const Config& config) {
@@ -154,22 +115,7 @@ VectorDiskAnnIndex<T>::Load(milvus::tracer::TraceContext ctx,
 }
 
 template <typename T>
-void
-VectorDiskAnnIndex<T>::LoadV2(const Config& config) {
-    knowhere::Json load_config = update_load_json(config);
-
-    file_manager_->CacheIndexToDisk();
-
-    auto stat = index_.Deserialize(knowhere::BinarySet(), load_config);
-    if (stat != knowhere::Status::success)
-        PanicInfo(ErrorCode::UnexpectedError,
-                  "failed to Deserialize index, " + KnowhereStatusString(stat));
-
-    SetDim(index_.Dim());
-}
-
-template <typename T>
-BinarySet
+IndexStatsPtr
 VectorDiskAnnIndex<T>::Upload(const Config& config) {
     BinarySet ret;
     auto stat = index_.Serialize(ret);
@@ -178,56 +124,8 @@ VectorDiskAnnIndex<T>::Upload(const Config& config) {
                   "failed to serialize index, " + KnowhereStatusString(stat));
     }
     auto remote_paths_to_size = file_manager_->GetRemotePathsToFileSize();
-    for (auto& file : remote_paths_to_size) {
-        ret.Append(file.first, nullptr, file.second);
-    }
-
-    return ret;
-}
-
-template <typename T>
-BinarySet
-VectorDiskAnnIndex<T>::UploadV2(const Config& config) {
-    return Upload(config);
-}
-
-template <typename T>
-void
-VectorDiskAnnIndex<T>::BuildV2(const Config& config) {
-    knowhere::Json build_config;
-    build_config.update(config);
-
-    auto local_data_path = file_manager_->CacheRawDataToDisk<T>(space_);
-    build_config[DISK_ANN_RAW_DATA_PATH] = local_data_path;
-
-    auto local_index_path_prefix = file_manager_->GetLocalIndexObjectPrefix();
-    build_config[DISK_ANN_PREFIX_PATH] = local_index_path_prefix;
-
-    if (GetIndexType() == knowhere::IndexEnum::INDEX_DISKANN) {
-        auto num_threads = GetValueFromConfig<std::string>(
-            build_config, DISK_ANN_BUILD_THREAD_NUM);
-        AssertInfo(
-            num_threads.has_value(),
-            "param " + std::string(DISK_ANN_BUILD_THREAD_NUM) + "is empty");
-        build_config[DISK_ANN_THREADS_NUM] =
-            std::atoi(num_threads.value().c_str());
-    }
-
-    auto opt_fields = GetValueFromConfig<OptFieldT>(config, VEC_OPT_FIELDS);
-    if (opt_fields.has_value() && index_.IsAdditionalScalarSupported()) {
-        build_config[VEC_OPT_FIELDS_PATH] =
-            file_manager_->CacheOptFieldToDisk(opt_fields.value());
-    }
-
-    build_config.erase("insert_files");
-    build_config.erase(VEC_OPT_FIELDS);
-    index_.Build({}, build_config);
-
-    auto local_chunk_manager =
-        storage::LocalChunkManagerSingleton::GetInstance().GetChunkManager();
-    auto segment_id = file_manager_->GetFieldDataMeta().segment_id;
-    local_chunk_manager->RemoveDir(
-        storage::GetSegmentRawDataPathPrefix(local_chunk_manager, segment_id));
+    return IndexStats::NewFromSizeMap(file_manager_->GetAddedTotalFileSize(),
+                                      remote_paths_to_size);
 }
 
 template <typename T>
@@ -239,12 +137,7 @@ VectorDiskAnnIndex<T>::Build(const Config& config) {
     build_config.update(config);
 
     auto segment_id = file_manager_->GetFieldDataMeta().segment_id;
-    auto insert_files =
-        GetValueFromConfig<std::vector<std::string>>(config, "insert_files");
-    AssertInfo(insert_files.has_value(),
-               "insert file paths is empty when build disk ann index");
-    auto local_data_path =
-        file_manager_->CacheRawDataToDisk<T>(insert_files.value());
+    auto local_data_path = file_manager_->CacheRawDataToDisk<T>(config);
     build_config[DISK_ANN_RAW_DATA_PATH] = local_data_path;
 
     auto local_index_path_prefix = file_manager_->GetLocalIndexObjectPrefix();
@@ -261,12 +154,18 @@ VectorDiskAnnIndex<T>::Build(const Config& config) {
     }
 
     auto opt_fields = GetValueFromConfig<OptFieldT>(config, VEC_OPT_FIELDS);
-    if (opt_fields.has_value() && index_.IsAdditionalScalarSupported()) {
+    auto is_partition_key_isolation =
+        GetValueFromConfig<bool>(build_config, "partition_key_isolation");
+    if (opt_fields.has_value() &&
+        index_.IsAdditionalScalarSupported(
+            is_partition_key_isolation.value_or(false))) {
         build_config[VEC_OPT_FIELDS_PATH] =
             file_manager_->CacheOptFieldToDisk(opt_fields.value());
+        // `partition_key_isolation` is already in the config, so it falls through
+        // into the index Build call directly
     }
 
-    build_config.erase("insert_files");
+    build_config.erase(INSERT_FILES_KEY);
     build_config.erase(VEC_OPT_FIELDS);
     auto stat = index_.Build({}, build_config);
     if (stat != knowhere::Status::success)
@@ -363,20 +262,9 @@ VectorDiskAnnIndex<T>::Query(const DatasetPtr dataset,
     search_config[DISK_ANN_PREFIX_PATH] = local_index_path_prefix;
 
     auto final = [&] {
-        auto radius =
-            GetValueFromConfig<float>(search_info.search_params_, RADIUS);
-        if (radius.has_value()) {
-            search_config[RADIUS] = radius.value();
-            auto range_filter = GetValueFromConfig<float>(
-                search_info.search_params_, RANGE_FILTER);
-            if (range_filter.has_value()) {
-                search_config[RANGE_FILTER] = range_filter.value();
-                CheckRangeSearchParam(search_config[RADIUS],
-                                      search_config[RANGE_FILTER],
-                                      GetMetricType());
-            }
-            auto res = index_.RangeSearch(*dataset, search_config, bitset);
-
+        if (CheckAndUpdateKnowhereRangeSearchParam(
+                search_info, topk, GetMetricType(), search_config)) {
+            auto res = index_.RangeSearch(dataset, search_config, bitset);
             if (!res.has_value()) {
                 PanicInfo(ErrorCode::UnexpectedError,
                           fmt::format("failed to range search: {}: {}",
@@ -386,7 +274,7 @@ VectorDiskAnnIndex<T>::Query(const DatasetPtr dataset,
             return ReGenRangeSearchResult(
                 res.value(), topk, num_queries, GetMetricType());
         } else {
-            auto res = index_.Search(*dataset, search_config, bitset);
+            auto res = index_.Search(dataset, search_config, bitset);
             if (!res.has_value()) {
                 PanicInfo(ErrorCode::UnexpectedError,
                           fmt::format("failed to search: {}: {}",
@@ -419,11 +307,11 @@ VectorDiskAnnIndex<T>::Query(const DatasetPtr dataset,
 }
 
 template <typename T>
-knowhere::expected<std::vector<std::shared_ptr<knowhere::IndexNode::iterator>>>
+knowhere::expected<std::vector<knowhere::IndexNode::IteratorPtr>>
 VectorDiskAnnIndex<T>::VectorIterators(const DatasetPtr dataset,
                                        const knowhere::Json& conf,
                                        const BitsetView& bitset) const {
-    return this->index_.AnnIterator(*dataset, conf, bitset);
+    return this->index_.AnnIterator(dataset, conf, bitset);
 }
 
 template <typename T>
@@ -440,7 +328,13 @@ VectorDiskAnnIndex<T>::GetVector(const DatasetPtr dataset) const {
         PanicInfo(ErrorCode::UnexpectedError,
                   "failed to get vector, index is sparse");
     }
-    auto res = index_.GetVectorByIds(*dataset);
+
+    // if dataset is empty, return empty vector
+    if (dataset->GetRows() == 0) {
+        return {};
+    }
+
+    auto res = index_.GetVectorByIds(dataset);
     if (!res.has_value()) {
         PanicInfo(ErrorCode::UnexpectedError,
                   fmt::format("failed to get vector: {}: {}",
@@ -499,9 +393,9 @@ VectorDiskAnnIndex<T>::update_load_json(const Config& config) {
         }
     }
 
-    if (config.contains(kMmapFilepath)) {
-        load_config.erase(kMmapFilepath);
-        load_config[kEnableMmap] = true;
+    if (config.contains(MMAP_FILE_PATH)) {
+        load_config.erase(MMAP_FILE_PATH);
+        load_config[ENABLE_MMAP] = true;
     }
 
     return load_config;

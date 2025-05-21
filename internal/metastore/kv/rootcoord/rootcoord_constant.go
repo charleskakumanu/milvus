@@ -3,7 +3,7 @@ package rootcoord
 import (
 	"fmt"
 
-	"github.com/milvus-io/milvus/pkg/util"
+	"github.com/milvus-io/milvus/pkg/v2/util"
 )
 
 const (
@@ -20,6 +20,7 @@ const (
 	PartitionMetaPrefix = ComponentPrefix + "/partitions"
 	AliasMetaPrefix     = ComponentPrefix + "/aliases"
 	FieldMetaPrefix     = ComponentPrefix + "/fields"
+	FunctionMetaPrefix  = ComponentPrefix + "/functions"
 
 	// CollectionAliasMetaPrefix210 prefix for collection alias meta
 	CollectionAliasMetaPrefix210 = ComponentPrefix + "/collection-alias"
@@ -49,6 +50,9 @@ const (
 
 	// GranteeIDPrefix prefix for mapping among privilege and grantor
 	GranteeIDPrefix = ComponentPrefix + CommonCredentialPrefix + "/grantee-id"
+
+	// PrivilegeGroupPrefix prefix for privilege group
+	PrivilegeGroupPrefix = ComponentPrefix + "/privilege-group"
 )
 
 func BuildDatabasePrefixWithDBID(dbID int64) string {
@@ -68,4 +72,8 @@ func getDatabasePrefix(dbID int64) string {
 		return BuildDatabasePrefixWithDBID(dbID)
 	}
 	return CollectionMetaPrefix
+}
+
+func BuildPrivilegeGroupkey(groupName string) string {
+	return fmt.Sprintf("%s/%s", PrivilegeGroupPrefix, groupName)
 }

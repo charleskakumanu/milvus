@@ -38,10 +38,10 @@ import (
 	"github.com/cockroachdb/errors"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/pkg/kv"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/tsoutil"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/kv"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/tsoutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 const (
@@ -75,7 +75,7 @@ type timestampOracle struct {
 }
 
 func (t *timestampOracle) loadTimestamp() (time.Time, error) {
-	strData, err := t.txnKV.Load(t.key)
+	strData, err := t.txnKV.Load(context.TODO(), t.key)
 	if err != nil {
 		// intend to return nil
 		return typeutil.ZeroTime, nil
@@ -93,7 +93,7 @@ func (t *timestampOracle) loadTimestamp() (time.Time, error) {
 func (t *timestampOracle) saveTimestamp(ts time.Time) error {
 	// we use big endian here for compatibility issues
 	data := typeutil.Uint64ToBytesBigEndian(uint64(ts.UnixNano()))
-	err := t.txnKV.Save(t.key, string(data))
+	err := t.txnKV.Save(context.TODO(), t.key, string(data))
 	if err != nil {
 		return errors.WithStack(err)
 	}

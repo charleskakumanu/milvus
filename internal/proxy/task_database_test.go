@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"google.golang.org/grpc/metadata"
@@ -12,17 +13,17 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus/internal/mocks"
-	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/util"
-	"github.com/milvus-io/milvus/pkg/util/crypto"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/proto/rootcoordpb"
+	"github.com/milvus-io/milvus/pkg/v2/util"
+	"github.com/milvus-io/milvus/pkg/v2/util/crypto"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 func TestCreateDatabaseTask(t *testing.T) {
 	paramtable.Init()
-	rc := NewRootCoordMock()
+	rc := NewMixCoordMock()
 	defer rc.Close()
 
 	ctx := context.Background()
@@ -36,9 +37,9 @@ func TestCreateDatabaseTask(t *testing.T) {
 			},
 			DbName: "db",
 		},
-		ctx:       ctx,
-		rootCoord: rc,
-		result:    nil,
+		ctx:      ctx,
+		mixCoord: rc,
+		result:   nil,
 	}
 
 	t.Run("ok", func(t *testing.T) {
@@ -69,7 +70,7 @@ func TestCreateDatabaseTask(t *testing.T) {
 
 func TestDropDatabaseTask(t *testing.T) {
 	paramtable.Init()
-	rc := NewRootCoordMock()
+	rc := NewMixCoordMock()
 	defer rc.Close()
 
 	ctx := context.Background()
@@ -83,9 +84,9 @@ func TestDropDatabaseTask(t *testing.T) {
 			},
 			DbName: "db",
 		},
-		ctx:       ctx,
-		rootCoord: rc,
-		result:    nil,
+		ctx:      ctx,
+		mixCoord: rc,
+		result:   nil,
 	}
 
 	cache := NewMockCache(t)
@@ -123,7 +124,7 @@ func TestDropDatabaseTask(t *testing.T) {
 
 func TestListDatabaseTask(t *testing.T) {
 	paramtable.Init()
-	rc := NewRootCoordMock()
+	rc := NewMixCoordMock()
 	defer rc.Close()
 
 	ctx := GetContext(context.Background(), "root:123456")
@@ -136,9 +137,9 @@ func TestListDatabaseTask(t *testing.T) {
 				Timestamp: 100,
 			},
 		},
-		ctx:       ctx,
-		rootCoord: rc,
-		result:    nil,
+		ctx:      ctx,
+		mixCoord: rc,
+		result:   nil,
 	}
 
 	t.Run("ok", func(t *testing.T) {
@@ -169,7 +170,7 @@ func TestListDatabaseTask(t *testing.T) {
 }
 
 func TestAlterDatabase(t *testing.T) {
-	rc := mocks.NewMockRootCoordClient(t)
+	rc := mocks.NewMockMixCoordClient(t)
 
 	rc.EXPECT().AlterDatabase(mock.Anything, mock.Anything).Return(merr.Success(), nil)
 	task := &alterDatabaseTask{
@@ -178,17 +179,188 @@ func TestAlterDatabase(t *testing.T) {
 			DbName:     "test_alter_database",
 			Properties: []*commonpb.KeyValuePair{{Key: common.MmapEnabledKey, Value: "true"}},
 		},
-		rootCoord: rc,
+		mixCoord: rc,
 	}
 	err := task.PreExecute(context.Background())
 	assert.Nil(t, err)
 
 	err = task.Execute(context.Background())
 	assert.Nil(t, err)
+
+	task1 := &alterDatabaseTask{
+		AlterDatabaseRequest: &milvuspb.AlterDatabaseRequest{
+			Base:       &commonpb.MsgBase{},
+			DbName:     "test_alter_database",
+			DeleteKeys: []string{common.MmapEnabledKey},
+		},
+		mixCoord: rc,
+	}
+	err1 := task1.PreExecute(context.Background())
+	assert.Nil(t, err1)
+
+	err1 = task1.Execute(context.Background())
+	assert.Nil(t, err1)
 }
 
-func TestDescribeDatabase(t *testing.T) {
-	rc := mocks.NewMockRootCoordClient(t)
+func TestAlterDatabaseTaskForReplicateProperty(t *testing.T) {
+	rc := mocks.NewMockMixCoordClient(t)
+	cache := globalMetaCache
+	defer func() { globalMetaCache = cache }()
+	mockCache := NewMockCache(t)
+	globalMetaCache = mockCache
+
+	t.Run("replicate id", func(t *testing.T) {
+		task := &alterDatabaseTask{
+			AlterDatabaseRequest: &milvuspb.AlterDatabaseRequest{
+				Base:   &commonpb.MsgBase{},
+				DbName: "test_alter_database",
+				Properties: []*commonpb.KeyValuePair{
+					{
+						Key:   common.MmapEnabledKey,
+						Value: "true",
+					},
+					{
+						Key:   common.ReplicateIDKey,
+						Value: "local-test",
+					},
+				},
+			},
+			mixCoord: rc,
+		}
+		err := task.PreExecute(context.Background())
+		assert.Error(t, err)
+	})
+
+	t.Run("fail to get database info", func(t *testing.T) {
+		mockCache.EXPECT().GetDatabaseInfo(mock.Anything, mock.Anything).Return(nil, errors.New("err")).Once()
+		task := &alterDatabaseTask{
+			AlterDatabaseRequest: &milvuspb.AlterDatabaseRequest{
+				Base:   &commonpb.MsgBase{},
+				DbName: "test_alter_database",
+				Properties: []*commonpb.KeyValuePair{
+					{
+						Key:   common.ReplicateEndTSKey,
+						Value: "1000",
+					},
+				},
+			},
+			mixCoord: rc,
+		}
+		err := task.PreExecute(context.Background())
+		assert.Error(t, err)
+	})
+
+	t.Run("not enable replicate", func(t *testing.T) {
+		mockCache.EXPECT().GetDatabaseInfo(mock.Anything, mock.Anything).Return(&databaseInfo{
+			properties: []*commonpb.KeyValuePair{},
+		}, nil).Once()
+		task := &alterDatabaseTask{
+			AlterDatabaseRequest: &milvuspb.AlterDatabaseRequest{
+				Base:   &commonpb.MsgBase{},
+				DbName: "test_alter_database",
+				Properties: []*commonpb.KeyValuePair{
+					{
+						Key:   common.ReplicateEndTSKey,
+						Value: "1000",
+					},
+				},
+			},
+			mixCoord: rc,
+		}
+		err := task.PreExecute(context.Background())
+		assert.Error(t, err)
+	})
+
+	t.Run("fail to alloc ts", func(t *testing.T) {
+		mockCache.EXPECT().GetDatabaseInfo(mock.Anything, mock.Anything).Return(&databaseInfo{
+			properties: []*commonpb.KeyValuePair{
+				{
+					Key:   common.ReplicateIDKey,
+					Value: "local-test",
+				},
+			},
+		}, nil).Once()
+		rc.EXPECT().AllocTimestamp(mock.Anything, mock.Anything).Return(nil, errors.New("err")).Once()
+		task := &alterDatabaseTask{
+			AlterDatabaseRequest: &milvuspb.AlterDatabaseRequest{
+				Base:   &commonpb.MsgBase{},
+				DbName: "test_alter_database",
+				Properties: []*commonpb.KeyValuePair{
+					{
+						Key:   common.ReplicateEndTSKey,
+						Value: "1000",
+					},
+				},
+			},
+			mixCoord: rc,
+		}
+		err := task.PreExecute(context.Background())
+		assert.Error(t, err)
+	})
+
+	t.Run("alloc wrong ts", func(t *testing.T) {
+		mockCache.EXPECT().GetDatabaseInfo(mock.Anything, mock.Anything).Return(&databaseInfo{
+			properties: []*commonpb.KeyValuePair{
+				{
+					Key:   common.ReplicateIDKey,
+					Value: "local-test",
+				},
+			},
+		}, nil).Once()
+		rc.EXPECT().AllocTimestamp(mock.Anything, mock.Anything).Return(&rootcoordpb.AllocTimestampResponse{
+			Status:    merr.Success(),
+			Timestamp: 999,
+		}, nil).Once()
+		task := &alterDatabaseTask{
+			AlterDatabaseRequest: &milvuspb.AlterDatabaseRequest{
+				Base:   &commonpb.MsgBase{},
+				DbName: "test_alter_database",
+				Properties: []*commonpb.KeyValuePair{
+					{
+						Key:   common.ReplicateEndTSKey,
+						Value: "1000",
+					},
+				},
+			},
+			mixCoord: rc,
+		}
+		err := task.PreExecute(context.Background())
+		assert.Error(t, err)
+	})
+
+	t.Run("alloc wrong ts", func(t *testing.T) {
+		mockCache.EXPECT().GetDatabaseInfo(mock.Anything, mock.Anything).Return(&databaseInfo{
+			properties: []*commonpb.KeyValuePair{
+				{
+					Key:   common.ReplicateIDKey,
+					Value: "local-test",
+				},
+			},
+		}, nil).Once()
+		rc.EXPECT().AllocTimestamp(mock.Anything, mock.Anything).Return(&rootcoordpb.AllocTimestampResponse{
+			Status:    merr.Success(),
+			Timestamp: 1001,
+		}, nil).Once()
+		task := &alterDatabaseTask{
+			AlterDatabaseRequest: &milvuspb.AlterDatabaseRequest{
+				Base:   &commonpb.MsgBase{},
+				DbName: "test_alter_database",
+				Properties: []*commonpb.KeyValuePair{
+					{
+						Key:   common.ReplicateEndTSKey,
+						Value: "1000",
+					},
+				},
+			},
+			mixCoord: rc,
+		}
+		err := task.PreExecute(context.Background())
+		assert.NoError(t, err)
+	})
+}
+
+func TestDescribeDatabaseTask(t *testing.T) {
+	rc := mocks.NewMockMixCoordClient(t)
 
 	rc.EXPECT().DescribeDatabase(mock.Anything, mock.Anything).Return(&rootcoordpb.DescribeDatabaseResponse{}, nil)
 	task := &describeDatabaseTask{
@@ -196,7 +368,7 @@ func TestDescribeDatabase(t *testing.T) {
 			Base:   &commonpb.MsgBase{},
 			DbName: "test_describe_database",
 		},
-		rootCoord: rc,
+		mixCoord: rc,
 	}
 
 	err := task.PreExecute(context.Background())

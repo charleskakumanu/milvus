@@ -23,10 +23,10 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/streamrpc"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
 )
 
 type qnServerWrapper struct {
@@ -146,6 +146,14 @@ func (qn *qnServerWrapper) SyncDistribution(ctx context.Context, in *querypb.Syn
 
 func (qn *qnServerWrapper) Delete(ctx context.Context, in *querypb.DeleteRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	return qn.QueryNode.Delete(ctx, in)
+}
+
+func (qn *qnServerWrapper) DeleteBatch(ctx context.Context, in *querypb.DeleteBatchRequest, opts ...grpc.CallOption) (*querypb.DeleteBatchResponse, error) {
+	return qn.QueryNode.DeleteBatch(ctx, in)
+}
+
+func (qn *qnServerWrapper) UpdateSchema(ctx context.Context, in *querypb.UpdateSchemaRequest, _ ...grpc.CallOption) (*commonpb.Status, error) {
+	return qn.QueryNode.UpdateSchema(ctx, in)
 }
 
 func WrapQueryNodeServerAsClient(qn types.QueryNode) types.QueryNodeClient {

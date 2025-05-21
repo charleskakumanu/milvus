@@ -24,15 +24,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/pkg/mq/msgstream"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
 )
 
 func TestBaseTaskQueue(t *testing.T) {
@@ -582,7 +583,7 @@ func TestTaskScheduler_concurrentPushAndPop(t *testing.T) {
 		it := &insertTask{
 			ctx: context.Background(),
 			insertMsg: &msgstream.InsertMsg{
-				InsertRequest: msgpb.InsertRequest{
+				InsertRequest: &msgpb.InsertRequest{
 					Base:           &commonpb.MsgBase{},
 					CollectionName: collectionName,
 				},
@@ -593,7 +594,7 @@ func TestTaskScheduler_concurrentPushAndPop(t *testing.T) {
 		assert.NoError(t, err)
 		task := scheduler.scheduleDmTask()
 		scheduler.dmQueue.AddActiveTask(task)
-		chMgr.EXPECT().getChannels(mock.Anything).Return(nil, fmt.Errorf("mock err"))
+		chMgr.EXPECT().getChannels(mock.Anything).Return(nil, errors.New("mock err"))
 		scheduler.dmQueue.PopActiveTask(task.ID()) // assert no panic
 	}
 
@@ -621,7 +622,7 @@ func TestTaskScheduler_SkipAllocTimestamp(t *testing.T) {
 
 	mockMetaCache.EXPECT().GetCollectionID(mock.Anything, mock.Anything, mock.Anything).Return(collID, nil)
 	mockMetaCache.EXPECT().GetCollectionInfo(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(
-		&collectionBasicInfo{
+		&collectionInfo{
 			collID:           collID,
 			consistencyLevel: commonpb.ConsistencyLevel_Eventually,
 		}, nil)
@@ -659,7 +660,7 @@ func TestTaskScheduler_SkipAllocTimestamp(t *testing.T) {
 		assert.NoError(t, err)
 	})
 
-	mockMetaCache.EXPECT().AllocID(mock.Anything).Return(0, fmt.Errorf("mock error")).Once()
+	mockMetaCache.EXPECT().AllocID(mock.Anything).Return(0, errors.New("mock error")).Once()
 	t.Run("failed", func(t *testing.T) {
 		st := &searchTask{
 			SearchRequest: &internalpb.SearchRequest{

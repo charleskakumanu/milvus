@@ -16,6 +16,8 @@
 
 package entity
 
+import "github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+
 // MetricType metric type
 type MetricType string
 
@@ -29,4 +31,14 @@ const (
 	TANIMOTO       MetricType = "TANIMOTO"
 	SUBSTRUCTURE   MetricType = "SUBSTRUCTURE"
 	SUPERSTRUCTURE MetricType = "SUPERSTRUCTURE"
+	BM25           MetricType = "BM25"
+)
+
+// CompactionState enum type for compaction state
+type CompactionState commonpb.CompactionState
+
+// CompactionState Constants
+const (
+	CompactionStateRunning   CompactionState = CompactionState(commonpb.CompactionState_Executing)
+	CompactionStateCompleted CompactionState = CompactionState(commonpb.CompactionState_Completed)
 )

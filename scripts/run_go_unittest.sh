@@ -108,6 +108,7 @@ go test -race -cover -tags dynamic,test "${MILVUS_DIR}/util/importutilv2/..." -f
 go test -race -cover -tags dynamic,test "${MILVUS_DIR}/util/proxyutil/..." -failfast -count=1  -ldflags="-r ${RPATH}"
 go test -race -cover -tags dynamic,test "${MILVUS_DIR}/util/initcore/..." -failfast -count=1  -ldflags="-r ${RPATH}"
 go test -race -cover -tags dynamic,test "${MILVUS_DIR}/util/cgo/..." -failfast -count=1  -ldflags="-r ${RPATH}"
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/util/streamingutil/..." -failfast -count=1  -ldflags="-r ${RPATH}"
 }
 
 function test_pkg()
@@ -119,6 +120,7 @@ go test -race -cover -tags dynamic,test "${PKG_DIR}/log/..." -failfast -count=1 
 go test -race -cover -tags dynamic,test "${PKG_DIR}/mq/..." -failfast -count=1  -ldflags="-r ${RPATH}"
 go test -race -cover -tags dynamic,test "${PKG_DIR}/tracer/..." -failfast -count=1  -ldflags="-r ${RPATH}"
 go test -race -cover -tags dynamic,test "${PKG_DIR}/util/..." -failfast -count=1  -ldflags="-r ${RPATH}"
+go test -race -cover -tags dynamic,test "${PKG_DIR}/streaming/..." -failfast -count=1  -ldflags="-r ${RPATH}"
 popd
 }
 
@@ -128,11 +130,6 @@ function test_datanode
 go test -race -cover -tags dynamic,test "${MILVUS_DIR}/datanode/..." -failfast -count=1  -ldflags="-r ${RPATH}"
 go test -race -cover -tags dynamic,test "${MILVUS_DIR}/distributed/datanode/..." -failfast -count=1  -ldflags="-r ${RPATH}"
 
-}
-
-function test_indexnode()
-{
-go test -race -cover -tags dynamic,test "${MILVUS_DIR}/indexnode/..." -failfast -count=1 -ldflags="-r ${RPATH}"
 }
 
 function test_rootcoord()
@@ -163,12 +160,22 @@ function test_cmd()
 go test -race -cover -tags dynamic,test "${ROOT_DIR}/cmd/tools/..." -failfast -count=1 -ldflags="-r ${RPATH}"
 }
 
+function test_streaming()
+{
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/streamingcoord/..." -failfast -count=1 -ldflags="-r ${RPATH}"
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/streamingnode/..." -failfast -count=1 -ldflags="-r ${RPATH}"
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/util/streamingutil/..." -failfast -count=1 -ldflags="-r ${RPATH}"
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/distributed/streaming/..." -failfast -count=1 -ldflags="-r ${RPATH}"
+pushd pkg
+go test -race -cover -tags dynamic,test "${PKG_DIR}/streaming/..." -failfast -count=1  -ldflags="-r ${RPATH}"
+popd
+}
+
 function test_all()
 {
 test_proxy
 test_querynode
 test_datanode
-test_indexnode
 test_rootcoord
 test_querycoord
 test_datacoord
@@ -181,6 +188,7 @@ test_util
 test_pkg
 test_metastore
 test_cmd
+test_streaming
 }
 
 
@@ -194,9 +202,6 @@ case "${TEST_TAG}" in
         ;;
     datanode)
 	test_datanode
-        ;;
-    indexnode)
-	test_indexnode
         ;;
     rootcoord)
 	test_rootcoord
@@ -236,6 +241,9 @@ case "${TEST_TAG}" in
         ;;
     cmd)
 	test_cmd
+        ;;
+    streaming)
+	test_streaming
         ;;
     *)   echo "Test All";
 	test_all

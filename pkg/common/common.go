@@ -22,8 +22,13 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cockroachdb/errors"
+	"github.com/samber/lo"
+	"go.uber.org/zap"
+
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/pkg/v2/log"
 )
 
 // system field id:
@@ -37,6 +42,8 @@ const (
 	// StartOfUserFieldID represents the starting ID of the user-defined field
 	StartOfUserFieldID = 100
 
+	// StartOfUserFunctionID represents the starting ID of the user-defined function
+	StartOfUserFunctionID = 100
 	// RowIDField is the ID of the RowID field reserved by the system
 	RowIDField = 0
 
@@ -72,6 +79,13 @@ const (
 
 	// InvalidNodeID indicates that node is not valid in querycoord replica or shard cluster.
 	InvalidNodeID = int64(-1)
+
+	SystemFieldsNum = int64(2)
+)
+
+const (
+	MinimalScalarIndexEngineVersion = int32(0)
+	CurrentScalarIndexEngineVersion = int32(2)
 )
 
 // Endian is type alias of binary.LittleEndian.
@@ -91,6 +105,9 @@ const (
 	// SegmentIndexPath storage path const for segment index files.
 	SegmentIndexPath = `index_files`
 
+	// SegmentBm25LogPath storage path const for bm25 statistic
+	SegmentBm25LogPath = `bm25_stats`
+
 	// PartitionStatsPath storage path const for partition stats files
 	PartitionStatsPath = `part_stats`
 
@@ -98,6 +115,12 @@ const (
 	AnalyzeStatsPath = `analyze_stats`
 	OffsetMapping    = `offset_mapping`
 	Centroids        = "centroids"
+
+	// TextIndexPath storage path const for text index
+	TextIndexPath = "text_log"
+
+	// JSONIndexPath storage path const for json index
+	JSONIndexPath = "json_key_index_log"
 )
 
 // Search, Index parameter keys
@@ -107,8 +130,10 @@ const (
 	SegmentNumKey   = "segment_num"
 	WithFilterKey   = "with_filter"
 	DataTypeKey     = "data_type"
+	ChannelNumKey   = "channel_num"
 	WithOptimizeKey = "with_optimize"
 	CollectionKey   = "collection"
+	RecallEvalKey   = "recall_eval"
 
 	IndexParamsKey = "params"
 	IndexTypeKey   = "index_type"
@@ -119,7 +144,21 @@ const (
 
 	DropRatioBuildKey = "drop_ratio_build"
 
+	IsSparseKey               = "is_sparse"
+	AutoIndexName             = "AUTOINDEX"
 	BitmapCardinalityLimitKey = "bitmap_cardinality_limit"
+	IgnoreGrowing             = "ignore_growing"
+	ConsistencyLevel          = "consistency_level"
+	HintsKey                  = "hints"
+
+	JSONCastTypeKey = "json_cast_type"
+	JSONPathKey     = "json_path"
+)
+
+// Doc-in-doc-out
+const (
+	EnableAnalyzerKey = `enable_analyzer`
+	AnalyzerParamKey  = `analyzer_params`
 )
 
 //  Collection properties key
@@ -127,6 +166,7 @@ const (
 const (
 	CollectionTTLConfigKey      = "collection.ttl.seconds"
 	CollectionAutoCompactionKey = "collection.autocompaction.enabled"
+	CollectionDescription       = "collection.description"
 
 	// rate limit
 	CollectionInsertRateMaxKey   = "collection.insertRate.max.mb"
@@ -146,14 +186,35 @@ const (
 	PartitionDiskQuotaKey = "partition.diskProtection.diskQuota.mb"
 
 	// database level properties
-	DatabaseReplicaNumber  = "database.replica.number"
-	DatabaseResourceGroups = "database.resource_groups"
+	DatabaseReplicaNumber       = "database.replica.number"
+	DatabaseResourceGroups      = "database.resource_groups"
+	DatabaseDiskQuotaKey        = "database.diskQuota.mb"
+	DatabaseMaxCollectionsKey   = "database.max.collections"
+	DatabaseForceDenyWritingKey = "database.force.deny.writing"
+	DatabaseForceDenyReadingKey = "database.force.deny.reading"
+
+	DatabaseForceDenyDDLKey           = "database.force.deny.ddl" // all ddl
+	DatabaseForceDenyCollectionDDLKey = "database.force.deny.collectionDDL"
+	DatabaseForceDenyPartitionDDLKey  = "database.force.deny.partitionDDL"
+	DatabaseForceDenyIndexDDLKey      = "database.force.deny.index"
+	DatabaseForceDenyFlushDDLKey      = "database.force.deny.flush"
+	DatabaseForceDenyCompactionDDLKey = "database.force.deny.compaction"
+
+	// collection level load properties
+	CollectionReplicaNumber  = "collection.replica.number"
+	CollectionResourceGroups = "collection.resource_groups"
 )
 
 // common properties
 const (
-	MmapEnabledKey    = "mmap.enabled"
-	LazyLoadEnableKey = "lazyload.enabled"
+	MmapEnabledKey             = "mmap.enabled"
+	LazyLoadEnableKey          = "lazyload.enabled"
+	PartitionKeyIsolationKey   = "partitionkey.isolation"
+	FieldSkipLoadKey           = "field.skipLoad"
+	IndexOffsetCacheEnabledKey = "indexoffsetcache.enabled"
+	ReplicateIDKey             = "replicate.id"
+	ReplicateEndTSKey          = "replicate.endTS"
+	IndexNonEncoding           = "index.nonEncoding"
 )
 
 const (
@@ -165,22 +226,34 @@ func IsSystemField(fieldID int64) bool {
 	return fieldID < StartOfUserFieldID
 }
 
-func IsMmapEnabled(kvs ...*commonpb.KeyValuePair) bool {
+func IsMmapDataEnabled(kvs ...*commonpb.KeyValuePair) (bool, bool) {
 	for _, kv := range kvs {
-		if kv.Key == MmapEnabledKey && strings.ToLower(kv.Value) == "true" {
-			return true
+		if kv.Key == MmapEnabledKey {
+			enable, _ := strconv.ParseBool(kv.Value)
+			return enable, true
 		}
 	}
-	return false
+	return false, false
 }
 
-func IsFieldMmapEnabled(schema *schemapb.CollectionSchema, fieldID int64) bool {
-	for _, field := range schema.GetFields() {
-		if field.GetFieldID() == fieldID {
-			return IsMmapEnabled(field.GetTypeParams()...)
+func IsMmapIndexEnabled(kvs ...*commonpb.KeyValuePair) (bool, bool) {
+	for _, kv := range kvs {
+		if kv.Key == MmapEnabledKey {
+			enable, _ := strconv.ParseBool(kv.Value)
+			return enable, true
 		}
 	}
-	return false
+	return false, false
+}
+
+func GetIndexType(indexParams []*commonpb.KeyValuePair) string {
+	for _, param := range indexParams {
+		if param.Key == IndexTypeKey {
+			return param.Value
+		}
+	}
+	log.Warn("IndexType not found in indexParams")
+	return ""
 }
 
 func FieldHasMmapKey(schema *schemapb.CollectionSchema, fieldID int64) bool {
@@ -213,6 +286,31 @@ func IsCollectionLazyLoadEnabled(kvs ...*commonpb.KeyValuePair) bool {
 		}
 	}
 	return false
+}
+
+func IsPartitionKeyIsolationKvEnabled(kvs ...*commonpb.KeyValuePair) (bool, error) {
+	for _, kv := range kvs {
+		if kv.Key == PartitionKeyIsolationKey {
+			val, err := strconv.ParseBool(strings.ToLower(kv.Value))
+			if err != nil {
+				return false, errors.Wrap(err, "failed to parse partition key isolation")
+			}
+			return val, nil
+		}
+	}
+	return false, nil
+}
+
+func IsPartitionKeyIsolationPropEnabled(props map[string]string) (bool, error) {
+	val, ok := props[PartitionKeyIsolationKey]
+	if !ok {
+		return false, nil
+	}
+	iso, parseErr := strconv.ParseBool(val)
+	if parseErr != nil {
+		return false, errors.Wrap(parseErr, "failed to parse partition key isolation property")
+	}
+	return iso, nil
 }
 
 const (
@@ -248,9 +346,121 @@ func DatabaseLevelResourceGroups(kvs []*commonpb.KeyValuePair) ([]string, error)
 				return nil, invalidPropValue
 			}
 
-			return rgs, nil
+			return lo.Map(rgs, func(rg string, _ int) string { return strings.TrimSpace(rg) }), nil
 		}
 	}
 
 	return nil, fmt.Errorf("database property not found: %s", DatabaseResourceGroups)
+}
+
+func CollectionLevelReplicaNumber(kvs []*commonpb.KeyValuePair) (int64, error) {
+	for _, kv := range kvs {
+		if kv.Key == CollectionReplicaNumber {
+			replicaNum, err := strconv.ParseInt(kv.Value, 10, 64)
+			if err != nil {
+				return 0, fmt.Errorf("invalid collection property: [key=%s] [value=%s]", kv.Key, kv.Value)
+			}
+
+			return replicaNum, nil
+		}
+	}
+
+	return 0, fmt.Errorf("collection property not found: %s", CollectionReplicaNumber)
+}
+
+func CollectionLevelResourceGroups(kvs []*commonpb.KeyValuePair) ([]string, error) {
+	for _, kv := range kvs {
+		if kv.Key == CollectionResourceGroups {
+			invalidPropValue := fmt.Errorf("invalid collection property: [key=%s] [value=%s]", kv.Key, kv.Value)
+			if len(kv.Value) == 0 {
+				return nil, invalidPropValue
+			}
+
+			rgs := strings.Split(kv.Value, ",")
+			if len(rgs) == 0 {
+				return nil, invalidPropValue
+			}
+
+			return lo.Map(rgs, func(rg string, _ int) string { return strings.TrimSpace(rg) }), nil
+		}
+	}
+
+	return nil, fmt.Errorf("collection property not found: %s", CollectionReplicaNumber)
+}
+
+// GetCollectionLoadFields returns the load field ids according to the type params.
+func GetCollectionLoadFields(schema *schemapb.CollectionSchema, skipDynamicField bool) []int64 {
+	fields := lo.FilterMap(schema.GetFields(), func(field *schemapb.FieldSchema, _ int) (int64, bool) {
+		// skip system field
+		if IsSystemField(field.GetFieldID()) {
+			return field.GetFieldID(), false
+		}
+		// skip dynamic field if specified
+		if field.IsDynamic && skipDynamicField {
+			return field.GetFieldID(), false
+		}
+
+		v, err := ShouldFieldBeLoaded(field.GetTypeParams())
+		if err != nil {
+			log.Warn("type param parse skip load failed", zap.Error(err))
+			// if configuration cannot be parsed, ignore it and load field
+			return field.GetFieldID(), true
+		}
+		return field.GetFieldID(), v
+	})
+	// empty fields list means all fields will be loaded
+	if len(fields) == len(schema.GetFields())-int(SystemFieldsNum) {
+		return []int64{}
+	}
+	return fields
+}
+
+func ShouldFieldBeLoaded(kvs []*commonpb.KeyValuePair) (bool, error) {
+	for _, kv := range kvs {
+		if kv.GetKey() == FieldSkipLoadKey {
+			val, err := strconv.ParseBool(kv.GetValue())
+			return !val, err
+		}
+	}
+	return true, nil
+}
+
+func IsReplicateEnabled(kvs []*commonpb.KeyValuePair) (bool, bool) {
+	replicateID, ok := GetReplicateID(kvs)
+	return replicateID != "", ok
+}
+
+func GetReplicateID(kvs []*commonpb.KeyValuePair) (string, bool) {
+	for _, kv := range kvs {
+		if kv.GetKey() == ReplicateIDKey {
+			return kv.GetValue(), true
+		}
+	}
+	return "", false
+}
+
+func GetReplicateEndTS(kvs []*commonpb.KeyValuePair) (uint64, bool) {
+	for _, kv := range kvs {
+		if kv.GetKey() == ReplicateEndTSKey {
+			ts, err := strconv.ParseUint(kv.GetValue(), 10, 64)
+			if err != nil {
+				log.Warn("parse replicate end ts failed", zap.Error(err), zap.Stack("stack"))
+				return 0, false
+			}
+			return ts, true
+		}
+	}
+	return 0, false
+}
+
+func ValidateAutoIndexMmapConfig(autoIndexConfigEnable, isVectorField bool, indexParams map[string]string) error {
+	if !autoIndexConfigEnable {
+		return nil
+	}
+
+	_, ok := indexParams[MmapEnabledKey]
+	if ok && isVectorField {
+		return errors.New("mmap index is not supported to config for the collection in auto index mode")
+	}
+	return nil
 }

@@ -18,9 +18,9 @@ import (
 	"github.com/cockroachdb/errors"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 )
 
 // Do will run function with retry mechanism.
@@ -40,26 +40,41 @@ func Do(ctx context.Context, fn func() error, opts ...Option) error {
 
 	var lastErr error
 
-	for i := uint(0); i < c.attempts; i++ {
+	for i := uint(0); c.attempts == 0 || i < c.attempts; i++ {
 		if err := fn(); err != nil {
 			if i%4 == 0 {
 				log.Warn("retry func failed", zap.Uint("retried", i), zap.Error(err))
 			}
 
 			if !IsRecoverable(err) {
-				if errors.IsAny(err, context.Canceled, context.DeadlineExceeded) && lastErr != nil {
+				isContextErr := errors.IsAny(err, context.Canceled, context.DeadlineExceeded)
+				log.Warn("retry func failed, not be recoverable",
+					zap.Uint("retried", i),
+					zap.Uint("attempt", c.attempts),
+					zap.Bool("isContextErr", isContextErr),
+				)
+				if isContextErr && lastErr != nil {
 					return lastErr
 				}
 				return err
 			}
 			if c.isRetryErr != nil && !c.isRetryErr(err) {
+				log.Warn("retry func failed, not be retryable",
+					zap.Uint("retried", i),
+					zap.Uint("attempt", c.attempts),
+				)
 				return err
 			}
 
 			deadline, ok := ctx.Deadline()
 			if ok && time.Until(deadline) < c.sleep {
-				// to avoid sleep until ctx done
-				if errors.IsAny(err, context.Canceled, context.DeadlineExceeded) && lastErr != nil {
+				isContextErr := errors.IsAny(err, context.Canceled, context.DeadlineExceeded)
+				log.Warn("retry func failed, deadline",
+					zap.Uint("retried", i),
+					zap.Uint("attempt", c.attempts),
+					zap.Bool("isContextErr", isContextErr),
+				)
+				if isContextErr && lastErr != nil {
 					return lastErr
 				}
 				return err
@@ -70,6 +85,10 @@ func Do(ctx context.Context, fn func() error, opts ...Option) error {
 			select {
 			case <-time.After(c.sleep):
 			case <-ctx.Done():
+				log.Warn("retry func failed, ctx done",
+					zap.Uint("retried", i),
+					zap.Uint("attempt", c.attempts),
+				)
 				return lastErr
 			}
 
@@ -80,6 +99,11 @@ func Do(ctx context.Context, fn func() error, opts ...Option) error {
 		} else {
 			return nil
 		}
+	}
+	if lastErr != nil {
+		log.Warn("retry func failed, reach max retry",
+			zap.Uint("attempt", c.attempts),
+		)
 	}
 	return lastErr
 }

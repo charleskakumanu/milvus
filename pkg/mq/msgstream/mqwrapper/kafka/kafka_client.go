@@ -12,13 +12,13 @@ import (
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/metrics"
-	"github.com/milvus-io/milvus/pkg/mq/common"
-	"github.com/milvus-io/milvus/pkg/mq/msgstream/mqwrapper"
-	"github.com/milvus-io/milvus/pkg/util/conc"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/timerecord"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/metrics"
+	"github.com/milvus-io/milvus/pkg/v2/mq/common"
+	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream/mqwrapper"
+	"github.com/milvus-io/milvus/pkg/v2/util/conc"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/timerecord"
 )
 
 var (
@@ -74,17 +74,8 @@ func NewKafkaClientInstanceWithConfigMap(config kafka.ConfigMap, extraConsumerCo
 	return &kafkaClient{basicConfig: config, consumerConfig: extraConsumerConfig, producerConfig: extraProducerConfig}
 }
 
-func NewKafkaClientInstanceWithConfig(ctx context.Context, config *paramtable.KafkaConfig) (*kafkaClient, error) {
+func GetBasicConfig(config *paramtable.KafkaConfig) kafka.ConfigMap {
 	kafkaConfig := getBasicConfig(config.Address.GetValue())
-
-	// connection setup timeout, default as 30000ms, available range is [1000, 2147483647]
-	if deadline, ok := ctx.Deadline(); ok {
-		if deadline.Before(time.Now()) {
-			return nil, errors.New("context timeout when new kafka client")
-		}
-		// timeout := time.Until(deadline).Milliseconds()
-		// kafkaConfig.SetKey("socket.connection.setup.timeout.ms", strconv.FormatInt(timeout, 10))
-	}
 
 	if (config.SaslUsername.GetValue() == "" && config.SaslPassword.GetValue() != "") ||
 		(config.SaslUsername.GetValue() != "" && config.SaslPassword.GetValue() == "") {
@@ -110,6 +101,20 @@ func NewKafkaClientInstanceWithConfig(ctx context.Context, config *paramtable.Ka
 		}
 	}
 
+	return kafkaConfig
+}
+
+func NewKafkaClientInstanceWithConfig(ctx context.Context, config *paramtable.KafkaConfig) (*kafkaClient, error) {
+	// connection setup timeout, default as 30000ms, available range is [1000, 2147483647]
+	if deadline, ok := ctx.Deadline(); ok {
+		if deadline.Before(time.Now()) {
+			return nil, errors.New("context timeout when new kafka client")
+		}
+		// timeout := time.Until(deadline).Milliseconds()
+		// kafkaConfig.SetKey("socket.connection.setup.timeout.ms", strconv.FormatInt(timeout, 10))
+	}
+
+	kafkaConfig := GetBasicConfig(config)
 	specExtraConfig := func(config map[string]string) kafka.ConfigMap {
 		kafkaConfigMap := make(kafka.ConfigMap, len(config))
 		for k, v := range config {
@@ -136,6 +141,7 @@ func (kc *kafkaClient) getKafkaProducer() (*kafka.Producer, error) {
 	if p := producer.Load(); p != nil {
 		return p, nil
 	}
+	log := log.Ctx(context.TODO())
 	p, err, _ := sf.Do("kafka_producer", func() (*kafka.Producer, error) {
 		if p := producer.Load(); p != nil {
 			return p, nil
@@ -200,7 +206,7 @@ func (kc *kafkaClient) newConsumerConfig(group string, offset common.Subscriptio
 	return newConf
 }
 
-func (kc *kafkaClient) CreateProducer(options common.ProducerOptions) (mqwrapper.Producer, error) {
+func (kc *kafkaClient) CreateProducer(ctx context.Context, options common.ProducerOptions) (mqwrapper.Producer, error) {
 	start := timerecord.NewTimeRecorder("create producer")
 	metrics.MsgStreamOpCounter.WithLabelValues(metrics.CreateProducerLabel, metrics.TotalLabel).Inc()
 
@@ -214,12 +220,11 @@ func (kc *kafkaClient) CreateProducer(options common.ProducerOptions) (mqwrapper
 	metrics.MsgStreamRequestLatency.WithLabelValues(metrics.CreateProducerLabel).Observe(float64(elapsed.Milliseconds()))
 	metrics.MsgStreamOpCounter.WithLabelValues(metrics.CreateProducerLabel, metrics.SuccessLabel).Inc()
 
-	deliveryChan := make(chan kafka.Event, 128)
-	producer := &kafkaProducer{p: pp, deliveryChan: deliveryChan, topic: options.Topic}
+	producer := &kafkaProducer{p: pp, stopCh: make(chan struct{}), topic: options.Topic}
 	return producer, nil
 }
 
-func (kc *kafkaClient) Subscribe(options mqwrapper.ConsumerOptions) (mqwrapper.Consumer, error) {
+func (kc *kafkaClient) Subscribe(ctx context.Context, options mqwrapper.ConsumerOptions) (mqwrapper.Consumer, error) {
 	start := timerecord.NewTimeRecorder("create consumer")
 	metrics.MsgStreamOpCounter.WithLabelValues(metrics.CreateConsumerLabel, metrics.TotalLabel).Inc()
 
@@ -236,7 +241,7 @@ func (kc *kafkaClient) Subscribe(options mqwrapper.ConsumerOptions) (mqwrapper.C
 }
 
 func (kc *kafkaClient) EarliestMessageID() common.MessageID {
-	return &kafkaID{messageID: int64(kafka.OffsetBeginning)}
+	return &KafkaID{MessageID: int64(kafka.OffsetBeginning)}
 }
 
 func (kc *kafkaClient) StringToMsgID(id string) (common.MessageID, error) {
@@ -245,13 +250,13 @@ func (kc *kafkaClient) StringToMsgID(id string) (common.MessageID, error) {
 		return nil, err
 	}
 
-	return &kafkaID{messageID: offset}, nil
+	return &KafkaID{MessageID: offset}, nil
 }
 
 func (kc *kafkaClient) specialExtraConfig(current *kafka.ConfigMap, special kafka.ConfigMap) {
 	for k, v := range special {
 		if existingConf, _ := current.Get(k, nil); existingConf != nil {
-			log.Warn(fmt.Sprintf("The existing config :  %v=%v  will be covered by the speciled kafka config :  %v.", k, v, existingConf))
+			log.Warn(fmt.Sprintf("The existing config :  %v=%v  will be covered by the special kafka config :  %v.", k, v, existingConf))
 		}
 
 		current.SetKey(k, v)
@@ -260,7 +265,7 @@ func (kc *kafkaClient) specialExtraConfig(current *kafka.ConfigMap, special kafk
 
 func (kc *kafkaClient) BytesToMsgID(id []byte) (common.MessageID, error) {
 	offset := DeserializeKafkaID(id)
-	return &kafkaID{messageID: offset}, nil
+	return &KafkaID{MessageID: offset}, nil
 }
 
 func (kc *kafkaClient) Close() {

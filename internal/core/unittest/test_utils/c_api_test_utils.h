@@ -23,15 +23,16 @@
 
 #include "common/Types.h"
 #include "common/type_c.h"
+#include "common/VectorTrait.h"
 #include "pb/plan.pb.h"
 #include "segcore/Collection.h"
-#include "segcore/Reduce.h"
+#include "segcore/reduce/Reduce.h"
 #include "segcore/reduce_c.h"
 #include "segcore/segment_c.h"
 #include "futures/Future.h"
+#include "futures/future_c.h"
 #include "DataGen.h"
 #include "PbHelper.h"
-#include "c_api_test_utils.h"
 #include "indexbuilder_test_utils.h"
 
 using namespace milvus;
@@ -65,35 +66,39 @@ generate_max_float_query_data(int all_nq, int max_float_nq) {
     return blob;
 }
 
+template <class TraitType = milvus::FloatVector>
 std::string
 generate_query_data(int nq) {
     namespace ser = milvus::proto::common;
+    GET_ELEM_TYPE_FOR_VECTOR_TRAIT
+
     std::default_random_engine e(67);
     int dim = DIM;
-    std::normal_distribution<double> dis(0.0, 1.0);
+    std::uniform_int_distribution<int8_t> dis(-128, 127);
     ser::PlaceholderGroup raw_group;
     auto value = raw_group.add_placeholders();
     value->set_tag("$0");
-    value->set_type(ser::PlaceholderType::FloatVector);
+    value->set_type(TraitType::placeholder_type);
     for (int i = 0; i < nq; ++i) {
-        std::vector<float> vec;
-        for (int d = 0; d < dim; ++d) {
-            vec.push_back(dis(e));
+        std::vector<elem_type> vec;
+        for (int d = 0; d < dim / TraitType::dim_factor; ++d) {
+            vec.push_back((elem_type)dis(e));
         }
-        value->add_values(vec.data(), vec.size() * sizeof(float));
+        value->add_values(vec.data(), vec.size() * sizeof(elem_type));
     }
     auto blob = raw_group.SerializeAsString();
     return blob;
 }
-void
-CheckSearchResultDuplicate(const std::vector<CSearchResult>& results) {
-    auto nq = ((SearchResult*)results[0])->total_nq_;
 
+void
+CheckSearchResultDuplicate(const std::vector<CSearchResult>& results,
+                           int group_size = 1) {
+    auto nq = ((SearchResult*)results[0])->total_nq_;
     std::unordered_set<PkType> pk_set;
-    std::unordered_set<GroupByValueType> group_by_val_set;
+    std::unordered_map<GroupByValueType, int> group_by_map;
     for (int qi = 0; qi < nq; qi++) {
         pk_set.clear();
-        group_by_val_set.clear();
+        group_by_map.clear();
         for (size_t i = 0; i < results.size(); i++) {
             auto search_result = (SearchResult*)results[i];
             ASSERT_EQ(nq, search_result->total_nq_);
@@ -108,36 +113,69 @@ CheckSearchResultDuplicate(const std::vector<CSearchResult>& results) {
                     search_result->group_by_values_.value().size() > ki) {
                     auto group_by_val =
                         search_result->group_by_values_.value()[ki];
-                    ASSERT_TRUE(group_by_val_set.count(group_by_val) == 0);
-                    group_by_val_set.insert(group_by_val);
+                    group_by_map[group_by_val] += 1;
+                    ASSERT_TRUE(group_by_map[group_by_val] <= group_size);
                 }
             }
         }
     }
 }
 
-const char*
+template <class TraitType = milvus::FloatVector>
+const std::string
 get_default_schema_config() {
+    auto fmt = boost::format(R"(name: "default-collection"
+                                fields: <
+                                  fieldID: 100
+                                  name: "fakevec"
+                                  data_type: %1%
+                                  type_params: <
+                                    key: "dim"
+                                    value: "16"
+                                  >
+                                  index_params: <
+                                    key: "metric_type"
+                                    value: "L2"
+                                  >
+                                >
+                                fields: <
+                                  fieldID: 101
+                                  name: "age"
+                                  data_type: Int64
+                                  is_primary_key: true
+                                >)") %
+               (int(TraitType::data_type));
+    return fmt.str();
+}
+
+const char*
+get_default_schema_config_nullable() {
     static std::string conf = R"(name: "default-collection"
-                            fields: <
-                              fieldID: 100
-                              name: "fakevec"
-                              data_type: FloatVector
-                              type_params: <
-                                key: "dim"
-                                value: "16"
-                              >
-                              index_params: <
-                                key: "metric_type"
-                                value: "L2"
-                              >
-                            >
-                            fields: <
-                              fieldID: 101
-                              name: "age"
-                              data_type: Int64
-                              is_primary_key: true
-                            >)";
+                                fields: <
+                                  fieldID: 100
+                                  name: "fakevec"
+                                  data_type: FloatVector
+                                  type_params: <
+                                    key: "dim"
+                                    value: "16"
+                                  >
+                                  index_params: <
+                                    key: "metric_type"
+                                    value: "L2"
+                                  >
+                                >
+                                fields: <
+                                  fieldID: 101
+                                  name: "age"
+                                  data_type: Int64
+                                  is_primary_key: true
+                                >
+                                fields: <
+                                  fieldID: 102
+                                  name: "nullable"
+                                  data_type: Int32
+                                  nullable:true
+                                >)";
     static std::string fake_conf = "";
     return conf.c_str();
 }
@@ -149,7 +187,7 @@ CSearch(CSegmentInterface c_segment,
         uint64_t timestamp,
         CSearchResult* result) {
     auto future =
-        AsyncSearch({}, c_segment, c_plan, c_placeholder_group, timestamp);
+        AsyncSearch({}, c_segment, c_plan, c_placeholder_group, timestamp, 0);
     auto futurePtr = static_cast<milvus::futures::IFuture*>(
         static_cast<void*>(static_cast<CFuture*>(future)));
 
@@ -161,6 +199,8 @@ CSearch(CSegmentInterface c_segment,
     mu.lock();
 
     auto [searchResult, status] = futurePtr->leakyGet();
+    future_destroy(future);
+
     if (status.error_code != 0) {
         return status;
     }

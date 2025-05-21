@@ -17,20 +17,23 @@
 package paramtable
 
 import (
-	"fmt"
+	"strconv"
+
+	"github.com/cockroachdb/errors"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/config"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/util/indexparamcheck"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/metric"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 // /////////////////////////////////////////////////////////////////////////////
 // --- common ---
-type autoIndexConfig struct {
-	Enable         ParamItem `refreshable:"true"`
-	EnableOptimize ParamItem `refreshable:"true"`
+type AutoIndexConfig struct {
+	Enable                 ParamItem `refreshable:"true"`
+	EnableOptimize         ParamItem `refreshable:"true"`
+	EnableResultLimitCheck ParamItem `refreshable:"true"`
 
 	IndexParams           ParamItem  `refreshable:"true"`
 	SparseIndexParams     ParamItem  `refreshable:"true"`
@@ -46,11 +49,19 @@ type autoIndexConfig struct {
 	ScalarAutoIndexEnable  ParamItem `refreshable:"true"`
 	ScalarAutoIndexParams  ParamItem `refreshable:"true"`
 	ScalarNumericIndexType ParamItem `refreshable:"true"`
+	ScalarIntIndexType     ParamItem `refreshable:"true"`
 	ScalarVarcharIndexType ParamItem `refreshable:"true"`
 	ScalarBoolIndexType    ParamItem `refreshable:"true"`
+	ScalarFloatIndexType   ParamItem `refreshable:"true"`
+
+	BitmapCardinalityLimit ParamItem `refreshable:"true"`
 }
 
-func (p *autoIndexConfig) init(base *BaseTable) {
+const (
+	DefaultBitmapCardinalityLimit = 100
+)
+
+func (p *AutoIndexConfig) init(base *BaseTable) {
 	p.Enable = ParamItem{
 		Key:          "autoIndex.enable",
 		Version:      "2.2.0",
@@ -67,10 +78,19 @@ func (p *autoIndexConfig) init(base *BaseTable) {
 	}
 	p.EnableOptimize.Init(base.mgr)
 
+	p.EnableResultLimitCheck = ParamItem{
+		Key:          "autoIndex.resultLimitCheck",
+		Version:      "2.5.0",
+		DefaultValue: "true",
+		PanicIfEmpty: true,
+	}
+	p.EnableResultLimitCheck.Init(base.mgr)
+
 	p.IndexParams = ParamItem{
 		Key:          "autoIndex.params.build",
 		Version:      "2.2.0",
-		DefaultValue: `{"M": 18,"efConstruction": 240,"index_type": "HNSW", "metric_type": "IP"}`,
+		DefaultValue: `{"M": 18,"efConstruction": 240,"index_type": "HNSW", "metric_type": "COSINE"}`,
+		Formatter:    GetBuildParamFormatter(FloatVectorDefaultMetricType, "autoIndex.params.build"),
 		Export:       true,
 	}
 	p.IndexParams.Init(base.mgr)
@@ -79,6 +99,7 @@ func (p *autoIndexConfig) init(base *BaseTable) {
 		Key:          "autoIndex.params.sparse.build",
 		Version:      "2.4.5",
 		DefaultValue: `{"index_type": "SPARSE_INVERTED_INDEX", "metric_type": "IP"}`,
+		Formatter:    GetBuildParamFormatter(SparseFloatVectorDefaultMetricType, "autoIndex.params.sparse.build"),
 		Export:       true,
 	}
 	p.SparseIndexParams.Init(base.mgr)
@@ -86,7 +107,8 @@ func (p *autoIndexConfig) init(base *BaseTable) {
 	p.BinaryIndexParams = ParamItem{
 		Key:          "autoIndex.params.binary.build",
 		Version:      "2.4.5",
-		DefaultValue: `{"nlist": 1024, "index_type": "BIN_IVF_FLAT", "metric_type": "JACCARD"}`,
+		DefaultValue: `{"nlist": 1024, "index_type": "BIN_IVF_FLAT", "metric_type": "HAMMING"}`,
+		Formatter:    GetBuildParamFormatter(BinaryVectorDefaultMetricType, "autoIndex.params.sparse.build"),
 		Export:       true,
 	}
 	p.BinaryIndexParams.Init(base.mgr)
@@ -139,8 +161,6 @@ func (p *autoIndexConfig) init(base *BaseTable) {
 	}
 	p.AutoIndexTuningConfig.Init(base.mgr)
 
-	p.panicIfNotValidAndSetDefaultMetricType(base.mgr)
-
 	p.ScalarAutoIndexEnable = ParamItem{
 		Key:          "scalarAutoIndex.enable",
 		Version:      "2.4.0",
@@ -152,10 +172,11 @@ func (p *autoIndexConfig) init(base *BaseTable) {
 	p.ScalarAutoIndexParams = ParamItem{
 		Key:          "scalarAutoIndex.params.build",
 		Version:      "2.4.0",
-		DefaultValue: `{"numeric": "INVERTED","varchar": "INVERTED","bool": "INVERTED"}`,
+		DefaultValue: `{"int": "HYBRID","varchar": "HYBRID","bool": "BITMAP", "float": "INVERTED"}`,
 	}
 	p.ScalarAutoIndexParams.Init(base.mgr)
 
+	// Deprecated param
 	p.ScalarNumericIndexType = ParamItem{
 		Version: "2.4.0",
 		Formatter: func(v string) string {
@@ -167,6 +188,38 @@ func (p *autoIndexConfig) init(base *BaseTable) {
 		},
 	}
 	p.ScalarNumericIndexType.Init(base.mgr)
+
+	p.ScalarIntIndexType = ParamItem{
+		Version: "2.5.0",
+		Formatter: func(v string) string {
+			m := p.ScalarAutoIndexParams.GetAsJSONMap()
+			if m == nil {
+				return ""
+			}
+			return m["int"]
+		},
+	}
+	p.ScalarIntIndexType.Init(base.mgr)
+
+	p.ScalarFloatIndexType = ParamItem{
+		Version: "2.5.0",
+		Formatter: func(v string) string {
+			m := p.ScalarAutoIndexParams.GetAsJSONMap()
+			if m == nil {
+				return ""
+			}
+			return m["float"]
+		},
+	}
+	p.ScalarFloatIndexType.Init(base.mgr)
+
+	p.BitmapCardinalityLimit = ParamItem{
+		Key:          "scalarAutoIndex.params.bitmapCardinalityLimit",
+		Version:      "2.5.0",
+		DefaultValue: strconv.Itoa(DefaultBitmapCardinalityLimit),
+		Export:       true,
+	}
+	p.BitmapCardinalityLimit.Init(base.mgr)
 
 	p.ScalarVarcharIndexType = ParamItem{
 		Version: "2.4.0",
@@ -193,37 +246,47 @@ func (p *autoIndexConfig) init(base *BaseTable) {
 	p.ScalarBoolIndexType.Init(base.mgr)
 }
 
-func (p *autoIndexConfig) panicIfNotValidAndSetDefaultMetricType(mgr *config.Manager) {
-	p.panicIfNotValidAndSetDefaultMetricTypeHelper(p.IndexParams.Key, p.IndexParams.GetAsJSONMap(), schemapb.DataType_FloatVector, mgr)
-	p.panicIfNotValidAndSetDefaultMetricTypeHelper(p.BinaryIndexParams.Key, p.BinaryIndexParams.GetAsJSONMap(), schemapb.DataType_BinaryVector, mgr)
-	p.panicIfNotValidAndSetDefaultMetricTypeHelper(p.SparseIndexParams.Key, p.SparseIndexParams.GetAsJSONMap(), schemapb.DataType_SparseFloatVector, mgr)
+func setDefaultIfNotExist(params map[string]string, key string, defaultValue string) {
+	_, exist := params[key]
+	if !exist {
+		params[key] = defaultValue
+	}
 }
 
-func (p *autoIndexConfig) panicIfNotValidAndSetDefaultMetricTypeHelper(key string, m map[string]string, dtype schemapb.DataType, mgr *config.Manager) {
-	if m == nil {
-		panic(fmt.Sprintf("%s invalid, should be json format", key))
+const (
+	FloatVectorDefaultMetricType       = metric.COSINE
+	SparseFloatVectorDefaultMetricType = metric.IP
+	BinaryVectorDefaultMetricType      = metric.HAMMING
+	IntVectorDefaultMetricType         = metric.COSINE
+)
+
+func SetDefaultMetricTypeIfNotExist(dType schemapb.DataType, params map[string]string) {
+	if typeutil.IsDenseFloatVectorType(dType) {
+		setDefaultIfNotExist(params, common.MetricTypeKey, FloatVectorDefaultMetricType)
+	} else if typeutil.IsSparseFloatVectorType(dType) {
+		setDefaultIfNotExist(params, common.MetricTypeKey, SparseFloatVectorDefaultMetricType)
+	} else if typeutil.IsBinaryVectorType(dType) {
+		setDefaultIfNotExist(params, common.MetricTypeKey, BinaryVectorDefaultMetricType)
+	} else if typeutil.IsIntVectorType(dType) {
+		setDefaultIfNotExist(params, common.MetricTypeKey, IntVectorDefaultMetricType)
 	}
-
-	indexType, ok := m[common.IndexTypeKey]
-	if !ok {
-		panic(fmt.Sprintf("%s invalid, index type not found", key))
-	}
-
-	checker, err := indexparamcheck.GetIndexCheckerMgrInstance().GetChecker(indexType)
-	if err != nil {
-		panic(fmt.Sprintf("%s invalid, unsupported index type: %s", key, indexType))
-	}
-
-	checker.SetDefaultMetricTypeIfNotExist(m, dtype)
-
-	if err := checker.StaticCheck(m); err != nil {
-		panic(fmt.Sprintf("%s invalid, parameters invalid, error: %s", key, err.Error()))
-	}
-
-	p.reset(key, m, mgr)
 }
 
-func (p *autoIndexConfig) reset(key string, m map[string]string, mgr *config.Manager) {
-	j := funcutil.MapToJSON(m)
-	mgr.SetConfig(key, string(j))
+func GetBuildParamFormatter(defaultMetricsType metric.MetricType, tag string) func(string) string {
+	return func(originValue string) string {
+		m, err := funcutil.JSONToMap(originValue)
+		if err != nil {
+			panic(errors.Wrapf(err, "failed to parse %s config value", tag))
+		}
+		_, ok := m[common.MetricTypeKey]
+		if ok {
+			return originValue
+		}
+		m[common.MetricTypeKey] = defaultMetricsType
+		ret, err := funcutil.MapToJSON(m)
+		if err != nil {
+			panic(errors.Wrapf(err, "failed to convert updated %s map to json", tag))
+		}
+		return ret
+	}
 }

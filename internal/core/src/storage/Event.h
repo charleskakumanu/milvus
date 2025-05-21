@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <any>
 #include <string>
 #include <memory>
 #include <vector>
@@ -23,6 +24,7 @@
 
 #include "common/FieldData.h"
 #include "common/Types.h"
+#include "storage/PayloadReader.h"
 #include "storage/Types.h"
 #include "storage/BinlogReader.h"
 
@@ -46,8 +48,6 @@ struct DescriptorEventDataFixPart {
     int64_t partition_id;
     int64_t segment_id;
     int64_t field_id;
-    //(todo:smellthemoon) set nullable false temporarily, will change it
-    bool nullable = false;
     Timestamp start_timestamp;
     Timestamp end_timestamp;
     milvus::proto::schema::DataType data_type;
@@ -63,7 +63,7 @@ struct DescriptorEventData {
     DescriptorEventDataFixPart fix_part;
     int32_t extra_length;
     std::vector<uint8_t> extra_bytes;
-    std::unordered_map<std::string, std::string> extras;
+    std::unordered_map<std::string, std::any> extras;
     std::vector<uint8_t> post_header_lengths;
 
     DescriptorEventData() = default;
@@ -76,12 +76,13 @@ struct DescriptorEventData {
 struct BaseEventData {
     Timestamp start_timestamp;
     Timestamp end_timestamp;
-    FieldDataPtr field_data;
-
+    std::shared_ptr<PayloadReader> payload_reader;
     BaseEventData() = default;
     explicit BaseEventData(BinlogReaderPtr reader,
                            int event_length,
-                           DataType data_type);
+                           DataType data_type,
+                           bool nullable,
+                           bool is_field_data = true);
 
     std::vector<uint8_t>
     Serialize();
@@ -104,7 +105,9 @@ struct BaseEvent {
     int64_t event_offset;
 
     BaseEvent() = default;
-    explicit BaseEvent(BinlogReaderPtr reader, DataType data_type);
+    explicit BaseEvent(BinlogReaderPtr reader,
+                       DataType data_type,
+                       bool nullable);
 
     std::vector<uint8_t>
     Serialize();
@@ -112,10 +115,10 @@ struct BaseEvent {
 
 using InsertEvent = BaseEvent;
 using InsertEventData = BaseEventData;
-using IndexEvent = BaseEvent;
-using IndexEventData = BaseEventData;
 using DeleteEvent = BaseEvent;
 using DeleteEventData = BaseEventData;
+using IndexEvent = BaseEvent;
+using IndexEventData = BaseEventData;
 using CreateCollectionEvent = BaseEvent;
 using CreateCollectionEventData = BaseEventData;
 using CreatePartitionEvent = BaseEvent;

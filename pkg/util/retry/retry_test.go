@@ -18,10 +18,9 @@ import (
 	"time"
 
 	"github.com/cockroachdb/errors"
-	"github.com/lingdor/stackerror"
 	"github.com/stretchr/testify/assert"
 
-	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 )
 
 func TestDo(t *testing.T) {
@@ -51,13 +50,24 @@ func TestAttempts(t *testing.T) {
 	err := Do(ctx, testFn, Attempts(1))
 	assert.Error(t, err)
 	t.Log(err)
+
+	ctx = context.Background()
+	testOperation := 0
+	testFn = func() error {
+		testOperation++
+		return nil
+	}
+
+	err = Do(ctx, testFn, AttemptAlways())
+	assert.Equal(t, testOperation, 1)
+	assert.NoError(t, err)
 }
 
 func TestMaxSleepTime(t *testing.T) {
 	ctx := context.Background()
 
 	testFn := func() error {
-		return fmt.Errorf("some error")
+		return errors.New("some error")
 	}
 
 	err := Do(ctx, testFn, Attempts(3), MaxSleepTime(200*time.Millisecond))
@@ -75,7 +85,7 @@ func TestSleep(t *testing.T) {
 	ctx := context.Background()
 
 	testFn := func() error {
-		return fmt.Errorf("some error")
+		return errors.New("some error")
 	}
 
 	err := Do(ctx, testFn, Attempts(3), Sleep(500*time.Millisecond))
@@ -87,7 +97,7 @@ func TestAllError(t *testing.T) {
 	ctx := context.Background()
 
 	testFn := func() error {
-		return stackerror.New("some error")
+		return errors.New("some error")
 	}
 
 	err := Do(ctx, testFn, Attempts(3))
@@ -116,7 +126,7 @@ func TestContextDeadline(t *testing.T) {
 	defer cancel()
 
 	testFn := func() error {
-		return fmt.Errorf("some error")
+		return errors.New("some error")
 	}
 
 	err := Do(ctx, testFn)

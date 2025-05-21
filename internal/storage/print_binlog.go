@@ -17,17 +17,17 @@
 package storage
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 
 	"github.com/cockroachdb/errors"
-	"github.com/golang/protobuf/proto"
 	"golang.org/x/exp/mmap"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/pkg/util/tsoutil"
+	"github.com/milvus-io/milvus/internal/json"
+	"github.com/milvus-io/milvus/pkg/v2/util/tsoutil"
 )
 
 // PrintBinlogFiles call printBinlogFile in turn for the file list specified by parameter fileList.

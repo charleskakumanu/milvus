@@ -19,11 +19,14 @@ package info
 import (
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/samber/lo"
 
-	"github.com/milvus-io/milvus/pkg/util/requestutil"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus/pkg/v2/util/requestutil"
 )
 
 const (
@@ -31,6 +34,7 @@ const (
 	ContextReturnCode    = "code"
 	ContextReturnMessage = "message"
 	ContextRequest       = "request"
+	ContextToken         = "token"
 )
 
 type RestfulInfo struct {
@@ -40,7 +44,7 @@ type RestfulInfo struct {
 }
 
 func NewRestfulInfo() *RestfulInfo {
-	return &RestfulInfo{start: time.Now()}
+	return &RestfulInfo{start: time.Now(), params: &gin.LogFormatterParams{}}
 }
 
 func (i *RestfulInfo) SetParams(p *gin.LogFormatterParams) {
@@ -95,11 +99,21 @@ func (i *RestfulInfo) MethodStatus() string {
 		return fmt.Sprintf("HttpError%d", i.params.StatusCode)
 	}
 
-	if code, ok := i.params.Keys[ContextReturnCode]; !ok || code.(int32) != 0 {
-		return "Failed"
+	value, ok := i.params.Keys[ContextReturnCode]
+	if !ok {
+		return Unknown
 	}
 
-	return "Successful"
+	code, ok := value.(int32)
+	if ok {
+		if code != 0 {
+			return "Failed"
+		}
+
+		return "Successful"
+	}
+
+	return Unknown
 }
 
 func (i *RestfulInfo) UserName() string {
@@ -128,7 +142,11 @@ func (i *RestfulInfo) ErrorMsg() string {
 	if !ok {
 		return ""
 	}
-	return fmt.Sprint(message)
+	return strings.ReplaceAll(message.(string), "\n", "\\n")
+}
+
+func (i *RestfulInfo) ErrorType() string {
+	return Unknown
 }
 
 func (i *RestfulInfo) SdkVersion() string {
@@ -171,6 +189,10 @@ func (i *RestfulInfo) Expression() string {
 		return expr.(string)
 	}
 
+	if req, ok := i.req.(*milvuspb.HybridSearchRequest); ok {
+		return listToString(lo.Map(req.GetRequests(), func(req *milvuspb.SearchRequest, _ int) string { return req.GetDsl() }))
+	}
+
 	dsl, ok := requestutil.GetDSLFromRequest(i.req)
 	if ok {
 		return dsl.(string)
@@ -190,6 +212,46 @@ func (i *RestfulInfo) ConsistencyLevel() string {
 	level, ok := requestutil.GetConsistencyLevelFromRequst(i.req)
 	if ok {
 		return level.String()
+	}
+	return Unknown
+}
+
+func (i *RestfulInfo) AnnsField() string {
+	if req, ok := i.req.(*milvuspb.SearchRequest); ok {
+		return getAnnsFieldFromKvs(req.GetSearchParams())
+	}
+
+	if req, ok := i.req.(*milvuspb.HybridSearchRequest); ok {
+		return listToString(lo.Map(req.GetRequests(), func(req *milvuspb.SearchRequest, _ int) string { return getAnnsFieldFromKvs(req.GetSearchParams()) }))
+	}
+	return Unknown
+}
+
+func (i *RestfulInfo) NQ() string {
+	if req, ok := i.req.(*milvuspb.SearchRequest); ok {
+		return fmt.Sprint(req.GetNq())
+	}
+
+	if req, ok := i.req.(*milvuspb.HybridSearchRequest); ok {
+		return listToString(lo.Map(req.GetRequests(), func(req *milvuspb.SearchRequest, _ int) string { return fmt.Sprint(req.GetNq()) }))
+	}
+	return Unknown
+}
+
+func (i *RestfulInfo) SearchParams() string {
+	if req, ok := i.req.(*milvuspb.SearchRequest); ok {
+		return kvsToString(req.GetSearchParams())
+	}
+
+	if req, ok := i.req.(*milvuspb.HybridSearchRequest); ok {
+		return listToString(lo.Map(req.GetRequests(), func(req *milvuspb.SearchRequest, _ int) string { return kvsToString(req.GetSearchParams()) }))
+	}
+	return Unknown
+}
+
+func (i *RestfulInfo) QueryParams() string {
+	if req, ok := i.req.(*milvuspb.QueryRequest); ok {
+		return kvsToString(req.GetQueryParams())
 	}
 	return Unknown
 }

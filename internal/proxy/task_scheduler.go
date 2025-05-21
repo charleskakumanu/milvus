@@ -19,19 +19,21 @@ package proxy
 import (
 	"container/list"
 	"context"
+	"strconv"
 	"sync"
 	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/mq/msgstream"
-	"github.com/milvus-io/milvus/pkg/util/conc"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/tsoutil"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/metrics"
+	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/v2/util/conc"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/tsoutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 type taskQueue interface {
@@ -87,7 +89,7 @@ func (queue *baseTaskQueue) addUnissuedTask(t task) error {
 	defer queue.utLock.Unlock()
 
 	if queue.utFull() {
-		return merr.WrapErrServiceRequestLimitExceeded(int32(queue.getMaxTaskNum()))
+		return merr.WrapErrTooManyRequests(int32(queue.getMaxTaskNum()))
 	}
 	queue.unissuedTasks.PushBack(t)
 	queue.utBufChan <- 1
@@ -125,7 +127,7 @@ func (queue *baseTaskQueue) AddActiveTask(t task) {
 	tID := t.ID()
 	_, ok := queue.activeTasks[tID]
 	if ok {
-		log.Warn("Proxy task with tID already in active task list!", zap.Int64("ID", tID))
+		log.Ctx(t.TraceCtx()).Warn("Proxy task with tID already in active task list!", zap.Int64("ID", tID))
 	}
 
 	queue.activeTasks[tID] = t
@@ -140,7 +142,7 @@ func (queue *baseTaskQueue) PopActiveTask(taskID UniqueID) task {
 		return t
 	}
 
-	log.Warn("Proxy task not in active task list! ts", zap.Int64("taskID", taskID))
+	log.Ctx(context.TODO()).Warn("Proxy task not in active task list! ts", zap.Int64("taskID", taskID))
 	return t
 }
 
@@ -190,6 +192,7 @@ func (queue *baseTaskQueue) Enqueue(t task) error {
 	t.SetTs(ts)
 	t.SetID(id)
 
+	t.SetOnEnqueueTime()
 	return queue.addUnissuedTask(t)
 }
 
@@ -225,6 +228,18 @@ type ddTaskQueue struct {
 	lock sync.Mutex
 }
 
+func (queue *ddTaskQueue) updateMetrics() {
+	queue.utLock.RLock()
+	unissuedTasksNum := queue.unissuedTasks.Len()
+	queue.utLock.RUnlock()
+	queue.atLock.RLock()
+	activateTaskNum := len(queue.activeTasks)
+	queue.atLock.RUnlock()
+
+	metrics.ProxyQueueTaskNum.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), "ddl", metrics.UnissuedIndexTaskLabel).Set(float64(unissuedTasksNum))
+	metrics.ProxyQueueTaskNum.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), "ddl", metrics.InProgressIndexTaskLabel).Set(float64(activateTaskNum))
+}
+
 type pChanStatInfo struct {
 	pChanStatistics
 	tsSet map[Timestamp]struct{}
@@ -238,6 +253,18 @@ type dmTaskQueue struct {
 	pChanStatisticsInfos map[pChan]*pChanStatInfo
 }
 
+func (queue *dmTaskQueue) updateMetrics() {
+	queue.utLock.RLock()
+	unissuedTasksNum := queue.unissuedTasks.Len()
+	queue.utLock.RUnlock()
+	queue.atLock.RLock()
+	activateTaskNum := len(queue.activeTasks)
+	queue.atLock.RUnlock()
+
+	metrics.ProxyQueueTaskNum.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), "dml", metrics.UnissuedIndexTaskLabel).Set(float64(unissuedTasksNum))
+	metrics.ProxyQueueTaskNum.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), "dml", metrics.InProgressIndexTaskLabel).Set(float64(activateTaskNum))
+}
+
 func (queue *dmTaskQueue) Enqueue(t task) error {
 	// This statsLock has two functions:
 	//	1) Protect member pChanStatisticsInfos
@@ -247,7 +274,7 @@ func (queue *dmTaskQueue) Enqueue(t task) error {
 	dmt := t.(dmlTask)
 	err := dmt.setChannels()
 	if err != nil {
-		log.Warn("setChannels failed when Enqueue", zap.Int64("taskID", t.ID()), zap.Error(err))
+		log.Ctx(t.TraceCtx()).Warn("setChannels failed when Enqueue", zap.Int64("taskID", t.ID()), zap.Error(err))
 		return err
 	}
 
@@ -276,10 +303,10 @@ func (queue *dmTaskQueue) PopActiveTask(taskID UniqueID) task {
 		defer queue.statsLock.Unlock()
 
 		delete(queue.activeTasks, taskID)
-		log.Debug("Proxy dmTaskQueue popPChanStats", zap.Int64("taskID", t.ID()))
+		log.Ctx(t.TraceCtx()).Debug("Proxy dmTaskQueue popPChanStats", zap.Int64("taskID", t.ID()))
 		queue.popPChanStats(t)
 	} else {
-		log.Warn("Proxy task not in active task list!", zap.Int64("taskID", taskID))
+		log.Ctx(context.TODO()).Warn("Proxy task not in active task list!", zap.Int64("taskID", taskID))
 	}
 	return t
 }
@@ -356,6 +383,18 @@ func (queue *dmTaskQueue) getPChanStatsInfo() (map[pChan]*pChanStatistics, error
 // dqTaskQueue represents queue for DQL task such as search/query
 type dqTaskQueue struct {
 	*baseTaskQueue
+}
+
+func (queue *dqTaskQueue) updateMetrics() {
+	queue.utLock.RLock()
+	unissuedTasksNum := queue.unissuedTasks.Len()
+	queue.utLock.RUnlock()
+	queue.atLock.RLock()
+	activateTaskNum := len(queue.activeTasks)
+	queue.atLock.RUnlock()
+
+	metrics.ProxyQueueTaskNum.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), "dql", metrics.UnissuedIndexTaskLabel).Set(float64(unissuedTasksNum))
+	metrics.ProxyQueueTaskNum.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), "dql", metrics.InProgressIndexTaskLabel).Set(float64(activateTaskNum))
 }
 
 func (queue *ddTaskQueue) Enqueue(t task) error {
@@ -454,6 +493,11 @@ func (sched *taskScheduler) processTask(t task, q taskQueue) {
 	}()
 	span.AddEvent("scheduler process PreExecute")
 
+	waitDuration := t.GetDurationInQueue()
+	metrics.ProxyReqInQueueLatency.
+		WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), t.Type().String()).
+		Observe(float64(waitDuration.Milliseconds()))
+
 	err := t.PreExecute(ctx)
 
 	defer func() {
@@ -485,6 +529,9 @@ func (sched *taskScheduler) processTask(t task, q taskQueue) {
 // definitionLoop schedules the ddl tasks.
 func (sched *taskScheduler) definitionLoop() {
 	defer sched.wg.Done()
+
+	pool := conc.NewPool[struct{}](paramtable.Get().ProxyCfg.DDLConcurrency.GetAsInt(), conc.WithExpiryDuration(time.Minute))
+	defer pool.Release()
 	for {
 		select {
 		case <-sched.ctx.Done():
@@ -492,8 +539,12 @@ func (sched *taskScheduler) definitionLoop() {
 		case <-sched.ddQueue.utChan():
 			if !sched.ddQueue.utEmpty() {
 				t := sched.scheduleDdTask()
-				sched.processTask(t, sched.ddQueue)
+				pool.Submit(func() (struct{}, error) {
+					sched.processTask(t, sched.ddQueue)
+					return struct{}{}, nil
+				})
 			}
+			sched.ddQueue.updateMetrics()
 		}
 	}
 }
@@ -501,6 +552,9 @@ func (sched *taskScheduler) definitionLoop() {
 // controlLoop schedule the data control operation, such as flush
 func (sched *taskScheduler) controlLoop() {
 	defer sched.wg.Done()
+
+	pool := conc.NewPool[struct{}](paramtable.Get().ProxyCfg.DCLConcurrency.GetAsInt(), conc.WithExpiryDuration(time.Minute))
+	defer pool.Release()
 	for {
 		select {
 		case <-sched.ctx.Done():
@@ -508,8 +562,12 @@ func (sched *taskScheduler) controlLoop() {
 		case <-sched.dcQueue.utChan():
 			if !sched.dcQueue.utEmpty() {
 				t := sched.scheduleDcTask()
-				sched.processTask(t, sched.dcQueue)
+				pool.Submit(func() (struct{}, error) {
+					sched.processTask(t, sched.dcQueue)
+					return struct{}{}, nil
+				})
 			}
+			sched.dcQueue.updateMetrics()
 		}
 	}
 }
@@ -517,6 +575,7 @@ func (sched *taskScheduler) controlLoop() {
 func (sched *taskScheduler) manipulationLoop() {
 	defer sched.wg.Done()
 	pool := conc.NewPool[struct{}](paramtable.Get().ProxyCfg.MaxTaskNum.GetAsInt())
+	defer pool.Release()
 	for {
 		select {
 		case <-sched.ctx.Done():
@@ -529,6 +588,7 @@ func (sched *taskScheduler) manipulationLoop() {
 					return struct{}{}, nil
 				})
 			}
+			sched.dmQueue.updateMetrics()
 		}
 	}
 }
@@ -536,7 +596,12 @@ func (sched *taskScheduler) manipulationLoop() {
 func (sched *taskScheduler) queryLoop() {
 	defer sched.wg.Done()
 
-	pool := conc.NewPool[struct{}](paramtable.Get().ProxyCfg.MaxTaskNum.GetAsInt(), conc.WithExpiryDuration(time.Minute))
+	poolSize := paramtable.Get().ProxyCfg.MaxTaskNum.GetAsInt()
+	pool := conc.NewPool[struct{}](poolSize, conc.WithExpiryDuration(time.Minute))
+	subTaskPool := conc.NewPool[struct{}](poolSize, conc.WithExpiryDuration(time.Minute))
+	defer pool.Release()
+	defer subTaskPool.Release()
+
 	for {
 		select {
 		case <-sched.ctx.Done():
@@ -544,13 +609,19 @@ func (sched *taskScheduler) queryLoop() {
 		case <-sched.dqQueue.utChan():
 			if !sched.dqQueue.utEmpty() {
 				t := sched.scheduleDqTask()
-				pool.Submit(func() (struct{}, error) {
+				p := pool
+				// if task is sub task spawned by another, use sub task pool in case of deadlock
+				if t.IsSubTask() {
+					p = subTaskPool
+				}
+				p.Submit(func() (struct{}, error) {
 					sched.processTask(t, sched.dqQueue)
 					return struct{}{}, nil
 				})
 			} else {
-				log.Debug("query queue is empty ...")
+				log.Ctx(context.TODO()).Debug("query queue is empty ...")
 			}
+			sched.dqQueue.updateMetrics()
 		}
 	}
 }

@@ -27,10 +27,10 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/util/tsoutil"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/tsoutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 /* #nosec G103 */
@@ -54,10 +54,26 @@ func TestDescriptorEvent(t *testing.T) {
 	err = desc.Write(&buf)
 	assert.Error(t, err)
 
+	// nullable not existed
+	nullable, err := desc.GetNullable()
+	assert.NoError(t, err)
+	assert.False(t, nullable)
+
 	desc.AddExtra(originalSizeKey, fmt.Sprintf("%v", sizeTotal))
+	desc.AddExtra(nullableKey, "not bool format")
+
+	err = desc.Write(&buf)
+	// nullable not formatted
+	assert.Error(t, err)
+
+	desc.AddExtra(nullableKey, true)
 
 	err = desc.Write(&buf)
 	assert.NoError(t, err)
+
+	nullable, err = desc.GetNullable()
+	assert.NoError(t, err)
+	assert.True(t, nullable)
 
 	buffer := buf.Bytes()
 
@@ -89,25 +105,17 @@ func TestDescriptorEvent(t *testing.T) {
 		int(unsafe.Sizeof(partID))+
 		int(unsafe.Sizeof(segID)))
 	assert.Equal(t, fieldID, int64(-1))
-	nullable := UnsafeReadBool(buffer, binary.Size(eventHeader{})+
-		int(unsafe.Sizeof(collID))+
-		int(unsafe.Sizeof(partID))+
-		int(unsafe.Sizeof(segID))+
-		int(unsafe.Sizeof(fieldID)))
-	assert.Equal(t, nullable, false)
 	startTs := UnsafeReadInt64(buffer, binary.Size(eventHeader{})+
 		int(unsafe.Sizeof(collID))+
 		int(unsafe.Sizeof(partID))+
 		int(unsafe.Sizeof(segID))+
-		int(unsafe.Sizeof(fieldID))+
-		int(unsafe.Sizeof(nullable)))
+		int(unsafe.Sizeof(fieldID)))
 	assert.Equal(t, startTs, int64(0))
 	endTs := UnsafeReadInt64(buffer, binary.Size(eventHeader{})+
 		int(unsafe.Sizeof(collID))+
 		int(unsafe.Sizeof(partID))+
 		int(unsafe.Sizeof(segID))+
 		int(unsafe.Sizeof(fieldID))+
-		int(unsafe.Sizeof(nullable))+
 		int(unsafe.Sizeof(startTs)))
 	assert.Equal(t, endTs, int64(0))
 	colType := UnsafeReadInt32(buffer, binary.Size(eventHeader{})+
@@ -115,7 +123,6 @@ func TestDescriptorEvent(t *testing.T) {
 		int(unsafe.Sizeof(partID))+
 		int(unsafe.Sizeof(segID))+
 		int(unsafe.Sizeof(fieldID))+
-		int(unsafe.Sizeof(nullable))+
 		int(unsafe.Sizeof(startTs))+
 		int(unsafe.Sizeof(endTs)))
 	assert.Equal(t, colType, int32(-1))
@@ -125,7 +132,6 @@ func TestDescriptorEvent(t *testing.T) {
 		int(unsafe.Sizeof(partID)) +
 		int(unsafe.Sizeof(segID)) +
 		int(unsafe.Sizeof(fieldID)) +
-		int(unsafe.Sizeof(nullable)) +
 		int(unsafe.Sizeof(startTs)) +
 		int(unsafe.Sizeof(endTs)) +
 		int(unsafe.Sizeof(colType))
@@ -189,7 +195,7 @@ func TestInsertEvent(t *testing.T) {
 	}
 
 	t.Run("insert_bool", func(t *testing.T) {
-		w, err := newInsertEventWriter(schemapb.DataType_Bool, false)
+		w, err := newInsertEventWriter(schemapb.DataType_Bool)
 		assert.NoError(t, err)
 		insertT(t, schemapb.DataType_Bool, w,
 			func(w *insertEventWriter) error {
@@ -205,7 +211,7 @@ func TestInsertEvent(t *testing.T) {
 	})
 
 	t.Run("insert_int8", func(t *testing.T) {
-		w, err := newInsertEventWriter(schemapb.DataType_Int8, false)
+		w, err := newInsertEventWriter(schemapb.DataType_Int8)
 		assert.NoError(t, err)
 		insertT(t, schemapb.DataType_Int8, w,
 			func(w *insertEventWriter) error {
@@ -221,7 +227,7 @@ func TestInsertEvent(t *testing.T) {
 	})
 
 	t.Run("insert_int16", func(t *testing.T) {
-		w, err := newInsertEventWriter(schemapb.DataType_Int16, false)
+		w, err := newInsertEventWriter(schemapb.DataType_Int16)
 		assert.NoError(t, err)
 		insertT(t, schemapb.DataType_Int16, w,
 			func(w *insertEventWriter) error {
@@ -237,7 +243,7 @@ func TestInsertEvent(t *testing.T) {
 	})
 
 	t.Run("insert_int32", func(t *testing.T) {
-		w, err := newInsertEventWriter(schemapb.DataType_Int32, false)
+		w, err := newInsertEventWriter(schemapb.DataType_Int32)
 		assert.NoError(t, err)
 		insertT(t, schemapb.DataType_Int32, w,
 			func(w *insertEventWriter) error {
@@ -253,7 +259,7 @@ func TestInsertEvent(t *testing.T) {
 	})
 
 	t.Run("insert_int64", func(t *testing.T) {
-		w, err := newInsertEventWriter(schemapb.DataType_Int64, false)
+		w, err := newInsertEventWriter(schemapb.DataType_Int64)
 		assert.NoError(t, err)
 		insertT(t, schemapb.DataType_Int64, w,
 			func(w *insertEventWriter) error {
@@ -269,7 +275,7 @@ func TestInsertEvent(t *testing.T) {
 	})
 
 	t.Run("insert_float32", func(t *testing.T) {
-		w, err := newInsertEventWriter(schemapb.DataType_Float, false)
+		w, err := newInsertEventWriter(schemapb.DataType_Float)
 		assert.NoError(t, err)
 		insertT(t, schemapb.DataType_Float, w,
 			func(w *insertEventWriter) error {
@@ -285,7 +291,7 @@ func TestInsertEvent(t *testing.T) {
 	})
 
 	t.Run("insert_float64", func(t *testing.T) {
-		w, err := newInsertEventWriter(schemapb.DataType_Double, false)
+		w, err := newInsertEventWriter(schemapb.DataType_Double)
 		assert.NoError(t, err)
 		insertT(t, schemapb.DataType_Double, w,
 			func(w *insertEventWriter) error {
@@ -301,7 +307,7 @@ func TestInsertEvent(t *testing.T) {
 	})
 
 	t.Run("insert_binary_vector", func(t *testing.T) {
-		w, err := newInsertEventWriter(schemapb.DataType_BinaryVector, false, 16)
+		w, err := newInsertEventWriter(schemapb.DataType_BinaryVector, WithDim(16))
 		assert.NoError(t, err)
 		insertT(t, schemapb.DataType_BinaryVector, w,
 			func(w *insertEventWriter) error {
@@ -317,7 +323,7 @@ func TestInsertEvent(t *testing.T) {
 	})
 
 	t.Run("insert_float_vector", func(t *testing.T) {
-		w, err := newInsertEventWriter(schemapb.DataType_FloatVector, false, 2)
+		w, err := newInsertEventWriter(schemapb.DataType_FloatVector, WithDim(2))
 		assert.NoError(t, err)
 		insertT(t, schemapb.DataType_FloatVector, w,
 			func(w *insertEventWriter) error {
@@ -333,7 +339,7 @@ func TestInsertEvent(t *testing.T) {
 	})
 
 	t.Run("insert_string", func(t *testing.T) {
-		w, err := newInsertEventWriter(schemapb.DataType_String, false)
+		w, err := newInsertEventWriter(schemapb.DataType_String)
 		assert.NoError(t, err)
 		w.SetEventTimestamp(tsoutil.ComposeTS(10, 0), tsoutil.ComposeTS(100, 0))
 		err = w.AddDataToPayload("1234", nil)
@@ -1095,7 +1101,7 @@ func TestEventReaderError(t *testing.T) {
 }
 
 func TestEventClose(t *testing.T) {
-	w, err := newInsertEventWriter(schemapb.DataType_String, false)
+	w, err := newInsertEventWriter(schemapb.DataType_String)
 	assert.NoError(t, err)
 	w.SetEventTimestamp(tsoutil.ComposeTS(10, 0), tsoutil.ComposeTS(100, 0))
 	err = w.AddDataToPayload("1234", nil)

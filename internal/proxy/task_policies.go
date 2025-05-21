@@ -8,8 +8,8 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/milvus-io/milvus/internal/types"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 )
 
 // type pickShardPolicy func(ctx context.Context, mgr shardClientMgr, query func(UniqueID, types.QueryNode) error, leaders []nodeInfo) error
@@ -33,15 +33,15 @@ func RoundRobinPolicy(
 		leaders := dml2leaders[channel]
 
 		for _, target := range leaders {
-			qn, err := mgr.GetClient(ctx, target.nodeID)
+			qn, err := mgr.GetClient(ctx, target)
 			if err != nil {
-				log.Warn("query channel failed, node not available", zap.String("channel", channel), zap.Int64("nodeID", target.nodeID), zap.Error(err))
+				log.Ctx(ctx).Warn("query channel failed, node not available", zap.String("channel", channel), zap.Int64("nodeID", target.nodeID), zap.Error(err))
 				combineErr = merr.Combine(combineErr, err)
 				continue
 			}
 			err = query(ctx, target.nodeID, qn, channel)
 			if err != nil {
-				log.Warn("query channel failed", zap.String("channel", channel), zap.Int64("nodeID", target.nodeID), zap.Error(err))
+				log.Ctx(ctx).Warn("query channel failed", zap.String("channel", channel), zap.Int64("nodeID", target.nodeID), zap.Error(err))
 				combineErr = merr.Combine(combineErr, err)
 				continue
 			}

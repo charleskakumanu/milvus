@@ -24,19 +24,22 @@ import (
 	"fmt"
 	"net"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/cockroachdb/errors"
+	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	grpcStatus "google.golang.org/grpc/status"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/pkg/util"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 // CheckGrpcReady wait for context timeout, or wait 100ms then send nil to targetCh
@@ -56,6 +59,19 @@ func GetIP(ip string) string {
 	if len(ip) == 0 {
 		return GetLocalIP()
 	}
+	netIP := net.ParseIP(ip)
+	// not a valid ip addr
+	if netIP == nil {
+		log.Warn("cannot parse input ip, treat it as hostname/service name", zap.String("ip", ip))
+		return ip
+	}
+	// only localhost or unicast is acceptable
+	if netIP.IsUnspecified() {
+		panic(errors.Newf(`"%s" in param table is Unspecified IP address and cannot be used`))
+	}
+	if netIP.IsMulticast() || netIP.IsLinkLocalMulticast() || netIP.IsInterfaceLocalMulticast() {
+		panic(errors.Newf(`"%s" in param table is Multicast IP address and cannot be used`))
+	}
 	return ip
 }
 
@@ -63,14 +79,31 @@ func GetIP(ip string) string {
 func GetLocalIP() string {
 	addrs, err := net.InterfaceAddrs()
 	if err == nil {
-		for _, addr := range addrs {
-			ipaddr, ok := addr.(*net.IPNet)
-			if ok && ipaddr.IP.IsGlobalUnicast() && ipaddr.IP.To4() != nil {
-				return ipaddr.IP.String()
-			}
+		ip := GetValidLocalIP(addrs)
+		if len(ip) != 0 {
+			return ip
 		}
 	}
 	return "127.0.0.1"
+}
+
+// GetValidLocalIP return the first valid local ip address
+func GetValidLocalIP(addrs []net.Addr) string {
+	// Search for valid ipv4 addresses
+	for _, addr := range addrs {
+		ipaddr, ok := addr.(*net.IPNet)
+		if ok && ipaddr.IP.IsGlobalUnicast() && ipaddr.IP.To4() != nil {
+			return ipaddr.IP.String()
+		}
+	}
+	// Search for valid ipv6 addresses
+	for _, addr := range addrs {
+		ipaddr, ok := addr.(*net.IPNet)
+		if ok && ipaddr.IP.IsGlobalUnicast() && ipaddr.IP.To16() != nil && ipaddr.IP.To4() == nil {
+			return "[" + ipaddr.IP.String() + "]"
+		}
+	}
+	return ""
 }
 
 // JSONToMap parse the jsonic index parameters to map
@@ -88,10 +121,13 @@ func JSONToMap(mStr string) (map[string]string, error) {
 	return ret, nil
 }
 
-func MapToJSON(m map[string]string) []byte {
+func MapToJSON(m map[string]string) (string, error) {
 	// error won't happen here.
-	bs, _ := json.Marshal(m)
-	return bs
+	bs, err := json.Marshal(m)
+	if err != nil {
+		return "", err
+	}
+	return string(bs), nil
 }
 
 func JSONToRoleDetails(mStr string) (map[string](map[string]([](map[string]string))), error) {
@@ -153,6 +189,15 @@ func GetVecFieldIDs(schema *schemapb.CollectionSchema) []int64 {
 	return vecFieldIDs
 }
 
+func String2KeyValuePair(v string) ([]*commonpb.KeyValuePair, error) {
+	m := make(map[string]string)
+	err := json.Unmarshal([]byte(v), &m)
+	if err != nil {
+		return nil, err
+	}
+	return Map2KeyValuePair(m), nil
+}
+
 func Map2KeyValuePair(datas map[string]string) []*commonpb.KeyValuePair {
 	results := make([]*commonpb.KeyValuePair, len(datas))
 	offset := 0
@@ -209,8 +254,20 @@ func GetAvailablePort() int {
 	return listener.Addr().(*net.TCPAddr).Port
 }
 
+// IsPhysicalChannel checks if the channel is a physical channel
+func IsPhysicalChannel(channel string) bool {
+	i := strings.LastIndex(channel, "_")
+	if i == -1 {
+		return true
+	}
+	return !strings.Contains(channel[i+1:], "v")
+}
+
 // ToPhysicalChannel get physical channel name from virtual channel name
 func ToPhysicalChannel(vchannel string) string {
+	if IsPhysicalChannel(vchannel) {
+		return vchannel
+	}
 	index := strings.LastIndex(vchannel, "_")
 	if index < 0 {
 		return vchannel
@@ -218,15 +275,31 @@ func ToPhysicalChannel(vchannel string) string {
 	return vchannel[:index]
 }
 
+func GetVirtualChannel(pchannel string, collectionID int64, idx int) string {
+	return fmt.Sprintf("%s_%dv%d", pchannel, collectionID, idx)
+}
+
 // ConvertChannelName assembles channel name according to parameters.
 func ConvertChannelName(chanName string, tokenFrom string, tokenTo string) (string, error) {
 	if tokenFrom == "" {
-		return "", fmt.Errorf("the tokenFrom is empty")
+		return "", errors.New("the tokenFrom is empty")
 	}
 	if !strings.Contains(chanName, tokenFrom) {
 		return "", fmt.Errorf("cannot find token '%s' in '%s'", tokenFrom, chanName)
 	}
 	return strings.Replace(chanName, tokenFrom, tokenTo, 1), nil
+}
+
+func GetCollectionIDFromVChannel(vChannelName string) int64 {
+	re := regexp.MustCompile(`.*_(\d+)v\d+`)
+	matches := re.FindStringSubmatch(vChannelName)
+	if len(matches) > 1 {
+		number, err := strconv.ParseInt(matches[1], 0, 64)
+		if err == nil {
+			return number
+		}
+	}
+	return -1
 }
 
 func getNumRowsOfScalarField(datas interface{}) uint64 {
@@ -281,6 +354,17 @@ func GetNumRowsOfBFloat16VectorField(bf16Datas []byte, dim int64) (uint64, error
 	return uint64((int64(l)) / dim / 2), nil
 }
 
+func GetNumRowsOfInt8VectorField(iDatas []byte, dim int64) (uint64, error) {
+	if dim <= 0 {
+		return 0, fmt.Errorf("dim(%d) should be greater than 0", dim)
+	}
+	l := len(iDatas)
+	if int64(l)%dim != 0 {
+		return 0, fmt.Errorf("the length(%d) of int8 data should divide the dim(%d)", l, dim)
+	}
+	return uint64(int64(l) / dim), nil
+}
+
 // GetNumRowOfFieldDataWithSchema returns num of rows with schema specification.
 func GetNumRowOfFieldDataWithSchema(fieldData *schemapb.FieldData, helper *typeutil.SchemaHelper) (uint64, error) {
 	var fieldNumRows uint64
@@ -300,7 +384,7 @@ func GetNumRowOfFieldDataWithSchema(fieldData *schemapb.FieldData, helper *typeu
 		fieldNumRows = getNumRowsOfScalarField(fieldData.GetScalars().GetFloatData().GetData())
 	case schemapb.DataType_Double:
 		fieldNumRows = getNumRowsOfScalarField(fieldData.GetScalars().GetDoubleData().GetData())
-	case schemapb.DataType_String, schemapb.DataType_VarChar:
+	case schemapb.DataType_String, schemapb.DataType_VarChar, schemapb.DataType_Text:
 		fieldNumRows = getNumRowsOfScalarField(fieldData.GetScalars().GetStringData().GetData())
 	case schemapb.DataType_Array:
 		fieldNumRows = getNumRowsOfScalarField(fieldData.GetScalars().GetArrayData().GetData())
@@ -332,6 +416,12 @@ func GetNumRowOfFieldDataWithSchema(fieldData *schemapb.FieldData, helper *typeu
 		}
 	case schemapb.DataType_SparseFloatVector:
 		fieldNumRows = uint64(len(fieldData.GetVectors().GetSparseFloatVector().GetContents()))
+	case schemapb.DataType_Int8Vector:
+		dim := fieldData.GetVectors().GetDim()
+		fieldNumRows, err = GetNumRowsOfInt8VectorField(fieldData.GetVectors().GetInt8Vector(), dim)
+		if err != nil {
+			return 0, err
+		}
 	default:
 		return 0, fmt.Errorf("%s is not supported now", fieldSchema.GetDataType())
 	}
@@ -395,6 +485,12 @@ func GetNumRowOfFieldData(fieldData *schemapb.FieldData) (uint64, error) {
 			}
 		case *schemapb.VectorField_SparseFloatVector:
 			fieldNumRows = uint64(len(vectorField.GetSparseFloatVector().GetContents()))
+		case *schemapb.VectorField_Int8Vector:
+			dim := vectorField.GetDim()
+			fieldNumRows, err = GetNumRowsOfInt8VectorField(vectorField.GetInt8Vector(), dim)
+			if err != nil {
+				return 0, err
+			}
 		default:
 			return 0, fmt.Errorf("%s is not supported now", vectorFieldType)
 		}

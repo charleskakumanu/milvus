@@ -1,20 +1,22 @@
 package querycoord
 
 import (
+	"context"
 	"sort"
 	"testing"
 
 	"github.com/cockroachdb/errors"
+	"github.com/samber/lo"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
 
 	etcdkv "github.com/milvus-io/milvus/internal/kv/etcd"
 	"github.com/milvus-io/milvus/internal/kv/mocks"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
 	. "github.com/milvus-io/milvus/internal/querycoordv2/params"
-	"github.com/milvus-io/milvus/pkg/kv"
-	"github.com/milvus-io/milvus/pkg/util/etcd"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/kv"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/etcd"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 type CatalogTestSuite struct {
@@ -50,53 +52,57 @@ func (suite *CatalogTestSuite) TearDownTest() {
 }
 
 func (suite *CatalogTestSuite) TestCollection() {
-	suite.catalog.SaveCollection(&querypb.CollectionLoadInfo{
+	ctx := context.Background()
+	suite.catalog.SaveCollection(ctx, &querypb.CollectionLoadInfo{
 		CollectionID: 1,
 	})
 
-	suite.catalog.SaveCollection(&querypb.CollectionLoadInfo{
+	suite.catalog.SaveCollection(ctx, &querypb.CollectionLoadInfo{
 		CollectionID: 2,
 	})
 
-	suite.catalog.SaveCollection(&querypb.CollectionLoadInfo{
+	suite.catalog.SaveCollection(ctx, &querypb.CollectionLoadInfo{
 		CollectionID: 3,
 	})
 
-	suite.catalog.ReleaseCollection(1)
-	suite.catalog.ReleaseCollection(2)
+	suite.catalog.ReleaseCollection(ctx, 1)
+	suite.catalog.ReleaseCollection(ctx, 2)
 
-	collections, err := suite.catalog.GetCollections()
+	collections, err := suite.catalog.GetCollections(ctx)
 	suite.NoError(err)
 	suite.Len(collections, 1)
 }
 
 func (suite *CatalogTestSuite) TestCollectionWithPartition() {
-	suite.catalog.SaveCollection(&querypb.CollectionLoadInfo{
+	ctx := context.Background()
+	suite.catalog.SaveCollection(ctx, &querypb.CollectionLoadInfo{
 		CollectionID: 1,
 	})
 
-	suite.catalog.SaveCollection(&querypb.CollectionLoadInfo{
+	suite.catalog.SaveCollection(ctx, &querypb.CollectionLoadInfo{
 		CollectionID: 2,
 	}, &querypb.PartitionLoadInfo{
 		CollectionID: 2,
 		PartitionID:  102,
 	})
 
-	suite.catalog.SaveCollection(&querypb.CollectionLoadInfo{
+	suite.catalog.SaveCollection(ctx, &querypb.CollectionLoadInfo{
 		CollectionID: 3,
 	}, &querypb.PartitionLoadInfo{
 		CollectionID: 3,
 		PartitionID:  103,
 	})
 
-	suite.catalog.ReleaseCollection(1)
-	suite.catalog.ReleaseCollection(2)
+	suite.catalog.ReleaseCollection(ctx, 1)
+	suite.catalog.ReleaseCollection(ctx, 2)
 
-	collections, err := suite.catalog.GetCollections()
+	collections, err := suite.catalog.GetCollections(ctx)
 	suite.NoError(err)
 	suite.Len(collections, 1)
 	suite.Equal(int64(3), collections[0].GetCollectionID())
-	partitions, err := suite.catalog.GetPartitions()
+	partitions, err := suite.catalog.GetPartitions(ctx, lo.Map(collections, func(collection *querypb.CollectionLoadInfo, _ int) int64 {
+		return collection.GetCollectionID()
+	}))
 	suite.NoError(err)
 	suite.Len(partitions, 1)
 	suite.Len(partitions[int64(3)], 1)
@@ -104,88 +110,138 @@ func (suite *CatalogTestSuite) TestCollectionWithPartition() {
 }
 
 func (suite *CatalogTestSuite) TestPartition() {
-	suite.catalog.SavePartition(&querypb.PartitionLoadInfo{
+	ctx := context.Background()
+	suite.catalog.SavePartition(ctx, &querypb.PartitionLoadInfo{
 		PartitionID: 1,
 	})
 
-	suite.catalog.SavePartition(&querypb.PartitionLoadInfo{
+	suite.catalog.SavePartition(ctx, &querypb.PartitionLoadInfo{
 		PartitionID: 2,
 	})
 
-	suite.catalog.SavePartition(&querypb.PartitionLoadInfo{
+	suite.catalog.SavePartition(ctx, &querypb.PartitionLoadInfo{
 		PartitionID: 3,
 	})
 
-	suite.catalog.ReleasePartition(1)
-	suite.catalog.ReleasePartition(2)
+	suite.catalog.ReleasePartition(ctx, 1)
+	suite.catalog.ReleasePartition(ctx, 2)
 
-	partitions, err := suite.catalog.GetPartitions()
+	partitions, err := suite.catalog.GetPartitions(ctx, []int64{0})
 	suite.NoError(err)
 	suite.Len(partitions, 1)
 }
 
+func (suite *CatalogTestSuite) TestGetPartitions() {
+	ctx := context.Background()
+	suite.catalog.SaveCollection(ctx, &querypb.CollectionLoadInfo{
+		CollectionID: 1,
+	})
+	suite.catalog.SavePartition(ctx, &querypb.PartitionLoadInfo{
+		CollectionID: 1,
+		PartitionID:  100,
+	})
+	suite.catalog.SaveCollection(ctx, &querypb.CollectionLoadInfo{
+		CollectionID: 2,
+	})
+	suite.catalog.SavePartition(ctx, &querypb.PartitionLoadInfo{
+		CollectionID: 2,
+		PartitionID:  200,
+	})
+	suite.catalog.SaveCollection(ctx, &querypb.CollectionLoadInfo{
+		CollectionID: 3,
+	})
+	suite.catalog.SavePartition(ctx, &querypb.PartitionLoadInfo{
+		CollectionID: 3,
+		PartitionID:  300,
+	})
+
+	partitions, err := suite.catalog.GetPartitions(ctx, []int64{1, 2, 3})
+	suite.NoError(err)
+	suite.Len(partitions, 3)
+	suite.Len(partitions[int64(1)], 1)
+	suite.Len(partitions[int64(2)], 1)
+	suite.Len(partitions[int64(3)], 1)
+	partitions, err = suite.catalog.GetPartitions(ctx, []int64{2, 3})
+	suite.NoError(err)
+	suite.Len(partitions, 2)
+	suite.Len(partitions[int64(2)], 1)
+	suite.Len(partitions[int64(3)], 1)
+	partitions, err = suite.catalog.GetPartitions(ctx, []int64{3})
+	suite.NoError(err)
+	suite.Len(partitions, 1)
+	suite.Len(partitions[int64(3)], 1)
+	suite.Equal(int64(300), partitions[int64(3)][0].GetPartitionID())
+	partitions, err = suite.catalog.GetPartitions(ctx, []int64{})
+	suite.NoError(err)
+	suite.Len(partitions, 0)
+}
+
 func (suite *CatalogTestSuite) TestReleaseManyPartitions() {
+	ctx := context.Background()
 	partitionIDs := make([]int64, 0)
 	for i := 1; i <= 150; i++ {
-		suite.catalog.SavePartition(&querypb.PartitionLoadInfo{
+		suite.catalog.SavePartition(ctx, &querypb.PartitionLoadInfo{
 			CollectionID: 1,
 			PartitionID:  int64(i),
 		})
 		partitionIDs = append(partitionIDs, int64(i))
 	}
 
-	err := suite.catalog.ReleasePartition(1, partitionIDs...)
+	err := suite.catalog.ReleasePartition(ctx, 1, partitionIDs...)
 	suite.NoError(err)
-	partitions, err := suite.catalog.GetPartitions()
+	partitions, err := suite.catalog.GetPartitions(ctx, []int64{1})
 	suite.NoError(err)
-	suite.Len(partitions, 0)
+	suite.Len(partitions, 1)
+	suite.Len(partitions[int64(1)], 0)
 }
 
 func (suite *CatalogTestSuite) TestReplica() {
-	suite.catalog.SaveReplica(&querypb.Replica{
+	ctx := context.Background()
+	suite.catalog.SaveReplica(ctx, &querypb.Replica{
 		CollectionID: 1,
 		ID:           1,
 	})
 
-	suite.catalog.SaveReplica(&querypb.Replica{
+	suite.catalog.SaveReplica(ctx, &querypb.Replica{
 		CollectionID: 1,
 		ID:           2,
 	})
 
-	suite.catalog.SaveReplica(&querypb.Replica{
+	suite.catalog.SaveReplica(ctx, &querypb.Replica{
 		CollectionID: 1,
 		ID:           3,
 	})
 
-	suite.catalog.ReleaseReplica(1, 1)
-	suite.catalog.ReleaseReplica(1, 2)
+	suite.catalog.ReleaseReplica(ctx, 1, 1)
+	suite.catalog.ReleaseReplica(ctx, 1, 2)
 
-	replicas, err := suite.catalog.GetReplicas()
+	replicas, err := suite.catalog.GetReplicas(ctx)
 	suite.NoError(err)
 	suite.Len(replicas, 1)
 }
 
 func (suite *CatalogTestSuite) TestResourceGroup() {
-	suite.catalog.SaveResourceGroup(&querypb.ResourceGroup{
+	ctx := context.Background()
+	suite.catalog.SaveResourceGroup(ctx, &querypb.ResourceGroup{
 		Name:     "rg1",
 		Capacity: 3,
 		Nodes:    []int64{1, 2, 3},
 	})
-	suite.catalog.SaveResourceGroup(&querypb.ResourceGroup{
+	suite.catalog.SaveResourceGroup(ctx, &querypb.ResourceGroup{
 		Name:     "rg2",
 		Capacity: 3,
 		Nodes:    []int64{4, 5},
 	})
 
-	suite.catalog.SaveResourceGroup(&querypb.ResourceGroup{
+	suite.catalog.SaveResourceGroup(ctx, &querypb.ResourceGroup{
 		Name:     "rg3",
 		Capacity: 0,
 		Nodes:    []int64{},
 	})
 
-	suite.catalog.RemoveResourceGroup("rg3")
+	suite.catalog.RemoveResourceGroup(ctx, "rg3")
 
-	groups, err := suite.catalog.GetResourceGroups()
+	groups, err := suite.catalog.GetResourceGroups(ctx)
 	suite.NoError(err)
 	suite.Len(groups, 2)
 
@@ -203,7 +259,8 @@ func (suite *CatalogTestSuite) TestResourceGroup() {
 }
 
 func (suite *CatalogTestSuite) TestCollectionTarget() {
-	suite.catalog.SaveCollectionTargets(&querypb.CollectionTarget{
+	ctx := context.Background()
+	suite.catalog.SaveCollectionTargets(ctx, &querypb.CollectionTarget{
 		CollectionID: 1,
 		Version:      1,
 	},
@@ -219,9 +276,9 @@ func (suite *CatalogTestSuite) TestCollectionTarget() {
 			CollectionID: 1,
 			Version:      4,
 		})
-	suite.catalog.RemoveCollectionTarget(2)
+	suite.catalog.RemoveCollectionTarget(ctx, 2)
 
-	targets, err := suite.catalog.GetCollectionTargets()
+	targets, err := suite.catalog.GetCollectionTargets(ctx)
 	suite.NoError(err)
 	suite.Len(targets, 2)
 	suite.Equal(int64(4), targets[1].Version)
@@ -230,18 +287,18 @@ func (suite *CatalogTestSuite) TestCollectionTarget() {
 	// test access meta store failed
 	mockStore := mocks.NewMetaKv(suite.T())
 	mockErr := errors.New("failed to access etcd")
-	mockStore.EXPECT().MultiSave(mock.Anything).Return(mockErr)
-	mockStore.EXPECT().LoadWithPrefix(mock.Anything).Return(nil, nil, mockErr)
+	mockStore.EXPECT().MultiSave(mock.Anything, mock.Anything).Return(mockErr)
+	mockStore.EXPECT().WalkWithPrefix(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(mockErr)
 
 	suite.catalog.cli = mockStore
-	err = suite.catalog.SaveCollectionTargets(&querypb.CollectionTarget{})
+	err = suite.catalog.SaveCollectionTargets(ctx, &querypb.CollectionTarget{})
 	suite.ErrorIs(err, mockErr)
 
-	_, err = suite.catalog.GetCollectionTargets()
+	_, err = suite.catalog.GetCollectionTargets(ctx)
 	suite.ErrorIs(err, mockErr)
 
 	// test invalid message
-	err = suite.catalog.SaveCollectionTargets(nil)
+	err = suite.catalog.SaveCollectionTargets(ctx)
 	suite.Error(err)
 }
 

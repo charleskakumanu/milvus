@@ -17,6 +17,7 @@
 package pipeline
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 
@@ -25,12 +26,13 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus/internal/querynodev2/delegator"
 	base "github.com/milvus-io/milvus/internal/util/pipeline"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/metrics"
-	"github.com/milvus-io/milvus/pkg/mq/msgstream"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/tsoutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/metrics"
+	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message/adaptor"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/tsoutil"
 )
 
 // filterNode filter the invalid message of pipeline
@@ -46,6 +48,7 @@ type filterNode struct {
 }
 
 func (fNode *filterNode) Operate(in Msg) Msg {
+	log := log.Ctx(context.TODO())
 	if in == nil {
 		log.Debug("type assertion failed for Msg in filterNode because it's nil",
 			zap.String("name", fNode.Name()))
@@ -61,11 +64,11 @@ func (fNode *filterNode) Operate(in Msg) Msg {
 	}
 
 	metrics.QueryNodeConsumerMsgCount.
-		WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.InsertLabel, fmt.Sprint(fNode.collectionID)).
+		WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.AllLabel, fmt.Sprint(fNode.collectionID)).
 		Inc()
 
 	metrics.QueryNodeConsumeTimeTickLag.
-		WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.InsertLabel, fmt.Sprint(fNode.collectionID)).
+		WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.TimetickLabel, fmt.Sprint(fNode.collectionID)).
 		Set(float64(tsoutil.SubByNow(streamMsgPack.EndTs)))
 
 	// Get collection from collection manager
@@ -118,20 +121,27 @@ func (fNode *filterNode) filtrate(c *Collection, msg msgstream.TsMsg) error {
 		// check segment whether excluded
 		ok := fNode.delegator.VerifyExcludedSegments(insertMsg.SegmentID, insertMsg.EndTimestamp)
 		if !ok {
-			m := fmt.Sprintf("Segment excluded, id: %d", insertMsg.GetSegmentID())
-			return merr.WrapErrSegmentLack(insertMsg.GetSegmentID(), m)
+			m := fmt.Sprintf("skip msg due to segment=%d has been excluded", insertMsg.GetSegmentID())
+			return merr.WrapErrServiceInternal(m)
 		}
 		return nil
 
 	case commonpb.MsgType_Delete:
 		deleteMsg := msg.(*msgstream.DeleteMsg)
-		metrics.QueryNodeConsumeCounter.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.InsertLabel).Add(float64(deleteMsg.Size()))
+		metrics.QueryNodeConsumeCounter.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.DeleteLabel).Add(float64(deleteMsg.Size()))
 		for _, policy := range fNode.DeleteMsgPolicys {
 			err := policy(fNode, c, deleteMsg)
 			if err != nil {
 				return err
 			}
 		}
+	case commonpb.MsgType_AddCollectionField:
+		schemaMsg := msg.(*adaptor.SchemaChangeMessageBody)
+		header := schemaMsg.SchemaChangeMessage.Header()
+		if header.GetCollectionId() != fNode.collectionID {
+			return merr.WrapErrCollectionNotFound(header.GetCollectionId())
+		}
+		return nil
 	default:
 		return merr.WrapErrParameterInvalid("msgType is Insert or Delete", "not")
 	}

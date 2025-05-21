@@ -3,11 +3,11 @@ package planparserv2
 import (
 	"context"
 
-	"github.com/antlr/antlr4/runtime/Go/antlr"
+	"github.com/antlr4-go/antlr/v4"
 	pool "github.com/jolestar/go-commons-pool/v2"
 
 	antlrparser "github.com/milvus-io/milvus/internal/parser/planparserv2/generated"
-	"github.com/milvus-io/milvus/pkg/util/hardware"
+	"github.com/milvus-io/milvus/pkg/v2/util/hardware"
 )
 
 var (
@@ -72,11 +72,13 @@ func getParser(lexer *antlrparser.PlanLexer, listeners ...antlr.ErrorListener) *
 
 func putLexer(lexer *antlrparser.PlanLexer) {
 	lexer.SetInputStream(nil)
+	lexer.RemoveErrorListeners()
 	lexerPool.ReturnObject(context.TODO(), lexer)
 }
 
 func putParser(parser *antlrparser.PlanParser) {
 	parser.SetInputStream(nil)
+	parser.RemoveErrorListeners()
 	parserPool.ReturnObject(context.TODO(), parser)
 }
 

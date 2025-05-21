@@ -24,12 +24,13 @@ import (
 	"math/rand"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/x448/float16"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 const elemCountOfArray = 10
@@ -109,8 +110,21 @@ func GenerateVarCharArray(numRows int, maxLen int) []string {
 
 func GenerateStringArray(numRows int) []string {
 	ret := make([]string, 0, numRows)
+
+	genSentence := func() string {
+		words := []string{"hello", "world", "this", "is", "a", "test", "sentence", "milvus", "vector", "database", "search", "engine", "fast", "efficient", "scalable"}
+		selectedWords := make([]string, rand.Intn(6)+5) // 5 to 10 words
+		for i := range selectedWords {
+			selectedWords[i] = words[rand.Intn(len(words))]
+		}
+		rand.Shuffle(len(selectedWords), func(i, j int) {
+			selectedWords[i], selectedWords[j] = selectedWords[j], selectedWords[i]
+		})
+		return strings.Join(selectedWords, " ")
+	}
+
 	for i := 0; i < numRows; i++ {
-		ret = append(ret, strconv.Itoa(i))
+		ret = append(ret, genSentence())
 	}
 	return ret
 }
@@ -266,6 +280,15 @@ func GenerateBFloat16Vectors(numRows, dim int) []byte {
 	return ret
 }
 
+func GenerateInt8Vectors(numRows, dim int) []int8 {
+	total := numRows * dim
+	ret := make([]int8, 0, total)
+	for i := 0; i < total; i++ {
+		ret = append(ret, int8(rand.Intn(256)-128))
+	}
+	return ret
+}
+
 func GenerateBFloat16VectorsWithInvalidData(numRows, dim int) []byte {
 	total := numRows * dim
 	ret16 := make([]uint16, 0, total)
@@ -299,6 +322,48 @@ func GenerateFloat16VectorsWithInvalidData(numRows, dim int) []byte {
 		}
 	}
 	return ret
+}
+
+func GenerateSparseFloatVectorsData(numRows int) ([][]byte, int64) {
+	dim := 700
+	avgNnz := 20
+	var contents [][]byte
+	maxDim := 0
+
+	uniqueAndSort := func(indices []uint32) []uint32 {
+		seen := make(map[uint32]bool)
+		var result []uint32
+		for _, value := range indices {
+			if _, ok := seen[value]; !ok {
+				seen[value] = true
+				result = append(result, value)
+			}
+		}
+		sort.Slice(result, func(i, j int) bool {
+			return result[i] < result[j]
+		})
+		return result
+	}
+
+	for i := 0; i < numRows; i++ {
+		nnz := rand.Intn(avgNnz*2) + 1
+		indices := make([]uint32, 0, nnz)
+		for j := 0; j < nnz; j++ {
+			indices = append(indices, uint32(rand.Intn(dim)))
+		}
+		indices = uniqueAndSort(indices)
+		values := make([]float32, 0, len(indices))
+		for j := 0; j < len(indices); j++ {
+			values = append(values, rand.Float32())
+		}
+		if len(indices) > 0 && int(indices[len(indices)-1])+1 > maxDim {
+			maxDim = int(indices[len(indices)-1]) + 1
+		}
+		rowBytes := typeutil.CreateSparseFloatRow(indices, values)
+
+		contents = append(contents, rowBytes)
+	}
+	return contents, int64(maxDim)
 }
 
 func GenerateSparseFloatVectors(numRows int) *schemapb.SparseFloatArray {
@@ -802,6 +867,36 @@ func NewSparseFloatVectorFieldData(fieldName string, numRows int) *schemapb.Fiel
 	}
 }
 
+func NewInt8VectorFieldData(fieldName string, numRows, dim int) *schemapb.FieldData {
+	return &schemapb.FieldData{
+		Type:      schemapb.DataType_Int8Vector,
+		FieldName: fieldName,
+		Field: &schemapb.FieldData_Vectors{
+			Vectors: &schemapb.VectorField{
+				Dim: int64(dim),
+				Data: &schemapb.VectorField_Int8Vector{
+					Int8Vector: typeutil.Int8ArrayToBytes(GenerateInt8Vectors(numRows, dim)),
+				},
+			},
+		},
+	}
+}
+
+func NewInt8VectorFieldDataWithValue(fieldName string, fieldValue interface{}, dim int) *schemapb.FieldData {
+	return &schemapb.FieldData{
+		Type:      schemapb.DataType_Int8Vector,
+		FieldName: fieldName,
+		Field: &schemapb.FieldData_Vectors{
+			Vectors: &schemapb.VectorField{
+				Dim: int64(dim),
+				Data: &schemapb.VectorField_Int8Vector{
+					Int8Vector: fieldValue.([]byte),
+				},
+			},
+		},
+	}
+}
+
 func GenerateScalarFieldData(dType schemapb.DataType, fieldName string, numRows int) *schemapb.FieldData {
 	switch dType {
 	case schemapb.DataType_Bool:
@@ -875,6 +970,8 @@ func GenerateVectorFieldData(dType schemapb.DataType, fieldName string, numRows 
 		return NewBFloat16VectorFieldData(fieldName, numRows, dim)
 	case schemapb.DataType_SparseFloatVector:
 		return NewSparseFloatVectorFieldData(fieldName, numRows)
+	case schemapb.DataType_Int8Vector:
+		return NewInt8VectorFieldData(fieldName, numRows, dim)
 	default:
 		panic("unsupported data type")
 	}
@@ -897,6 +994,8 @@ func GenerateVectorFieldDataWithValue(dType schemapb.DataType, fieldName string,
 		fieldData = NewFloat16VectorFieldDataWithValue(fieldName, fieldValue, dim)
 	case schemapb.DataType_BFloat16Vector:
 		fieldData = NewBFloat16VectorFieldDataWithValue(fieldName, fieldValue, dim)
+	case schemapb.DataType_Int8Vector:
+		fieldData = NewInt8VectorFieldDataWithValue(fieldName, fieldValue, dim)
 	default:
 		panic("unsupported data type")
 	}

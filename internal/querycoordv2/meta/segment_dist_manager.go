@@ -19,12 +19,15 @@ package meta
 import (
 	"sync"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/samber/lo"
+	"google.golang.org/protobuf/proto"
 
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/internal/util/metrics"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
+	"github.com/milvus-io/milvus/pkg/v2/util/tsoutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 type segDistCriterion struct {
@@ -57,7 +60,7 @@ func (f *ReplicaSegDistFilter) Match(s *Segment) bool {
 	return f.GetCollectionID() == s.GetCollectionID() && f.Contains(s.Node)
 }
 
-func (f ReplicaSegDistFilter) AddFilter(filter *segDistCriterion) {
+func (f *ReplicaSegDistFilter) AddFilter(filter *segDistCriterion) {
 	filter.nodes = f.GetNodes()
 	filter.collectionID = f.GetCollectionID()
 }
@@ -121,13 +124,30 @@ type Segment struct {
 	Node               int64                             // Node the segment is in
 	Version            int64                             // Version is the timestamp of loading segment
 	LastDeltaTimestamp uint64                            // The timestamp of the last delta record
-	IndexInfo          map[int64]*querypb.FieldIndexInfo // index info of loaded segment
+	IndexInfo          map[int64]*querypb.FieldIndexInfo // index info of loaded segment, indexID -> FieldIndexInfo
+	JSONIndexField     []int64                           // json index info of loaded segment
 }
 
 func SegmentFromInfo(info *datapb.SegmentInfo) *Segment {
 	return &Segment{
 		SegmentInfo: info,
 	}
+}
+
+func newSegmentMetricsFrom(segment *Segment) *metricsinfo.Segment {
+	convertedSegment := metrics.NewSegmentFrom(segment.SegmentInfo)
+	convertedSegment.NodeID = segment.Node
+	convertedSegment.LoadedTimestamp = tsoutil.PhysicalTimeFormat(segment.LastDeltaTimestamp)
+	convertedSegment.IndexedFields = lo.Map(lo.Values(segment.IndexInfo), func(e *querypb.FieldIndexInfo, i int) *metricsinfo.IndexedField {
+		return &metricsinfo.IndexedField{
+			IndexFieldID: e.FieldID,
+			IndexID:      e.IndexID,
+			BuildID:      e.BuildID,
+			IndexSize:    e.IndexSize,
+			IsLoaded:     true,
+		}
+	})
+	return convertedSegment
 }
 
 func (segment *Segment) Clone() *Segment {
@@ -226,4 +246,21 @@ func (m *SegmentDistManager) GetByFilter(filters ...SegmentDistFilter) []*Segmen
 		ret = append(ret, nodeSegments.Filter(criterion, mergedFilters)...)
 	}
 	return ret
+}
+
+func (m *SegmentDistManager) GetSegmentDist(collectionID int64) []*metricsinfo.Segment {
+	m.rwmutex.RLock()
+	defer m.rwmutex.RUnlock()
+
+	var segments []*metricsinfo.Segment
+	for _, nodeSeg := range m.segments {
+		for _, segment := range nodeSeg.segments {
+			if collectionID > 0 && segment.GetCollectionID() != collectionID {
+				continue
+			}
+			segments = append(segments, newSegmentMetricsFrom(segment))
+		}
+	}
+
+	return segments
 }

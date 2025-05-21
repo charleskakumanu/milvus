@@ -16,6 +16,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Skip the installation and compilation of third-party code, 
+# if the developer is certain that it has already been done.
+if [[ ${SKIP_3RDPARTY} -eq 1 ]]; then
+  exit 0
+fi
+
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do # resolve $SOURCE until the file is no longer a symlink
   DIR="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
@@ -46,22 +52,32 @@ pushd ${BUILD_OUTPUT_DIR}
 export CONAN_REVISIONS_ENABLED=1
 export CXXFLAGS="-Wno-error=address -Wno-error=deprecated-declarations"
 export CFLAGS="-Wno-error=address -Wno-error=deprecated-declarations"
+
+# Determine the Conan remote URL, using the environment variable if set, otherwise defaulting
+CONAN_ARTIFACTORY_URL="${CONAN_ARTIFACTORY_URL:-https://milvus01.jfrog.io/artifactory/api/conan/default-conan-local}"
+
 if [[ ! `conan remote list` == *default-conan-local* ]]; then
-    conan remote add default-conan-local https://milvus01.jfrog.io/artifactory/api/conan/default-conan-local
+    conan remote add default-conan-local $CONAN_ARTIFACTORY_URL
 fi
+
 unameOut="$(uname -s)"
 case "${unameOut}" in
   Darwin*)
-    conan install ${CPP_SRC_DIR} --install-folder conan --build=missing -s compiler=clang -s compiler.version=${llvm_version} -s compiler.libcxx=libc++ -s compiler.cppstd=17 || { echo 'conan install failed'; exit 1; }
+    conan install ${CPP_SRC_DIR} --install-folder conan --build=missing -s compiler=clang -s compiler.version=${llvm_version} -s compiler.libcxx=libc++ -s compiler.cppstd=17 -r default-conan-local -u || { echo 'conan install failed'; exit 1; }
     ;;
   Linux*)
+    if [ -f /etc/os-release ]; then
+        OS_NAME=$(grep '^PRETTY_NAME=' /etc/os-release | cut -d '=' -f2 | tr -d '"')
+    else
+        OS_NAME="Linux"
+    fi
     echo "Running on ${OS_NAME}"
     export CPU_TARGET=avx
     GCC_VERSION=`gcc -dumpversion`
     if [[ `gcc -v 2>&1 | sed -n 's/.*\(--with-default-libstdcxx-abi\)=\(\w*\).*/\2/p'` == "gcc4" ]]; then
-      conan install ${CPP_SRC_DIR} --install-folder conan --build=missing -s compiler.version=${GCC_VERSION} || { echo 'conan install failed'; exit 1; }
+      conan install ${CPP_SRC_DIR} --install-folder conan --build=missing -s compiler.version=${GCC_VERSION} -r default-conan-local -u || { echo 'conan install failed'; exit 1; }
     else
-      conan install ${CPP_SRC_DIR} --install-folder conan --build=missing -s compiler.version=${GCC_VERSION} -s compiler.libcxx=libstdc++11 || { echo 'conan install failed'; exit 1; }
+      conan install ${CPP_SRC_DIR} --install-folder conan --build=missing -s compiler.version=${GCC_VERSION} -s compiler.libcxx=libstdc++11 -r default-conan-local -u || { echo 'conan install failed'; exit 1; }
     fi
     ;;
   *)
@@ -80,27 +96,15 @@ if command -v cargo >/dev/null 2>&1; then
     unameOut="$(uname -s)"
     case "${unameOut}" in
         Darwin*)
-          echo "running on mac os, reinstall rust 1.73"
+          echo "running on mac os, reinstall rust 1.83"
           # github will install rust 1.74 by default.
           # https://github.com/actions/runner-images/blob/main/images/macos/macos-12-Readme.md
-          rustup install 1.73
-          rustup default 1.73;;
+          rustup install 1.83
+          rustup default 1.83;;
         *)
           echo "not running on mac os, no need to reinstall rust";;
     esac
 else
-    bash -c "curl https://sh.rustup.rs -sSf | sh -s -- --default-toolchain=1.73 -y" || { echo 'rustup install failed'; exit 1;}
+    bash -c "curl https://sh.rustup.rs -sSf | sh -s -- --default-toolchain=1.83 -y" || { echo 'rustup install failed'; exit 1;}
     source $HOME/.cargo/env
 fi
-
-echo "BUILD_OPENDAL: ${BUILD_OPENDAL}"
-if [ "${BUILD_OPENDAL}" = "ON" ]; then
-    git clone --depth=1 --branch v0.43.0-rc.2 https://github.com/apache/opendal.git opendal
-    cd opendal
-    pushd bindings/c
-    cargo +1.73 build --release --verbose || { echo 'opendal_c build failed'; exit 1; }
-    popd
-    cp target/release/libopendal_c.a ${ROOT_DIR}/internal/core/output/lib/libopendal_c.a
-    cp bindings/c/include/opendal.h ${ROOT_DIR}/internal/core/output/include/opendal.h
-fi
-popd

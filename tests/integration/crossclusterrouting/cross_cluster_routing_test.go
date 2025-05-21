@@ -28,13 +28,12 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/indexpb"
-	"github.com/milvus-io/milvus/internal/proto/proxypb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
-	"github.com/milvus-io/milvus/pkg/util/commonpbutil"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/proxypb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/tests/integration"
 )
 
@@ -77,7 +76,7 @@ func (s *CrossClusterRoutingSuite) TestCrossClusterRouting() {
 
 	// test rootCoord
 	s.Eventually(func() bool {
-		resp, err := s.Cluster.RootCoordClient.ShowCollections(s.Cluster.GetContext(), &milvuspb.ShowCollectionsRequest{
+		resp, err := s.Cluster.MixCoordClient.ShowCollections(s.Cluster.GetContext(), &milvuspb.ShowCollectionsRequest{
 			Base: commonpbutil.NewMsgBase(
 				commonpbutil.WithMsgType(commonpb.MsgType_ShowCollections),
 			),
@@ -92,7 +91,7 @@ func (s *CrossClusterRoutingSuite) TestCrossClusterRouting() {
 
 	// test dataCoord
 	s.Eventually(func() bool {
-		resp, err := s.Cluster.DataCoordClient.GetRecoveryInfoV2(s.Cluster.GetContext(), &datapb.GetRecoveryInfoRequestV2{})
+		resp, err := s.Cluster.MixCoordClient.GetRecoveryInfoV2(s.Cluster.GetContext(), &datapb.GetRecoveryInfoRequestV2{})
 		s.Suite.T().Logf("resp: %s, err: %s", resp, err)
 		if err != nil {
 			return strings.Contains(err.Error(), merr.ErrServiceUnavailable.Error())
@@ -102,7 +101,7 @@ func (s *CrossClusterRoutingSuite) TestCrossClusterRouting() {
 
 	// test queryCoord
 	s.Eventually(func() bool {
-		resp, err := s.Cluster.QueryCoordClient.LoadCollection(s.Cluster.GetContext(), &querypb.LoadCollectionRequest{})
+		resp, err := s.Cluster.MixCoordClient.LoadCollection(s.Cluster.GetContext(), &querypb.LoadCollectionRequest{})
 		s.Suite.T().Logf("resp: %s, err: %s", resp, err)
 		if err != nil {
 			return strings.Contains(err.Error(), merr.ErrServiceUnavailable.Error())
@@ -133,16 +132,6 @@ func (s *CrossClusterRoutingSuite) TestCrossClusterRouting() {
 	// test queryNode
 	s.Eventually(func() bool {
 		resp, err := s.Cluster.QueryNodeClient.Search(s.Cluster.GetContext(), &querypb.SearchRequest{})
-		s.Suite.T().Logf("resp: %s, err: %s", resp, err)
-		if err != nil {
-			return strings.Contains(err.Error(), merr.ErrServiceUnavailable.Error())
-		}
-		return false
-	}, waitFor, duration)
-
-	// test indexNode
-	s.Eventually(func() bool {
-		resp, err := s.Cluster.IndexNodeClient.CreateJob(s.Cluster.GetContext(), &indexpb.CreateJobRequest{})
 		s.Suite.T().Logf("resp: %s, err: %s", resp, err)
 		if err != nil {
 			return strings.Contains(err.Error(), merr.ErrServiceUnavailable.Error())

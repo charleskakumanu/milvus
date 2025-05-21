@@ -21,13 +21,32 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/apache/arrow/go/v12/arrow/array"
-	"github.com/apache/arrow/go/v12/arrow/memory"
+	"github.com/apache/arrow/go/v17/arrow"
+	"github.com/apache/arrow/go/v17/arrow/array"
+	"github.com/apache/arrow/go/v17/arrow/memory"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/pkg/common"
 )
+
+type MockRecordWriter struct {
+	writefn func(Record) error
+	closefn func() error
+}
+
+var _ RecordWriter = (*MockRecordWriter)(nil)
+
+func (w *MockRecordWriter) Write(record Record) error {
+	return w.writefn(record)
+}
+
+func (w *MockRecordWriter) Close() error {
+	return w.closefn()
+}
+
+func (w *MockRecordWriter) GetWrittenUncompressed() uint64 {
+	return 0
+}
 
 func TestSerDe(t *testing.T) {
 	type args struct {
@@ -107,34 +126,91 @@ func BenchmarkDeserializeReader(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		reader, err := NewBinlogDeserializeReader(blobs, common.RowIDField)
+		reader, err := NewBinlogDeserializeReader(generateTestSchema(), MakeBlobsReader(blobs))
 		assert.NoError(b, err)
 		defer reader.Close()
 		for i := 0; i < len; i++ {
-			err = reader.Next()
-			_ = reader.Value()
+			_, err = reader.NextValue()
 			assert.NoError(b, err)
 		}
-		err = reader.Next()
+		_, err = reader.NextValue()
 		assert.Equal(b, io.EOF, err)
 	}
 }
 
-func BenchmarkBinlogIterator(b *testing.B) {
-	len := 1000000
-	blobs, err := generateTestData(len)
-	assert.NoError(b, err)
-	b.ResetTimer()
+func TestCalculateArraySize(t *testing.T) {
+	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer mem.AssertSize(t, 0)
 
-	for i := 0; i < b.N; i++ {
-		itr, err := NewInsertBinlogIterator(blobs, common.RowIDField, schemapb.DataType_Int64)
-		assert.NoError(b, err)
-		defer itr.Dispose()
-		for i := 0; i < len; i++ {
-			assert.True(b, itr.HasNext())
-			_, err = itr.Next()
-			assert.NoError(b, err)
-		}
-		assert.False(b, itr.HasNext())
+	tests := []struct {
+		name         string
+		arrayBuilder func() arrow.Array
+		expectedSize uint64
+	}{
+		{
+			name: "Empty array",
+			arrayBuilder: func() arrow.Array {
+				b := array.NewInt32Builder(mem)
+				defer b.Release()
+				return b.NewArray()
+			},
+			expectedSize: 0,
+		},
+		{
+			name: "Fixed-length array",
+			arrayBuilder: func() arrow.Array {
+				b := array.NewInt32Builder(mem)
+				defer b.Release()
+				b.AppendValues([]int32{1, 2, 3, 4}, nil)
+				return b.NewArray()
+			},
+			expectedSize: 20, // 4 elements * 4 bytes + bitmap(4bytes)
+		},
+		{
+			name: "Variable-length string array",
+			arrayBuilder: func() arrow.Array {
+				b := array.NewStringBuilder(mem)
+				defer b.Release()
+				b.AppendValues([]string{"hello", "world"}, nil)
+				return b.NewArray()
+			},
+			expectedSize: 23, // bytes: "hello" (5 bytes) + "world" (5 bytes)
+			// offsets: 2+1 elements * 4 bytes
+			// bitmap(1 byte)
+		},
+		{
+			name: "Nested list array",
+			arrayBuilder: func() arrow.Array {
+				b := array.NewListBuilder(mem, arrow.PrimitiveTypes.Int32)
+				defer b.Release()
+				valueBuilder := b.ValueBuilder().(*array.Int32Builder)
+
+				b.Append(true)
+				valueBuilder.AppendValues([]int32{1, 2, 3}, nil)
+
+				b.Append(true)
+				valueBuilder.AppendValues([]int32{4, 5}, nil)
+
+				b.Append(true)
+				valueBuilder.AppendValues([]int32{}, nil)
+
+				return b.NewArray()
+			},
+			expectedSize: 44, // child buffer: 5 elements * 4 bytes, plus bitmap (4bytes)
+			// offsets: 3+1 elements * 4 bytes
+			// bitmap(4 bytes)
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			arr := tt.arrayBuilder()
+			defer arr.Release()
+
+			size := arr.Data().SizeInBytes()
+			if size != tt.expectedSize {
+				t.Errorf("Expected size %d, got %d", tt.expectedSize, size)
+			}
+		})
 	}
 }

@@ -21,35 +21,62 @@ import (
 	"sync"
 	"time"
 
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/v2/util/lifetime"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 type target struct {
 	vchannel string
 	ch       chan *MsgPack
+	subPos   SubPos
 	pos      *Pos
+	isLagged bool
 
-	closeMu   sync.Mutex
-	closeOnce sync.Once
-	closed    bool
+	closeMu         sync.Mutex
+	closeOnce       sync.Once
+	closed          bool
+	maxLag          time.Duration
+	timer           *time.Timer
+	replicateConfig *msgstream.ReplicateConfig
+
+	cancelCh lifetime.SafeChan
 }
 
-func newTarget(vchannel string, pos *Pos) *target {
+func newTarget(streamConfig *StreamConfig) *target {
+	replicateConfig := streamConfig.ReplicateConfig
+	maxTolerantLag := paramtable.Get().MQCfg.MaxTolerantLag.GetAsDuration(time.Second)
 	t := &target{
-		vchannel: vchannel,
-		ch:       make(chan *MsgPack, paramtable.Get().MQCfg.TargetBufSize.GetAsInt()),
-		pos:      pos,
+		vchannel:        streamConfig.VChannel,
+		ch:              make(chan *MsgPack, paramtable.Get().MQCfg.TargetBufSize.GetAsInt()),
+		subPos:          streamConfig.SubPos,
+		pos:             streamConfig.Pos,
+		cancelCh:        lifetime.NewSafeChan(),
+		maxLag:          maxTolerantLag,
+		timer:           time.NewTimer(maxTolerantLag),
+		replicateConfig: replicateConfig,
 	}
 	t.closed = false
+	if replicateConfig != nil {
+		log.Info("have replicate config",
+			zap.String("vchannel", streamConfig.VChannel),
+			zap.String("replicateID", replicateConfig.ReplicateID))
+	}
 	return t
 }
 
 func (t *target) close() {
+	t.cancelCh.Close()
 	t.closeMu.Lock()
 	defer t.closeMu.Unlock()
 	t.closeOnce.Do(func() {
 		t.closed = true
+		t.timer.Stop()
 		close(t.ch)
+		log.Info("close target chan", zap.String("vchannel", t.vchannel))
 	})
 }
 
@@ -59,10 +86,21 @@ func (t *target) send(pack *MsgPack) error {
 	if t.closed {
 		return nil
 	}
-	maxTolerantLag := paramtable.Get().MQCfg.MaxTolerantLag.GetAsDuration(time.Second)
+
+	if !t.timer.Stop() {
+		select {
+		case <-t.timer.C:
+		default:
+		}
+	}
+	t.timer.Reset(t.maxLag)
 	select {
-	case <-time.After(maxTolerantLag):
-		return fmt.Errorf("send target timeout, vchannel=%s, timeout=%s", t.vchannel, maxTolerantLag)
+	case <-t.cancelCh.CloseCh():
+		log.Info("target closed", zap.String("vchannel", t.vchannel))
+		return nil
+	case <-t.timer.C:
+		t.isLagged = true
+		return fmt.Errorf("send target timeout, vchannel=%s, timeout=%s, beginTs=%d, endTs=%d", t.vchannel, t.maxLag, pack.BeginTs, pack.EndTs)
 	case t.ch <- pack:
 		return nil
 	}

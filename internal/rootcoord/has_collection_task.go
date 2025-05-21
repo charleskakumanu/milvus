@@ -21,7 +21,7 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
-	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 )
 
 // hasCollectionTask has collection request task
@@ -46,4 +46,11 @@ func (t *hasCollectionTask) Execute(ctx context.Context) error {
 	_, err := t.core.meta.GetCollectionByName(ctx, t.Req.GetDbName(), t.Req.GetCollectionName(), ts)
 	t.Rsp.Value = err == nil
 	return nil
+}
+
+func (t *hasCollectionTask) GetLockerKey() LockerKey {
+	return NewLockerKeyChain(
+		NewClusterLockerKey(false),
+		NewDatabaseLockerKey(t.Req.GetDbName(), false),
+	)
 }

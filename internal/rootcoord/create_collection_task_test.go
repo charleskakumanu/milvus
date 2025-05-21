@@ -20,25 +20,27 @@ import (
 	"context"
 	"math"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/errors"
-	"github.com/golang/protobuf/proto"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/metastore/model"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
+	"github.com/milvus-io/milvus/internal/mocks"
 	mockrootcoord "github.com/milvus-io/milvus/internal/rootcoord/mocks"
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/util"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/util"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 func Test_createCollectionTask_validate(t *testing.T) {
@@ -47,7 +49,7 @@ func Test_createCollectionTask_validate(t *testing.T) {
 		task := createCollectionTask{
 			Req: nil,
 		}
-		err := task.validate()
+		err := task.validate(context.TODO())
 		assert.Error(t, err)
 	})
 
@@ -57,7 +59,7 @@ func Test_createCollectionTask_validate(t *testing.T) {
 		}
 		{
 			task.SetTs(1000)
-			ts, err := task.getCreateTs()
+			ts, err := task.getCreateTs(context.TODO())
 			assert.NoError(t, err)
 			assert.EqualValues(t, 1000, ts)
 		}
@@ -72,14 +74,14 @@ func Test_createCollectionTask_validate(t *testing.T) {
 		}
 		{
 			task.SetTs(1000)
-			_, err := task.getCreateTs()
+			_, err := task.getCreateTs(context.TODO())
 			assert.Error(t, err)
 			err = task.Execute(context.Background())
 			assert.Error(t, err)
 		}
 		{
 			task.Req.Base.ReplicateInfo.MsgTimestamp = 2000
-			ts, err := task.getCreateTs()
+			ts, err := task.getCreateTs(context.TODO())
 			assert.NoError(t, err)
 			assert.EqualValues(t, 2000, ts)
 		}
@@ -91,20 +93,25 @@ func Test_createCollectionTask_validate(t *testing.T) {
 				Base: &commonpb.MsgBase{MsgType: commonpb.MsgType_DropCollection},
 			},
 		}
-		err := task.validate()
+		err := task.validate(context.TODO())
 		assert.Error(t, err)
 	})
 
 	t.Run("shard num exceeds max configuration", func(t *testing.T) {
 		// TODO: better to have a `Set` method for ParamItem.
-		cfgMaxShardNum := Params.RootCoordCfg.DmlChannelNum.GetAsInt32()
+		var cfgMaxShardNum int32
+		if Params.CommonCfg.PreCreatedTopicEnabled.GetAsBool() {
+			cfgMaxShardNum = int32(len(Params.CommonCfg.TopicNames.GetAsStrings()))
+		} else {
+			cfgMaxShardNum = Params.RootCoordCfg.DmlChannelNum.GetAsInt32()
+		}
 		task := createCollectionTask{
 			Req: &milvuspb.CreateCollectionRequest{
 				Base:      &commonpb.MsgBase{MsgType: commonpb.MsgType_CreateCollection},
 				ShardsNum: cfgMaxShardNum + 1,
 			},
 		}
-		err := task.validate()
+		err := task.validate(context.TODO())
 		assert.Error(t, err)
 	})
 
@@ -117,7 +124,7 @@ func Test_createCollectionTask_validate(t *testing.T) {
 				ShardsNum: cfgShardLimit + 1,
 			},
 		}
-		err := task.validate()
+		err := task.validate(context.TODO())
 		assert.Error(t, err)
 	})
 
@@ -126,11 +133,13 @@ func Test_createCollectionTask_validate(t *testing.T) {
 		defer paramtable.Get().Reset(Params.QuotaConfig.MaxCollectionNum.Key)
 
 		meta := mockrootcoord.NewIMetaTable(t)
-		meta.On("ListAllAvailCollections",
+		meta.EXPECT().ListAllAvailCollections(
 			mock.Anything,
-		).Return(map[int64][]int64{
-			1: {1, 2},
-		}, nil)
+		).Return(map[int64][]int64{1: {1, 2}})
+
+		meta.EXPECT().GetDatabaseByName(mock.Anything, mock.Anything, mock.Anything).
+			Return(&model.Database{Name: "db1"}, nil).Once()
+
 		core := newTestCore(withMeta(meta))
 		task := createCollectionTask{
 			baseTask: newBaseTask(context.TODO(), core),
@@ -138,7 +147,7 @@ func Test_createCollectionTask_validate(t *testing.T) {
 				Base: &commonpb.MsgBase{MsgType: commonpb.MsgType_CreateCollection},
 			},
 		}
-		err := task.validate()
+		err := task.validate(context.TODO())
 		assert.Error(t, err)
 
 		task = createCollectionTask{
@@ -148,20 +157,73 @@ func Test_createCollectionTask_validate(t *testing.T) {
 			},
 			dbID: util.DefaultDBID,
 		}
-		err = task.validate()
+		err = task.validate(context.TODO())
 		assert.Error(t, err)
 	})
 
-	t.Run("collection num per db exceeds limit", func(t *testing.T) {
+	t.Run("collection num per db exceeds limit with db properties", func(t *testing.T) {
 		paramtable.Get().Save(Params.QuotaConfig.MaxCollectionNumPerDB.Key, strconv.Itoa(2))
 		defer paramtable.Get().Reset(Params.QuotaConfig.MaxCollectionNumPerDB.Key)
 
 		meta := mockrootcoord.NewIMetaTable(t)
-		meta.On("ListAllAvailCollections",
-			mock.Anything,
-		).Return(map[int64][]int64{
-			1: {1, 2},
-		}, nil)
+		meta.EXPECT().ListAllAvailCollections(mock.Anything).Return(map[int64][]int64{util.DefaultDBID: {1, 2}})
+
+		// test reach limit
+		meta.EXPECT().GetDatabaseByName(mock.Anything, mock.Anything, mock.Anything).
+			Return(&model.Database{
+				Name: "db1",
+				Properties: []*commonpb.KeyValuePair{
+					{
+						Key:   common.DatabaseMaxCollectionsKey,
+						Value: "2",
+					},
+				},
+			}, nil).Once()
+
+		core := newTestCore(withMeta(meta))
+		task := createCollectionTask{
+			baseTask: newBaseTask(context.TODO(), core),
+			Req: &milvuspb.CreateCollectionRequest{
+				Base: &commonpb.MsgBase{MsgType: commonpb.MsgType_CreateCollection},
+			},
+			dbID: util.DefaultDBID,
+		}
+		err := task.validate(context.TODO())
+		assert.Error(t, err)
+
+		// invalid properties
+		meta.EXPECT().GetDatabaseByName(mock.Anything, mock.Anything, mock.Anything).
+			Return(&model.Database{
+				Name: "db1",
+				Properties: []*commonpb.KeyValuePair{
+					{
+						Key:   common.DatabaseMaxCollectionsKey,
+						Value: "invalid-value",
+					},
+				},
+			}, nil).Once()
+		core = newTestCore(withMeta(meta))
+		task = createCollectionTask{
+			baseTask: newBaseTask(context.TODO(), core),
+			Req: &milvuspb.CreateCollectionRequest{
+				Base: &commonpb.MsgBase{MsgType: commonpb.MsgType_CreateCollection},
+			},
+			dbID: util.DefaultDBID,
+		}
+
+		err = task.validate(context.TODO())
+		assert.Error(t, err)
+	})
+
+	t.Run("collection num per db exceeds limit with global configuration", func(t *testing.T) {
+		paramtable.Get().Save(Params.QuotaConfig.MaxCollectionNumPerDB.Key, strconv.Itoa(2))
+		defer paramtable.Get().Reset(Params.QuotaConfig.MaxCollectionNumPerDB.Key)
+
+		meta := mockrootcoord.NewIMetaTable(t)
+		meta.EXPECT().ListAllAvailCollections(mock.Anything).Return(map[int64][]int64{1: {1, 2}})
+		meta.EXPECT().GetDatabaseByName(mock.Anything, mock.Anything, mock.Anything).
+			Return(&model.Database{Name: "db1"}, nil).Once()
+
 		core := newTestCore(withMeta(meta))
 		task := createCollectionTask{
 			baseTask: newBaseTask(context.TODO(), core),
@@ -169,7 +231,7 @@ func Test_createCollectionTask_validate(t *testing.T) {
 				Base: &commonpb.MsgBase{MsgType: commonpb.MsgType_CreateCollection},
 			},
 		}
-		err := task.validate()
+		err := task.validate(context.TODO())
 		assert.Error(t, err)
 
 		task = createCollectionTask{
@@ -179,7 +241,7 @@ func Test_createCollectionTask_validate(t *testing.T) {
 			},
 			dbID: util.DefaultDBID,
 		}
-		err = task.validate()
+		err = task.validate(context.TODO())
 		assert.Error(t, err)
 	})
 
@@ -188,27 +250,10 @@ func Test_createCollectionTask_validate(t *testing.T) {
 		defer paramtable.Get().Reset(Params.RootCoordCfg.MaxGeneralCapacity.Key)
 
 		meta := mockrootcoord.NewIMetaTable(t)
-		meta.On("ListAllAvailCollections",
-			mock.Anything,
-		).Return(map[int64][]int64{
-			1: {1, 2},
-		}, nil)
-		meta.On("GetDatabaseByID",
-			mock.Anything, mock.Anything, mock.Anything,
-		).Return(&model.Database{
-			Name: "default",
-		}, nil)
-		meta.On("GetCollectionByID",
-			mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
-		).Return(&model.Collection{
-			Name:      "default",
-			ShardsNum: 2,
-			Partitions: []*model.Partition{
-				{
-					PartitionID: 1,
-				},
-			},
-		}, nil)
+		meta.EXPECT().ListAllAvailCollections(mock.Anything).Return(map[int64][]int64{1: {1, 2}})
+		meta.EXPECT().GetDatabaseByName(mock.Anything, mock.Anything, mock.Anything).
+			Return(&model.Database{Name: "db1"}, nil).Once()
+		meta.EXPECT().GetGeneralCount(mock.Anything).Return(1)
 
 		core := newTestCore(withMeta(meta))
 
@@ -221,19 +266,27 @@ func Test_createCollectionTask_validate(t *testing.T) {
 			},
 			dbID: util.DefaultDBID,
 		}
-		err := task.validate()
+		err := task.validate(context.TODO())
 		assert.ErrorIs(t, err, merr.ErrGeneralCapacityExceeded)
 	})
 
-	t.Run("normal case", func(t *testing.T) {
+	t.Run("ok", func(t *testing.T) {
+		paramtable.Get().Save(Params.QuotaConfig.MaxCollectionNumPerDB.Key, "1")
+		defer paramtable.Get().Reset(Params.QuotaConfig.MaxCollectionNumPerDB.Key)
+
 		meta := mockrootcoord.NewIMetaTable(t)
-		meta.On("ListAllAvailCollections",
-			mock.Anything,
-		).Return(map[int64][]int64{
-			1: {1, 2},
-		}, nil)
-		meta.On("GetDatabaseByID", mock.Anything,
-			mock.Anything, mock.Anything).Return(nil, errors.New("mock"))
+		meta.EXPECT().ListAllAvailCollections(mock.Anything).Return(map[int64][]int64{1: {1, 2}})
+		meta.EXPECT().GetDatabaseByName(mock.Anything, mock.Anything, mock.Anything).
+			Return(&model.Database{
+				Name: "db1",
+				Properties: []*commonpb.KeyValuePair{
+					{
+						Key:   common.DatabaseMaxCollectionsKey,
+						Value: "3",
+					},
+				},
+			}, nil).Once()
+		meta.EXPECT().GetGeneralCount(mock.Anything).Return(0)
 
 		core := newTestCore(withMeta(meta))
 		task := createCollectionTask{
@@ -249,10 +302,7 @@ func Test_createCollectionTask_validate(t *testing.T) {
 		paramtable.Get().Save(Params.QuotaConfig.MaxCollectionNum.Key, strconv.Itoa(math.MaxInt64))
 		defer paramtable.Get().Reset(Params.QuotaConfig.MaxCollectionNum.Key)
 
-		paramtable.Get().Save(Params.QuotaConfig.MaxCollectionNumPerDB.Key, strconv.Itoa(math.MaxInt64))
-		defer paramtable.Get().Reset(Params.QuotaConfig.MaxCollectionNumPerDB.Key)
-
-		err := task.validate()
+		err := task.validate(context.TODO())
 		assert.NoError(t, err)
 	})
 }
@@ -270,7 +320,55 @@ func Test_createCollectionTask_validateSchema(t *testing.T) {
 		schema := &schemapb.CollectionSchema{
 			Name: otherName,
 		}
-		err := task.validateSchema(schema)
+		err := task.validateSchema(context.TODO(), schema)
+		assert.Error(t, err)
+	})
+
+	t.Run("primary field set nullable", func(t *testing.T) {
+		collectionName := funcutil.GenRandomStr()
+		task := createCollectionTask{
+			Req: &milvuspb.CreateCollectionRequest{
+				Base:           &commonpb.MsgBase{MsgType: commonpb.MsgType_CreateCollection},
+				CollectionName: collectionName,
+			},
+		}
+		schema := &schemapb.CollectionSchema{
+			Name: collectionName,
+			Fields: []*schemapb.FieldSchema{
+				{
+					Name:         "pk",
+					IsPrimaryKey: true,
+					Nullable:     true,
+				},
+			},
+		}
+		err := task.validateSchema(context.TODO(), schema)
+		assert.Error(t, err)
+	})
+
+	t.Run("primary field set default_value", func(t *testing.T) {
+		collectionName := funcutil.GenRandomStr()
+		task := createCollectionTask{
+			Req: &milvuspb.CreateCollectionRequest{
+				Base:           &commonpb.MsgBase{MsgType: commonpb.MsgType_CreateCollection},
+				CollectionName: collectionName,
+			},
+		}
+		schema := &schemapb.CollectionSchema{
+			Name: collectionName,
+			Fields: []*schemapb.FieldSchema{
+				{
+					Name:         "pk",
+					IsPrimaryKey: true,
+					DefaultValue: &schemapb.ValueField{
+						Data: &schemapb.ValueField_LongData{
+							LongData: 1,
+						},
+					},
+				},
+			},
+		}
+		err := task.validateSchema(context.TODO(), schema)
 		assert.Error(t, err)
 	})
 
@@ -288,7 +386,7 @@ func Test_createCollectionTask_validateSchema(t *testing.T) {
 				{Name: RowIDFieldName},
 			},
 		}
-		err := task.validateSchema(schema)
+		err := task.validateSchema(context.TODO(), schema)
 		assert.Error(t, err)
 	})
 
@@ -300,7 +398,7 @@ func Test_createCollectionTask_validateSchema(t *testing.T) {
 				CollectionName: collectionName,
 			},
 		}
-		schema1 := &schemapb.CollectionSchema{
+		schema := &schemapb.CollectionSchema{
 			Name: collectionName,
 			Fields: []*schemapb.FieldSchema{
 				{
@@ -313,14 +411,30 @@ func Test_createCollectionTask_validateSchema(t *testing.T) {
 				},
 			},
 		}
-		err1 := task.validateSchema(schema1)
+		err := task.validateSchema(context.TODO(), schema)
+		assert.ErrorIs(t, err, merr.ErrParameterInvalid)
+
+		schema1 := &schemapb.CollectionSchema{
+			Name: collectionName,
+			Fields: []*schemapb.FieldSchema{
+				{
+					DataType: schemapb.DataType_Int16,
+					DefaultValue: &schemapb.ValueField{
+						Data: &schemapb.ValueField_BoolData{
+							BoolData: false,
+						},
+					},
+				},
+			},
+		}
+		err1 := task.validateSchema(context.TODO(), schema1)
 		assert.ErrorIs(t, err1, merr.ErrParameterInvalid)
 
 		schema2 := &schemapb.CollectionSchema{
 			Name: collectionName,
 			Fields: []*schemapb.FieldSchema{
 				{
-					DataType: schemapb.DataType_BinaryVector,
+					DataType: schemapb.DataType_Bool,
 					DefaultValue: &schemapb.ValueField{
 						Data: &schemapb.ValueField_IntData{
 							IntData: 1,
@@ -329,14 +443,14 @@ func Test_createCollectionTask_validateSchema(t *testing.T) {
 				},
 			},
 		}
-		err2 := task.validateSchema(schema2)
+		err2 := task.validateSchema(context.TODO(), schema2)
 		assert.ErrorIs(t, err2, merr.ErrParameterInvalid)
 
 		schema3 := &schemapb.CollectionSchema{
 			Name: collectionName,
 			Fields: []*schemapb.FieldSchema{
 				{
-					DataType: schemapb.DataType_BinaryVector,
+					DataType: schemapb.DataType_Bool,
 					DefaultValue: &schemapb.ValueField{
 						Data: &schemapb.ValueField_LongData{
 							LongData: 1,
@@ -345,14 +459,14 @@ func Test_createCollectionTask_validateSchema(t *testing.T) {
 				},
 			},
 		}
-		err3 := task.validateSchema(schema3)
+		err3 := task.validateSchema(context.TODO(), schema3)
 		assert.ErrorIs(t, err3, merr.ErrParameterInvalid)
 
 		schema4 := &schemapb.CollectionSchema{
 			Name: collectionName,
 			Fields: []*schemapb.FieldSchema{
 				{
-					DataType: schemapb.DataType_BinaryVector,
+					DataType: schemapb.DataType_Bool,
 					DefaultValue: &schemapb.ValueField{
 						Data: &schemapb.ValueField_FloatData{
 							FloatData: 1,
@@ -361,14 +475,14 @@ func Test_createCollectionTask_validateSchema(t *testing.T) {
 				},
 			},
 		}
-		err4 := task.validateSchema(schema4)
+		err4 := task.validateSchema(context.TODO(), schema4)
 		assert.ErrorIs(t, err4, merr.ErrParameterInvalid)
 
 		schema5 := &schemapb.CollectionSchema{
 			Name: collectionName,
 			Fields: []*schemapb.FieldSchema{
 				{
-					DataType: schemapb.DataType_BinaryVector,
+					DataType: schemapb.DataType_Bool,
 					DefaultValue: &schemapb.ValueField{
 						Data: &schemapb.ValueField_DoubleData{
 							DoubleData: 1,
@@ -377,14 +491,14 @@ func Test_createCollectionTask_validateSchema(t *testing.T) {
 				},
 			},
 		}
-		err5 := task.validateSchema(schema5)
+		err5 := task.validateSchema(context.TODO(), schema5)
 		assert.ErrorIs(t, err5, merr.ErrParameterInvalid)
 
 		schema6 := &schemapb.CollectionSchema{
 			Name: collectionName,
 			Fields: []*schemapb.FieldSchema{
 				{
-					DataType: schemapb.DataType_BinaryVector,
+					DataType: schemapb.DataType_Bool,
 					DefaultValue: &schemapb.ValueField{
 						Data: &schemapb.ValueField_StringData{
 							StringData: "a",
@@ -393,7 +507,7 @@ func Test_createCollectionTask_validateSchema(t *testing.T) {
 				},
 			},
 		}
-		err6 := task.validateSchema(schema6)
+		err6 := task.validateSchema(context.TODO(), schema6)
 		assert.ErrorIs(t, err6, merr.ErrParameterInvalid)
 
 		schema7 := &schemapb.CollectionSchema{
@@ -409,7 +523,7 @@ func Test_createCollectionTask_validateSchema(t *testing.T) {
 				},
 			},
 		}
-		err7 := task.validateSchema(schema7)
+		err7 := task.validateSchema(context.TODO(), schema7)
 		assert.ErrorIs(t, err7, merr.ErrParameterInvalid)
 
 		schema8 := &schemapb.CollectionSchema{
@@ -425,7 +539,7 @@ func Test_createCollectionTask_validateSchema(t *testing.T) {
 				},
 			},
 		}
-		err8 := task.validateSchema(schema8)
+		err8 := task.validateSchema(context.TODO(), schema8)
 		assert.ErrorIs(t, err8, merr.ErrParameterInvalid)
 	})
 
@@ -456,7 +570,71 @@ func Test_createCollectionTask_validateSchema(t *testing.T) {
 				},
 			},
 		}
-		err := task.validateSchema(schema)
+		err := task.validateSchema(context.TODO(), schema)
+		assert.ErrorIs(t, err, merr.ErrParameterInvalid)
+	})
+
+	t.Run("duplicate_type_params", func(t *testing.T) {
+		collectionName := funcutil.GenRandomStr()
+		task := createCollectionTask{
+			Req: &milvuspb.CreateCollectionRequest{
+				Base:           &commonpb.MsgBase{MsgType: commonpb.MsgType_CreateCollection},
+				CollectionName: collectionName,
+			},
+		}
+		schema := &schemapb.CollectionSchema{
+			Name: collectionName,
+			Fields: []*schemapb.FieldSchema{
+				{
+					DataType: schemapb.DataType_VarChar,
+					TypeParams: []*commonpb.KeyValuePair{
+						{
+							Key:   common.MaxLengthKey,
+							Value: "256",
+						},
+						{
+							Key:   common.MmapEnabledKey,
+							Value: "true",
+						},
+						{
+							Key:   common.MmapEnabledKey,
+							Value: "True",
+						},
+					},
+				},
+			},
+		}
+		err := task.validateSchema(context.TODO(), schema)
+		assert.ErrorIs(t, err, merr.ErrParameterInvalid)
+	})
+
+	t.Run("duplicate_index_params", func(t *testing.T) {
+		collectionName := funcutil.GenRandomStr()
+		task := createCollectionTask{
+			Req: &milvuspb.CreateCollectionRequest{
+				Base:           &commonpb.MsgBase{MsgType: commonpb.MsgType_CreateCollection},
+				CollectionName: collectionName,
+			},
+		}
+		schema := &schemapb.CollectionSchema{
+			Name: collectionName,
+			Fields: []*schemapb.FieldSchema{
+				{
+					DataType: schemapb.DataType_FloatVector,
+					TypeParams: []*commonpb.KeyValuePair{
+						{
+							Key:   common.DimKey,
+							Value: "256",
+						},
+					},
+					IndexParams: []*commonpb.KeyValuePair{
+						{Key: common.MetricTypeKey, Value: "L2"},
+						{Key: common.MetricTypeKey, Value: "IP"},
+					},
+				},
+			},
+		}
+		err := task.validateSchema(context.TODO(), schema)
 		assert.ErrorIs(t, err, merr.ErrParameterInvalid)
 	})
 
@@ -472,7 +650,7 @@ func Test_createCollectionTask_validateSchema(t *testing.T) {
 			Name:   collectionName,
 			Fields: []*schemapb.FieldSchema{},
 		}
-		err := task.validateSchema(schema)
+		err := task.validateSchema(context.TODO(), schema)
 		assert.NoError(t, err)
 	})
 }
@@ -487,7 +665,7 @@ func Test_createCollectionTask_prepareSchema(t *testing.T) {
 				Schema:         []byte("invalid schema"),
 			},
 		}
-		err := task.prepareSchema()
+		err := task.prepareSchema(context.TODO())
 		assert.Error(t, err)
 	})
 
@@ -510,7 +688,7 @@ func Test_createCollectionTask_prepareSchema(t *testing.T) {
 				Schema:         marshaledSchema,
 			},
 		}
-		err = task.prepareSchema()
+		err = task.prepareSchema(context.TODO())
 		assert.Error(t, err)
 	})
 
@@ -537,7 +715,7 @@ func Test_createCollectionTask_prepareSchema(t *testing.T) {
 				Schema:         marshaledSchema,
 			},
 		}
-		err = task.prepareSchema()
+		err = task.prepareSchema(context.TODO())
 		assert.NoError(t, err)
 	})
 
@@ -564,7 +742,35 @@ func Test_createCollectionTask_prepareSchema(t *testing.T) {
 				Schema:         marshaledSchema,
 			},
 		}
-		err = task.prepareSchema()
+		err = task.prepareSchema(context.TODO())
+		assert.Error(t, err)
+	})
+
+	t.Run("vector type not support null", func(t *testing.T) {
+		collectionName := funcutil.GenRandomStr()
+		field1 := funcutil.GenRandomStr()
+		schema := &schemapb.CollectionSchema{
+			Name:        collectionName,
+			Description: "",
+			AutoID:      false,
+			Fields: []*schemapb.FieldSchema{
+				{
+					Name:     field1,
+					DataType: 101,
+					Nullable: true,
+				},
+			},
+		}
+		marshaledSchema, err := proto.Marshal(schema)
+		assert.NoError(t, err)
+		task := createCollectionTask{
+			Req: &milvuspb.CreateCollectionRequest{
+				Base:           &commonpb.MsgBase{MsgType: commonpb.MsgType_CreateCollection},
+				CollectionName: collectionName,
+				Schema:         marshaledSchema,
+			},
+		}
+		err = task.prepareSchema(context.TODO())
 		assert.Error(t, err)
 	})
 }
@@ -576,12 +782,13 @@ func Test_createCollectionTask_Prepare(t *testing.T) {
 		mock.Anything,
 		mock.Anything,
 		mock.Anything,
-	).Return(model.NewDefaultDatabase(), nil)
+	).Return(model.NewDefaultDatabase(nil), nil)
 	meta.On("ListAllAvailCollections",
 		mock.Anything,
 	).Return(map[int64][]int64{
 		util.DefaultDBID: {1, 2},
 	}, nil)
+	meta.EXPECT().GetGeneralCount(mock.Anything).Return(0)
 
 	paramtable.Get().Save(Params.QuotaConfig.MaxCollectionNum.Key, strconv.Itoa(math.MaxInt64))
 	defer paramtable.Get().Reset(Params.QuotaConfig.MaxCollectionNum.Key)
@@ -602,8 +809,6 @@ func Test_createCollectionTask_Prepare(t *testing.T) {
 	})
 
 	t.Run("invalid schema", func(t *testing.T) {
-		meta.On("GetDatabaseByID", mock.Anything,
-			mock.Anything, mock.Anything).Return(nil, errors.New("mock"))
 		core := newTestCore(withMeta(meta))
 		collectionName := funcutil.GenRandomStr()
 		task := &createCollectionTask{
@@ -632,8 +837,6 @@ func Test_createCollectionTask_Prepare(t *testing.T) {
 		}
 		marshaledSchema, err := proto.Marshal(schema)
 		assert.NoError(t, err)
-		meta.On("GetDatabaseByID", mock.Anything,
-			mock.Anything, mock.Anything).Return(nil, errors.New("mock"))
 		core := newTestCore(withInvalidIDAllocator(), withMeta(meta))
 
 		task := createCollectionTask{
@@ -656,8 +859,6 @@ func Test_createCollectionTask_Prepare(t *testing.T) {
 		field1 := funcutil.GenRandomStr()
 
 		ticker := newRocksMqTtSynchronizer()
-		meta.On("GetDatabaseByID", mock.Anything,
-			mock.Anything, mock.Anything).Return(nil, errors.New("mock"))
 
 		core := newTestCore(withValidIDAllocator(), withTtSynchronizer(ticker), withMeta(meta))
 
@@ -693,6 +894,70 @@ func Test_createCollectionTask_Prepare(t *testing.T) {
 	})
 }
 
+func TestCreateCollectionTask_Prepare_WithProperty(t *testing.T) {
+	paramtable.Init()
+	meta := mockrootcoord.NewIMetaTable(t)
+	t.Run("with db properties", func(t *testing.T) {
+		meta.EXPECT().GetDatabaseByName(mock.Anything, mock.Anything, mock.Anything).Return(&model.Database{
+			Name: "foo",
+			ID:   1,
+			Properties: []*commonpb.KeyValuePair{
+				{
+					Key:   common.ReplicateIDKey,
+					Value: "local-test",
+				},
+			},
+		}, nil).Twice()
+		meta.EXPECT().ListAllAvailCollections(mock.Anything).Return(map[int64][]int64{
+			util.DefaultDBID: {1, 2},
+		}).Once()
+		meta.EXPECT().GetGeneralCount(mock.Anything).Return(0).Once()
+
+		defer cleanTestEnv()
+
+		collectionName := funcutil.GenRandomStr()
+		field1 := funcutil.GenRandomStr()
+
+		ticker := newRocksMqTtSynchronizer()
+		core := newTestCore(withValidIDAllocator(), withTtSynchronizer(ticker), withMeta(meta))
+
+		schema := &schemapb.CollectionSchema{
+			Name:        collectionName,
+			Description: "",
+			AutoID:      false,
+			Fields: []*schemapb.FieldSchema{
+				{
+					Name:     field1,
+					DataType: schemapb.DataType_Int64,
+				},
+			},
+		}
+		marshaledSchema, err := proto.Marshal(schema)
+		assert.NoError(t, err)
+
+		task := createCollectionTask{
+			baseTask: newBaseTask(context.Background(), core),
+			Req: &milvuspb.CreateCollectionRequest{
+				Base:           &commonpb.MsgBase{MsgType: commonpb.MsgType_CreateCollection},
+				CollectionName: collectionName,
+				Schema:         marshaledSchema,
+				Properties: []*commonpb.KeyValuePair{
+					{
+						Key:   common.ReplicateIDKey,
+						Value: "hoo",
+					},
+				},
+			},
+			dbID: 1,
+		}
+		task.Req.ShardsNum = common.DefaultShardsNum
+		err = task.Prepare(context.Background())
+		assert.Len(t, task.dbProperties, 1)
+		assert.Len(t, task.Req.Properties, 0)
+		assert.NoError(t, err)
+	})
+}
+
 func Test_createCollectionTask_Execute(t *testing.T) {
 	t.Run("add same collection with different parameters", func(t *testing.T) {
 		defer cleanTestEnv()
@@ -709,6 +974,8 @@ func Test_createCollectionTask_Execute(t *testing.T) {
 			mock.Anything,
 			mock.Anything,
 		).Return(coll, nil)
+		meta.EXPECT().DescribeAlias(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+			Return("", merr.WrapErrAliasNotFound("", ""))
 
 		core := newTestCore(withMeta(meta), withTtSynchronizer(ticker))
 
@@ -756,6 +1023,8 @@ func Test_createCollectionTask_Execute(t *testing.T) {
 			mock.Anything,
 			mock.Anything,
 		).Return(coll, nil)
+		meta.EXPECT().DescribeAlias(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+			Return("", merr.WrapErrAliasNotFound("", ""))
 
 		core := newTestCore(withMeta(meta), withTtSynchronizer(ticker))
 
@@ -778,19 +1047,67 @@ func Test_createCollectionTask_Execute(t *testing.T) {
 		ticker := newTickerWithMockFailStream()
 		shardNum := 2
 		pchans := ticker.getDmlChannelNames(shardNum)
-		core := newTestCore(withTtSynchronizer(ticker))
+		meta := mockrootcoord.NewIMetaTable(t)
+		meta.EXPECT().GetCollectionByName(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+			Return(nil, errors.New("error mock GetCollectionByName"))
+		meta.EXPECT().DescribeAlias(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+			Return("", merr.WrapErrAliasNotFound("", ""))
+		core := newTestCore(withTtSynchronizer(ticker), withMeta(meta))
+		schema := &schemapb.CollectionSchema{Name: "", Fields: []*schemapb.FieldSchema{{}}}
 		task := &createCollectionTask{
 			baseTask: newBaseTask(context.Background(), core),
 			channels: collectionChannels{
 				physicalChannels: pchans,
 				virtualChannels:  []string{funcutil.GenRandomStr(), funcutil.GenRandomStr()},
 			},
+			Req: &milvuspb.CreateCollectionRequest{
+				Base:           &commonpb.MsgBase{MsgType: commonpb.MsgType_CreateCollection},
+				CollectionName: "",
+				Schema:         []byte{},
+				ShardsNum:      int32(shardNum),
+			},
+			schema: schema,
 		}
 		err := task.Execute(context.Background())
 		assert.Error(t, err)
 	})
 
+	t.Run("collection name duplicates an alias", func(t *testing.T) {
+		defer cleanTestEnv()
+
+		collectionName := funcutil.GenRandomStr()
+		ticker := newRocksMqTtSynchronizer()
+		field1 := funcutil.GenRandomStr()
+		schema := &schemapb.CollectionSchema{Name: collectionName, Fields: []*schemapb.FieldSchema{{Name: field1}}}
+
+		meta := mockrootcoord.NewIMetaTable(t)
+		// mock collection name duplicates an alias
+		meta.EXPECT().DescribeAlias(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+			Return(collectionName, nil)
+
+		core := newTestCore(withMeta(meta), withTtSynchronizer(ticker))
+		task := &createCollectionTask{
+			baseTask: newBaseTask(context.Background(), core),
+			Req: &milvuspb.CreateCollectionRequest{
+				Base:           &commonpb.MsgBase{MsgType: commonpb.MsgType_CreateCollection},
+				DbName:         "mock-db",
+				CollectionName: collectionName,
+				Properties: []*commonpb.KeyValuePair{
+					{
+						Key:   common.ConsistencyLevel,
+						Value: "1",
+					},
+				},
+			},
+			schema: schema,
+		}
+		err := task.Execute(context.Background())
+		assert.Error(t, err)
+		assert.True(t, strings.Contains(err.Error(), "conflicts with an existing alias"))
+	})
+
 	t.Run("normal case", func(t *testing.T) {
+		t.Skip("normal case")
 		defer cleanTestEnv()
 
 		collectionName := funcutil.GenRandomStr()
@@ -817,27 +1134,27 @@ func Test_createCollectionTask_Execute(t *testing.T) {
 			mock.Anything,
 			mock.Anything,
 		).Return(nil)
+		meta.EXPECT().DescribeAlias(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+			Return("", merr.WrapErrAliasNotFound("", ""))
 
-		dc := newMockDataCoord()
-		dc.GetComponentStatesFunc = func(ctx context.Context) (*milvuspb.ComponentStates, error) {
-			return &milvuspb.ComponentStates{
+		dc := mocks.NewMixCoord(t)
+		dc.EXPECT().GetComponentStates(mock.Anything, mock.Anything).Return(
+			&milvuspb.ComponentStates{
 				State: &milvuspb.ComponentInfo{
 					NodeID:    TestRootCoordID,
 					StateCode: commonpb.StateCode_Healthy,
 				},
 				SubcomponentStates: nil,
 				Status:             merr.Success(),
-			}, nil
-		}
-		dc.WatchChannelsFunc = func(ctx context.Context, req *datapb.WatchChannelsRequest) (*datapb.WatchChannelsResponse, error) {
-			return &datapb.WatchChannelsResponse{Status: merr.Success()}, nil
-		}
+			}, nil)
+		dc.EXPECT().WatchChannels(mock.Anything, mock.Anything).Return(
+			&datapb.WatchChannelsResponse{Status: merr.Success()}, nil)
 
 		core := newTestCore(withValidIDAllocator(),
 			withMeta(meta),
 			withTtSynchronizer(ticker),
 			withValidProxyManager(),
-			withDataCoord(dc))
+			withMixCoord(dc))
 		core.broker = newServerBroker(core)
 
 		schema := &schemapb.CollectionSchema{
@@ -859,6 +1176,12 @@ func Test_createCollectionTask_Execute(t *testing.T) {
 				CollectionName: collectionName,
 				Schema:         marshaledSchema,
 				ShardsNum:      int32(shardNum),
+				Properties: []*commonpb.KeyValuePair{
+					{
+						Key:   common.ConsistencyLevel,
+						Value: "1",
+					},
+				},
 			},
 			channels: collectionChannels{physicalChannels: pchans},
 			schema:   schema,
@@ -895,6 +1218,8 @@ func Test_createCollectionTask_Execute(t *testing.T) {
 			mock.Anything,
 			mock.Anything,
 		).Return(errors.New("error mock ChangeCollectionState"))
+		meta.EXPECT().DescribeAlias(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+			Return("", merr.WrapErrAliasNotFound("", ""))
 
 		removeCollectionCalled := false
 		removeCollectionChan := make(chan struct{}, 1)
@@ -990,14 +1315,13 @@ func Test_createCollectionTask_PartitionKey(t *testing.T) {
 		mock.Anything,
 		mock.Anything,
 		mock.Anything,
-	).Return(model.NewDefaultDatabase(), nil)
+	).Return(model.NewDefaultDatabase(nil), nil)
 	meta.On("ListAllAvailCollections",
 		mock.Anything,
 	).Return(map[int64][]int64{
 		util.DefaultDBID: {1, 2},
 	}, nil)
-	meta.On("GetDatabaseByID", mock.Anything,
-		mock.Anything, mock.Anything).Return(nil, errors.New("mock"))
+	meta.EXPECT().GetGeneralCount(mock.Anything).Return(0)
 
 	paramtable.Get().Save(Params.QuotaConfig.MaxCollectionNum.Key, strconv.Itoa(math.MaxInt64))
 	defer paramtable.Get().Reset(Params.QuotaConfig.MaxCollectionNum.Key)

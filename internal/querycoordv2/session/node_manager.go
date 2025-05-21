@@ -23,11 +23,9 @@ import (
 
 	"github.com/blang/semver/v4"
 	"go.uber.org/atomic"
-	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/metrics"
-	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/internal/util/sessionutil"
+	"github.com/milvus-io/milvus/pkg/v2/metrics"
 )
 
 type Manager interface {
@@ -65,42 +63,6 @@ func (m *NodeManager) Stopping(nodeID int64) {
 	defer m.mu.Unlock()
 	if nodeInfo, ok := m.nodes[nodeID]; ok {
 		nodeInfo.SetState(NodeStateStopping)
-	}
-}
-
-func (m *NodeManager) Suspend(nodeID int64) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	nodeInfo, ok := m.nodes[nodeID]
-	if !ok {
-		return merr.WrapErrNodeNotFound(nodeID)
-	}
-	switch nodeInfo.GetState() {
-	case NodeStateNormal:
-		nodeInfo.SetState(NodeStateSuspend)
-		return nil
-	default:
-		log.Warn("failed to suspend query node", zap.Int64("nodeID", nodeID), zap.String("state", nodeInfo.GetState().String()))
-		return merr.WrapErrNodeStateUnexpected(nodeID, nodeInfo.GetState().String(), "failed to suspend a query node")
-	}
-}
-
-func (m *NodeManager) Resume(nodeID int64) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	nodeInfo, ok := m.nodes[nodeID]
-	if !ok {
-		return merr.WrapErrNodeNotFound(nodeID)
-	}
-
-	switch nodeInfo.GetState() {
-	case NodeStateSuspend:
-		nodeInfo.SetState(NodeStateNormal)
-		return nil
-
-	default:
-		log.Warn("failed to resume query node", zap.Int64("nodeID", nodeID), zap.String("state", nodeInfo.GetState().String()))
-		return merr.WrapErrNodeStateUnexpected(nodeID, nodeInfo.GetState().String(), "failed to resume query node")
 	}
 }
 
@@ -150,18 +112,17 @@ type ImmutableNodeInfo struct {
 	Address  string
 	Hostname string
 	Version  semver.Version
+	Labels   map[string]string
 }
 
 const (
 	NodeStateNormal State = iota
 	NodeStateStopping
-	NodeStateSuspend
 )
 
 var stateNameMap = map[State]string{
 	NodeStateNormal:   NormalStateName,
 	NodeStateStopping: StoppingStateName,
-	NodeStateSuspend:  SuspendStateName,
 }
 
 func (s State) String() string {
@@ -188,6 +149,14 @@ func (n *NodeInfo) Hostname() string {
 	return n.immutableInfo.Hostname
 }
 
+func (n *NodeInfo) Labels() map[string]string {
+	return n.immutableInfo.Labels
+}
+
+func (n *NodeInfo) IsEmbeddedQueryNodeInStreamingNode() bool {
+	return n.immutableInfo.Labels[sessionutil.LabelStreamingNodeEmbeddedQueryNode] == "1"
+}
+
 func (n *NodeInfo) SegmentCnt() int {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
@@ -198,6 +167,13 @@ func (n *NodeInfo) ChannelCnt() int {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 	return n.stats.getChannelCnt()
+}
+
+// return node's memory capacity in mb
+func (n *NodeInfo) MemCapacity() float64 {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.stats.getMemCapacity()
 }
 
 func (n *NodeInfo) SetLastHeartbeat(time time.Time) {
@@ -257,5 +233,11 @@ func WithSegmentCnt(cnt int) StatsOption {
 func WithChannelCnt(cnt int) StatsOption {
 	return func(n *NodeInfo) {
 		n.setChannelCnt(cnt)
+	}
+}
+
+func WithMemCapacity(capacity float64) StatsOption {
+	return func(n *NodeInfo) {
+		n.setMemCapacity(capacity)
 	}
 }

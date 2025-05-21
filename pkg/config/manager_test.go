@@ -49,12 +49,12 @@ func TestConfigChangeEvent(t *testing.T) {
 	mgr, _ := Init()
 	err := mgr.AddSource(fs)
 	assert.NoError(t, err)
-	res, err := mgr.GetConfig("a.b")
+	_, res, err := mgr.GetConfig("a.b")
 	assert.NoError(t, err)
 	assert.Equal(t, res, "3")
 	os.WriteFile(path.Join(dir, "user.yaml"), []byte("a.b: 6"), 0o600)
 	time.Sleep(3 * time.Second)
-	res, err = mgr.GetConfig("a.b")
+	_, res, err = mgr.GetConfig("a.b")
 	assert.NoError(t, err)
 	assert.Equal(t, res, "6")
 }
@@ -78,10 +78,10 @@ func TestBasic(t *testing.T) {
 
 	// test set config
 	mgr.SetConfig("a.b", "aaa")
-	value, err := mgr.GetConfig("a.b")
+	_, value, err := mgr.GetConfig("a.b")
 	assert.NoError(t, err)
 	assert.Equal(t, value, "aaa")
-	_, err = mgr.GetConfig("a.a")
+	_, _, err = mgr.GetConfig("a.a")
 	assert.Error(t, err)
 
 	// test delete config
@@ -105,7 +105,7 @@ func TestBasic(t *testing.T) {
 		Key:         "ab",
 		Value:       "aaa",
 	})
-	value, err = mgr.GetConfig("a.b")
+	_, value, err = mgr.GetConfig("a.b")
 	assert.NoError(t, err)
 	assert.Equal(t, value, "aaa")
 
@@ -116,7 +116,7 @@ func TestBasic(t *testing.T) {
 		Key:         "a.b",
 		Value:       "bbb",
 	})
-	value, err = mgr.GetConfig("a.b")
+	_, value, err = mgr.GetConfig("a.b")
 	assert.NoError(t, err)
 	assert.Equal(t, value, "aaa")
 
@@ -136,6 +136,7 @@ func TestOnEvent(t *testing.T) {
 
 	dir, _ := os.MkdirTemp("", "milvus")
 	yamlFile := path.Join(dir, "milvus.yaml")
+	os.WriteFile(yamlFile, []byte("a.b: \"\""), 0o600)
 	mgr, _ := Init(WithEnvSource(formatKey),
 		WithFilesSource(&FileInfo{
 			Files:           []string{yamlFile},
@@ -147,31 +148,70 @@ func TestOnEvent(t *testing.T) {
 			RefreshInterval: 10 * time.Millisecond,
 		}))
 	os.WriteFile(yamlFile, []byte("a.b: aaa"), 0o600)
-	time.Sleep(time.Second)
-	value, err := mgr.GetConfig("a.b")
-	assert.NoError(t, err)
-	assert.Equal(t, value, "aaa")
+	assert.Eventually(t, func() bool {
+		_, value, err := mgr.GetConfig("a.b")
+		assert.NoError(t, err)
+		return value == "aaa"
+	}, time.Second*5, time.Second)
+
 	ctx := context.Background()
 	client.KV.Put(ctx, "test/config/a/b", "bbb")
-	time.Sleep(time.Second)
-	value, err = mgr.GetConfig("a.b")
-	assert.NoError(t, err)
-	assert.Equal(t, value, "bbb")
+
+	assert.Eventually(t, func() bool {
+		_, value, err := mgr.GetConfig("a.b")
+		assert.NoError(t, err)
+		return value == "bbb"
+	}, time.Second*5, time.Second)
+
 	client.KV.Put(ctx, "test/config/a/b", "ccc")
-	time.Sleep(time.Second)
-	value, err = mgr.GetConfig("a.b")
-	assert.NoError(t, err)
-	assert.Equal(t, value, "ccc")
+	assert.Eventually(t, func() bool {
+		_, value, err := mgr.GetConfig("a.b")
+		assert.NoError(t, err)
+		return value == "ccc"
+	}, time.Second*5, time.Second)
+
 	os.WriteFile(yamlFile, []byte("a.b: ddd"), 0o600)
-	time.Sleep(time.Second)
-	value, err = mgr.GetConfig("a.b")
-	assert.NoError(t, err)
-	assert.Equal(t, value, "ccc")
+	assert.Eventually(t, func() bool {
+		_, value, err := mgr.GetConfig("a.b")
+		assert.NoError(t, err)
+		return value == "ccc"
+	}, time.Second*5, time.Second)
+
 	client.KV.Delete(ctx, "test/config/a/b")
-	time.Sleep(time.Second)
-	value, err = mgr.GetConfig("a.b")
+	assert.Eventually(t, func() bool {
+		_, value, err := mgr.GetConfig("a.b")
+		assert.NoError(t, err)
+		return value == "ddd"
+	}, time.Second*5, time.Second)
+}
+
+func TestGetConfigAndSource(t *testing.T) {
+	mgr, _ := Init()
+	envSource := NewEnvSource(formatKey)
+	err := mgr.AddSource(envSource)
 	assert.NoError(t, err)
-	assert.Equal(t, value, "ddd")
+
+	envSource.configs.Insert("ab-key", "ab-value")
+	mgr.OnEvent(&Event{
+		EventSource: envSource.GetSourceName(),
+		EventType:   CreateType,
+		Key:         "ab-key",
+	})
+
+	mgr.SetConfig("ac-key", "ac-value")
+	_, value, err := mgr.GetConfig("ac-key")
+	assert.NoError(t, err)
+	assert.Equal(t, value, "ac-value")
+
+	// test get all configs
+	configs := mgr.GetConfigsView()
+	v, ok := configs["ab-key"]
+	assert.True(t, ok)
+	assert.Contains(t, v, "EnvironmentSource")
+
+	v, ok = configs["ac-key"]
+	assert.True(t, ok)
+	assert.Contains(t, v, RuntimeSource)
 }
 
 func TestDeadlock(t *testing.T) {
@@ -206,6 +246,7 @@ func TestCachedConfig(t *testing.T) {
 
 	dir, _ := os.MkdirTemp("", "milvus")
 	yamlFile := path.Join(dir, "milvus.yaml")
+	os.WriteFile(yamlFile, []byte("a.b: aaa"), 0o600)
 	mgr, _ := Init(WithEnvSource(formatKey),
 		WithFilesSource(&FileInfo{
 			Files:           []string{yamlFile},
@@ -218,7 +259,6 @@ func TestCachedConfig(t *testing.T) {
 		}))
 	// test get cached value from file
 	{
-		os.WriteFile(yamlFile, []byte("a.b: aaa"), 0o600)
 		time.Sleep(time.Second)
 		_, exist := mgr.GetCachedValue("a.b")
 		assert.False(t, exist)
@@ -239,7 +279,7 @@ func TestCachedConfig(t *testing.T) {
 		assert.False(t, exist)
 		mgr.CASCachedValue("cd", "", "xxx")
 		_, exist = mgr.GetCachedValue("cd")
-		assert.False(t, exist)
+		assert.True(t, exist)
 
 		// after refresh, the cached value should be reset
 		ctx := context.Background()

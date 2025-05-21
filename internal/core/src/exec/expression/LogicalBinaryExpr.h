@@ -75,8 +75,31 @@ class PhyLogicalBinaryExpr : public Expr {
 
     void
     MoveCursor() override {
-        inputs_[0]->MoveCursor();
-        inputs_[1]->MoveCursor();
+        if (!has_offset_input_) {
+            inputs_[0]->MoveCursor();
+            inputs_[1]->MoveCursor();
+        }
+    }
+
+    bool
+    SupportOffsetInput() override {
+        return inputs_[0]->SupportOffsetInput() &&
+               inputs_[1]->SupportOffsetInput();
+    }
+
+    std::string
+    ToString() const {
+        return fmt::format("{}", expr_->ToString());
+    }
+
+    bool
+    IsSource() const override {
+        return false;
+    }
+
+    std::optional<milvus::expr::ColumnInfo>
+    GetColumnInfo() const override {
+        return std::nullopt;
     }
 
  private:

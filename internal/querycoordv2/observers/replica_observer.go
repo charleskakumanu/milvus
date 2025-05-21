@@ -23,11 +23,14 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/milvus-io/milvus/internal/coordinator/snmanager"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	"github.com/milvus-io/milvus/internal/querycoordv2/params"
 	"github.com/milvus-io/milvus/internal/querycoordv2/utils"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/syncutil"
+	"github.com/milvus-io/milvus/internal/util/streamingutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/syncutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 // check replica, find read only nodes and remove it from replica if all segment/channel has been moved
@@ -37,7 +40,8 @@ type ReplicaObserver struct {
 	meta    *meta.Meta
 	distMgr *meta.DistributionManager
 
-	stopOnce sync.Once
+	startOnce sync.Once
+	stopOnce  sync.Once
 }
 
 func NewReplicaObserver(meta *meta.Meta, distMgr *meta.DistributionManager) *ReplicaObserver {
@@ -48,11 +52,17 @@ func NewReplicaObserver(meta *meta.Meta, distMgr *meta.DistributionManager) *Rep
 }
 
 func (ob *ReplicaObserver) Start() {
-	ctx, cancel := context.WithCancel(context.Background())
-	ob.cancel = cancel
+	ob.startOnce.Do(func() {
+		ctx, cancel := context.WithCancel(context.Background())
+		ob.cancel = cancel
 
-	ob.wg.Add(1)
-	go ob.schedule(ctx)
+		ob.wg.Add(1)
+		go ob.schedule(ctx)
+		if streamingutil.IsStreamingServiceEnabled() {
+			ob.wg.Add(1)
+			go ob.scheduleStreamingQN(ctx)
+		}
+	})
 }
 
 func (ob *ReplicaObserver) Stop() {
@@ -68,7 +78,7 @@ func (ob *ReplicaObserver) schedule(ctx context.Context) {
 	defer ob.wg.Done()
 	log.Info("Start check replica loop")
 
-	listener := ob.meta.ResourceManager.ListenNodeChanged()
+	listener := ob.meta.ResourceManager.ListenNodeChanged(ctx)
 	for {
 		ob.waitNodeChangedOrTimeout(ctx, listener)
 		// stop if the context is canceled.
@@ -82,22 +92,85 @@ func (ob *ReplicaObserver) schedule(ctx context.Context) {
 	}
 }
 
+// scheduleStreamingQN is used to check streaming query node in replica
+func (ob *ReplicaObserver) scheduleStreamingQN(ctx context.Context) {
+	defer ob.wg.Done()
+	log.Info("Start streaming query node check replica loop")
+
+	listener := snmanager.StaticStreamingNodeManager.ListenNodeChanged()
+	for {
+		ob.waitNodeChangedOrTimeout(ctx, listener)
+		if ctx.Err() != nil {
+			log.Info("Stop streaming query node check replica observer")
+			return
+		}
+
+		ids := snmanager.StaticStreamingNodeManager.GetStreamingQueryNodeIDs()
+		ob.checkStreamingQueryNodesInReplica(ids)
+	}
+}
+
 func (ob *ReplicaObserver) waitNodeChangedOrTimeout(ctx context.Context, listener *syncutil.VersionedListener) {
 	ctxWithTimeout, cancel := context.WithTimeout(ctx, params.Params.QueryCoordCfg.CheckNodeInReplicaInterval.GetAsDuration(time.Second))
 	defer cancel()
 	listener.Wait(ctxWithTimeout)
 }
 
-func (ob *ReplicaObserver) checkNodesInReplica() {
-	log := log.Ctx(context.Background()).WithRateGroup("qcv2.replicaObserver", 1, 60)
-	collections := ob.meta.GetAll()
+func (ob *ReplicaObserver) checkStreamingQueryNodesInReplica(sqNodeIDs typeutil.UniqueSet) {
+	ctx := context.Background()
+	log := log.Ctx(ctx).WithRateGroup("qcv2.replicaObserver", 1, 60)
+	collections := ob.meta.GetAll(context.Background())
+
 	for _, collectionID := range collections {
-		utils.RecoverReplicaOfCollection(ob.meta, collectionID)
+		ob.meta.RecoverSQNodesInCollection(context.Background(), collectionID, sqNodeIDs)
+	}
+
+	for _, collectionID := range collections {
+		replicas := ob.meta.ReplicaManager.GetByCollection(ctx, collectionID)
+		for _, replica := range replicas {
+			roSQNodes := replica.GetROSQNodes()
+			rwSQNodes := replica.GetRWSQNodes()
+			if len(roSQNodes) == 0 {
+				continue
+			}
+			removeNodes := make([]int64, 0, len(roSQNodes))
+			for _, node := range roSQNodes {
+				channels := ob.distMgr.ChannelDistManager.GetByCollectionAndFilter(replica.GetCollectionID(), meta.WithNodeID2Channel(node))
+				segments := ob.distMgr.SegmentDistManager.GetByFilter(meta.WithCollectionID(collectionID), meta.WithNodeID(node))
+				if len(channels) == 0 && len(segments) == 0 {
+					removeNodes = append(removeNodes, node)
+				}
+			}
+			if len(removeNodes) == 0 {
+				continue
+			}
+			logger := log.With(
+				zap.Int64("collectionID", replica.GetCollectionID()),
+				zap.Int64("replicaID", replica.GetID()),
+				zap.Int64s("removedNodes", removeNodes),
+				zap.Int64s("roNodes", roSQNodes),
+				zap.Int64s("rwNodes", rwSQNodes),
+			)
+			if err := ob.meta.ReplicaManager.RemoveSQNode(ctx, replica.GetID(), removeNodes...); err != nil {
+				logger.Warn("fail to remove streaming query node from replica", zap.Error(err))
+				continue
+			}
+			logger.Info("all segment/channel has been removed from ro streaming query node, remove it from replica")
+		}
+	}
+}
+
+func (ob *ReplicaObserver) checkNodesInReplica() {
+	ctx := context.Background()
+	log := log.Ctx(ctx).WithRateGroup("qcv2.replicaObserver", 1, 60)
+	collections := ob.meta.GetAll(ctx)
+	for _, collectionID := range collections {
+		utils.RecoverReplicaOfCollection(ctx, ob.meta, collectionID)
 	}
 
 	// check all ro nodes, remove it from replica if all segment/channel has been moved
 	for _, collectionID := range collections {
-		replicas := ob.meta.ReplicaManager.GetByCollection(collectionID)
+		replicas := ob.meta.ReplicaManager.GetByCollection(ctx, collectionID)
 		for _, replica := range replicas {
 			roNodes := replica.GetRONodes()
 			rwNodes := replica.GetRWNodes()
@@ -127,11 +200,11 @@ func (ob *ReplicaObserver) checkNodesInReplica() {
 				zap.Int64s("roNodes", roNodes),
 				zap.Int64s("rwNodes", rwNodes),
 			)
-			if err := ob.meta.ReplicaManager.RemoveNode(replica.GetID(), removeNodes...); err != nil {
+			if err := ob.meta.ReplicaManager.RemoveNode(ctx, replica.GetID(), removeNodes...); err != nil {
 				logger.Warn("fail to remove node from replica", zap.Error(err))
 				continue
 			}
-			logger.Info("all segment/channel has been removed from ro node, try to remove it from replica")
+			logger.Info("all segment/channel has been removed from ro node, remove it from replica")
 		}
 	}
 }

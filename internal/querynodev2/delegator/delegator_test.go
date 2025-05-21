@@ -19,7 +19,6 @@ package delegator
 import (
 	"context"
 	"io"
-	"sync"
 	"testing"
 	"time"
 
@@ -29,26 +28,23 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
-	"go.uber.org/atomic"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
-	"github.com/milvus-io/milvus/internal/proto/segcorepb"
 	"github.com/milvus-io/milvus/internal/querynodev2/cluster"
 	"github.com/milvus-io/milvus/internal/querynodev2/segments"
-	"github.com/milvus-io/milvus/internal/querynodev2/tsafe"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/util/streamrpc"
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/mq/msgstream"
-	"github.com/milvus-io/milvus/pkg/util/commonpbutil"
-	"github.com/milvus-io/milvus/pkg/util/lifetime"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/metric"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/segcorepb"
+	"github.com/milvus-io/milvus/pkg/v2/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/metric"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 type DelegatorSuite struct {
@@ -61,7 +57,6 @@ type DelegatorSuite struct {
 	version       int64
 	workerManager *cluster.MockManager
 	manager       *segments.Manager
-	tsafeManager  tsafe.Manager
 	loader        *segments.MockLoader
 	mq            *msgstream.MockMsgStream
 
@@ -85,7 +80,6 @@ func (s *DelegatorSuite) SetupTest() {
 	s.version = 2000
 	s.workerManager = &cluster.MockManager{}
 	s.manager = segments.NewManager()
-	s.tsafeManager = tsafe.NewTSafeReplica()
 	s.loader = &segments.MockLoader{}
 	s.loader.EXPECT().
 		Load(mock.Anything, s.collectionID, segments.SegmentTypeGrowing, int64(0), mock.Anything).
@@ -165,7 +159,7 @@ func (s *DelegatorSuite) SetupTest() {
 
 	var err error
 	//	s.delegator, err = NewShardDelegator(s.collectionID, s.replicaID, s.vchannelName, s.version, s.workerManager, s.manager, s.tsafeManager, s.loader)
-	s.delegator, err = NewShardDelegator(context.Background(), s.collectionID, s.replicaID, s.vchannelName, s.version, s.workerManager, s.manager, s.tsafeManager, s.loader, &msgstream.MockMqFactory{
+	s.delegator, err = NewShardDelegator(context.Background(), s.collectionID, s.replicaID, s.vchannelName, s.version, s.workerManager, s.manager, s.loader, &msgstream.MockMqFactory{
 		NewMsgStreamFunc: func(_ context.Context) (msgstream.MsgStream, error) {
 			return s.mq, nil
 		},
@@ -176,6 +170,84 @@ func (s *DelegatorSuite) SetupTest() {
 func (s *DelegatorSuite) TearDownTest() {
 	s.delegator.Close()
 	s.delegator = nil
+}
+
+func (s *DelegatorSuite) TestCreateDelegatorWithFunction() {
+	s.Run("init function failed", func() {
+		manager := segments.NewManager()
+		manager.Collection.PutOrRef(s.collectionID, &schemapb.CollectionSchema{
+			Name: "TestCollection",
+			Fields: []*schemapb.FieldSchema{
+				{
+					Name:         "id",
+					FieldID:      100,
+					IsPrimaryKey: true,
+					DataType:     schemapb.DataType_Int64,
+					AutoID:       true,
+				}, {
+					Name:         "vector",
+					FieldID:      101,
+					IsPrimaryKey: false,
+					DataType:     schemapb.DataType_SparseFloatVector,
+				},
+			},
+			Functions: []*schemapb.FunctionSchema{{
+				Type:           schemapb.FunctionType_BM25,
+				InputFieldIds:  []int64{102},
+				OutputFieldIds: []int64{101, 103}, // invalid output field
+			}},
+		}, nil, nil)
+
+		_, err := NewShardDelegator(context.Background(), s.collectionID, s.replicaID, s.vchannelName, s.version, s.workerManager, manager, s.loader, &msgstream.MockMqFactory{
+			NewMsgStreamFunc: func(_ context.Context) (msgstream.MsgStream, error) {
+				return s.mq, nil
+			},
+		}, 10000, nil, s.chunkManager)
+		s.Error(err)
+	})
+
+	s.Run("init function failed", func() {
+		manager := segments.NewManager()
+		manager.Collection.PutOrRef(s.collectionID, &schemapb.CollectionSchema{
+			Name: "TestCollection",
+			Fields: []*schemapb.FieldSchema{
+				{
+					Name:         "id",
+					FieldID:      100,
+					IsPrimaryKey: true,
+					DataType:     schemapb.DataType_Int64,
+					AutoID:       true,
+				}, {
+					Name:         "vector",
+					FieldID:      101,
+					IsPrimaryKey: false,
+					DataType:     schemapb.DataType_SparseFloatVector,
+				}, {
+					Name:     "text",
+					FieldID:  102,
+					DataType: schemapb.DataType_VarChar,
+					TypeParams: []*commonpb.KeyValuePair{
+						{
+							Key:   common.MaxLengthKey,
+							Value: "256",
+						},
+					},
+				},
+			},
+			Functions: []*schemapb.FunctionSchema{{
+				Type:           schemapb.FunctionType_BM25,
+				InputFieldIds:  []int64{102},
+				OutputFieldIds: []int64{101},
+			}},
+		}, nil, nil)
+
+		_, err := NewShardDelegator(context.Background(), s.collectionID, s.replicaID, s.vchannelName, s.version, s.workerManager, manager, s.loader, &msgstream.MockMqFactory{
+			NewMsgStreamFunc: func(_ context.Context) (msgstream.MsgStream, error) {
+				return s.mq, nil
+			},
+		}, 10000, nil, s.chunkManager)
+		s.NoError(err)
+	})
 }
 
 func (s *DelegatorSuite) TestBasicInfo() {
@@ -253,7 +325,7 @@ func (s *DelegatorSuite) initSegments() {
 			Version:     2001,
 		},
 	)
-	s.delegator.SyncTargetVersion(2001, []int64{1004}, []int64{1000, 1001, 1002, 1003}, []int64{}, &msgpb.MsgPosition{})
+	s.delegator.SyncTargetVersion(2001, []int64{500, 501}, []int64{1004}, []int64{1000, 1001, 1002, 1003}, []int64{}, &msgpb.MsgPosition{}, &msgpb.MsgPosition{})
 }
 
 func (s *DelegatorSuite) TestSearch() {
@@ -1117,75 +1189,119 @@ func (s *DelegatorSuite) TestGetStats() {
 	})
 }
 
+func (s *DelegatorSuite) TestUpdateSchema() {
+	s.delegator.Start()
+	paramtable.SetNodeID(1)
+	s.initSegments()
+
+	s.Run("normal", func() {
+		workers := make(map[int64]*cluster.MockWorker)
+		worker1 := cluster.NewMockWorker(s.T())
+		worker2 := cluster.NewMockWorker(s.T())
+
+		workers[1] = worker1
+		workers[2] = worker2
+
+		worker1.EXPECT().UpdateSchema(mock.Anything, mock.AnythingOfType("*querypb.UpdateSchemaRequest")).RunAndReturn(func(ctx context.Context, usr *querypb.UpdateSchemaRequest) (*commonpb.Status, error) {
+			return merr.Success(), nil
+		}).Twice()
+
+		worker2.EXPECT().UpdateSchema(mock.Anything, mock.AnythingOfType("*querypb.UpdateSchemaRequest")).RunAndReturn(func(ctx context.Context, usr *querypb.UpdateSchemaRequest) (*commonpb.Status, error) {
+			return merr.Success(), nil
+		}).Once()
+
+		s.workerManager.EXPECT().GetWorker(mock.Anything, mock.AnythingOfType("int64")).Call.Return(func(_ context.Context, nodeID int64) cluster.Worker {
+			return workers[nodeID]
+		}, nil).Times(3) // currently node 1 will be called twice for growing & sealed
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := s.delegator.UpdateSchema(ctx, &schemapb.CollectionSchema{}, 100)
+		s.NoError(err)
+	})
+
+	s.Run("worker_return_error", func() {
+		workers := make(map[int64]*cluster.MockWorker)
+		worker1 := cluster.NewMockWorker(s.T())
+		worker2 := cluster.NewMockWorker(s.T())
+
+		workers[1] = worker1
+		workers[2] = worker2
+
+		worker1.EXPECT().UpdateSchema(mock.Anything, mock.AnythingOfType("*querypb.UpdateSchemaRequest")).RunAndReturn(func(ctx context.Context, usr *querypb.UpdateSchemaRequest) (*commonpb.Status, error) {
+			return merr.Status(merr.WrapErrServiceInternal("mocked")), merr.WrapErrServiceInternal("mocked")
+		}).Maybe()
+
+		worker2.EXPECT().UpdateSchema(mock.Anything, mock.AnythingOfType("*querypb.UpdateSchemaRequest")).RunAndReturn(func(ctx context.Context, usr *querypb.UpdateSchemaRequest) (*commonpb.Status, error) {
+			return merr.Success(), nil
+		}).Maybe()
+
+		s.workerManager.EXPECT().GetWorker(mock.Anything, mock.AnythingOfType("int64")).Call.Return(func(_ context.Context, nodeID int64) cluster.Worker {
+			return workers[nodeID]
+		}, nil).Times(3)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := s.delegator.UpdateSchema(ctx, &schemapb.CollectionSchema{}, 100)
+		s.Error(err)
+	})
+
+	s.Run("worker_manager_error", func() {
+		s.workerManager.EXPECT().GetWorker(mock.Anything, mock.AnythingOfType("int64")).RunAndReturn(func(ctx context.Context, i int64) (cluster.Worker, error) {
+			return nil, merr.WrapErrServiceInternal("mocked")
+		}).Once()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := s.delegator.UpdateSchema(ctx, &schemapb.CollectionSchema{}, 100)
+		s.Error(err)
+	})
+
+	s.Run("distribution_not_serviceable", func() {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		sd, ok := s.delegator.(*shardDelegator)
+		s.Require().True(ok)
+		sd.distribution.AddOfflines(1001)
+
+		err := s.delegator.UpdateSchema(ctx, &schemapb.CollectionSchema{}, 100)
+		s.Error(err)
+	})
+
+	s.Run("cluster_not_serviceable", func() {
+		s.delegator.Close()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := s.delegator.UpdateSchema(ctx, &schemapb.CollectionSchema{}, 100)
+		s.Error(err)
+	})
+}
+
 func TestDelegatorSuite(t *testing.T) {
 	suite.Run(t, new(DelegatorSuite))
 }
 
-func TestDelegatorWatchTsafe(t *testing.T) {
-	channelName := "default_dml_channel"
+func TestDelegatorSearchBM25InvalidMetricType(t *testing.T) {
+	paramtable.Init()
+	searchReq := &querypb.SearchRequest{
+		Req: &internalpb.SearchRequest{
+			Base: commonpbutil.NewMsgBase(),
+		},
+	}
 
-	tsafeManager := tsafe.NewTSafeReplica()
-	tsafeManager.Add(context.Background(), channelName, 100)
+	searchReq.Req.FieldId = 101
+	searchReq.Req.MetricType = metric.IP
+
 	sd := &shardDelegator{
-		tsafeManager: tsafeManager,
-		vchannelName: channelName,
-		lifetime:     lifetime.NewLifetime(lifetime.Initializing),
-		latestTsafe:  atomic.NewUint64(0),
-	}
-	defer sd.Close()
-
-	m := sync.Mutex{}
-	sd.tsCond = sync.NewCond(&m)
-	if sd.lifetime.Add(lifetime.NotStopped) == nil {
-		go sd.watchTSafe()
+		isBM25Field: map[int64]bool{101: true},
 	}
 
-	err := tsafeManager.Set(channelName, 200)
-	require.NoError(t, err)
-
-	assert.Eventually(t, func() bool {
-		return sd.latestTsafe.Load() == 200
-	}, time.Second*10, time.Millisecond*10)
-}
-
-func TestDelegatorTSafeListenerClosed(t *testing.T) {
-	channelName := "default_dml_channel"
-
-	tsafeManager := tsafe.NewTSafeReplica()
-	tsafeManager.Add(context.Background(), channelName, 100)
-	sd := &shardDelegator{
-		tsafeManager: tsafeManager,
-		vchannelName: channelName,
-		lifetime:     lifetime.NewLifetime(lifetime.Initializing),
-		latestTsafe:  atomic.NewUint64(0),
-	}
-	defer sd.Close()
-
-	m := sync.Mutex{}
-	sd.tsCond = sync.NewCond(&m)
-	signal := make(chan struct{})
-	if sd.lifetime.Add(lifetime.NotStopped) == nil {
-		go func() {
-			sd.watchTSafe()
-			close(signal)
-		}()
-	}
-
-	select {
-	case <-signal:
-		assert.FailNow(t, "watchTsafe quit unexpectedly")
-	case <-time.After(time.Millisecond * 10):
-	}
-
-	tsafeManager.Remove(context.Background(), channelName)
-
-	select {
-	case <-signal:
-	case <-time.After(time.Second):
-		assert.FailNow(t, "watchTsafe still working after listener closed")
-	}
-
-	sd.Close()
-	assert.Equal(t, sd.Serviceable(), false)
-	assert.Equal(t, sd.Stopped(), true)
+	_, err := sd.search(context.Background(), searchReq, []SnapshotItem{}, []SegmentEntry{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "must use BM25 metric type when searching against BM25 Function output field")
 }

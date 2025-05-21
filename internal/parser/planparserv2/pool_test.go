@@ -3,7 +3,7 @@ package planparserv2
 import (
 	"testing"
 
-	"github.com/antlr/antlr4/runtime/Go/antlr"
+	"github.com/antlr4-go/antlr/v4"
 	"github.com/stretchr/testify/assert"
 
 	antlrparser "github.com/milvus-io/milvus/internal/parser/planparserv2/generated"
@@ -16,10 +16,10 @@ func genNaiveInputStream() *antlr.InputStream {
 func Test_getLexer(t *testing.T) {
 	var lexer *antlrparser.PlanLexer
 	resetLexerPool()
-	lexer = getLexer(genNaiveInputStream(), &errorListener{})
+	lexer = getLexer(genNaiveInputStream(), &errorListenerImpl{})
 	assert.NotNil(t, lexer)
 
-	lexer = getLexer(genNaiveInputStream(), &errorListener{})
+	lexer = getLexer(genNaiveInputStream(), &errorListenerImpl{})
 	assert.NotNil(t, lexer)
 
 	pool := getLexerPool()
@@ -36,13 +36,13 @@ func Test_getParser(t *testing.T) {
 	var parser *antlrparser.PlanParser
 
 	resetParserPool()
-	lexer = getLexer(genNaiveInputStream(), &errorListener{})
+	lexer = getLexer(genNaiveInputStream(), &errorListenerImpl{})
 	assert.NotNil(t, lexer)
 
-	parser = getParser(lexer, &errorListener{})
+	parser = getParser(lexer, &errorListenerImpl{})
 	assert.NotNil(t, parser)
 
-	parser = getParser(lexer, &errorListener{})
+	parser = getParser(lexer, &errorListenerImpl{})
 	assert.NotNil(t, parser)
 
 	pool := getParserPool()

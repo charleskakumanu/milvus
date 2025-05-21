@@ -1,6 +1,6 @@
 package model
 
-import "github.com/milvus-io/milvus/internal/proto/internalpb"
+import "github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
 
 type Credential struct {
 	Username          string

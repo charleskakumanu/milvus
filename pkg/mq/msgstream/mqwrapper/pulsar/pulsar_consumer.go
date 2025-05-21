@@ -26,10 +26,10 @@ import (
 	"github.com/apache/pulsar-client-go/pulsar"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/mq/common"
-	"github.com/milvus-io/milvus/pkg/mq/msgstream/mqwrapper"
-	"github.com/milvus-io/milvus/pkg/util/retry"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/mq/common"
+	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream/mqwrapper"
+	"github.com/milvus-io/milvus/pkg/v2/util/retry"
 )
 
 // Consumer consumes from pulsar
@@ -51,6 +51,7 @@ func (pc *Consumer) Subscription() string {
 
 // Chan returns a message channel
 func (pc *Consumer) Chan() <-chan common.Message {
+	log := log.Ctx(context.TODO())
 	if pc.msgChannel == nil {
 		pc.once.Do(func() {
 			pc.msgChannel = make(chan common.Message, 256)
@@ -99,6 +100,11 @@ func (pc *Consumer) Chan() <-chan common.Message {
 // Seek seek consume position to the pointed messageID,
 // the pointed messageID will be consumed after the seek in pulsar
 func (pc *Consumer) Seek(id common.MessageID, inclusive bool) error {
+	// If it is the earliest message ID, skip the seek to prevent failure.
+	if id.AtEarliestPosition() {
+		log.Info("seek from earliest position", zap.String("id", string(id.Serialize())), zap.String("sub", pc.Subscription()))
+		return nil
+	}
 	messageID := id.(*pulsarID).messageID
 	err := pc.c.Seek(messageID)
 	if err == nil {

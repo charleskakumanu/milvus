@@ -1,13 +1,18 @@
-// Copyright (C) 2019-2020 Zilliz. All rights reserved.
-//
-// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
 // with the License. You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed under the License
-// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
-// or implied. See the License for the specific language governing permissions and limitations under the License.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package paramtable
 
@@ -17,14 +22,25 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/milvus-io/milvus/pkg/config"
-	"github.com/milvus-io/milvus/pkg/util/metricsinfo"
+	"github.com/milvus-io/milvus/pkg/v2/config"
+	"github.com/milvus-io/milvus/pkg/v2/util"
+	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 func TestServiceParam(t *testing.T) {
 	var SParams ServiceParam
 	bt := NewBaseTable(SkipRemote(true))
 	SParams.init(bt)
+
+	t.Run("test MQConfig", func(t *testing.T) {
+		Params := &SParams.MQCfg
+		assert.Equal(t, 1*time.Second, Params.MergeCheckInterval.GetAsDuration(time.Second))
+		assert.Equal(t, 16, Params.TargetBufSize.GetAsInt())
+		assert.Equal(t, 3*time.Second, Params.MaxTolerantLag.GetAsDuration(time.Second))
+		assert.Equal(t, 60*time.Minute, Params.MaxPositionTsGap.GetAsDuration(time.Minute))
+	})
+
 	t.Run("test etcdConfig", func(t *testing.T) {
 		Params := &SParams.EtcdCfg
 
@@ -80,6 +96,31 @@ func TestServiceParam(t *testing.T) {
 		SParams.init(bt)
 	})
 
+	t.Run("test woodpeckerConfig", func(t *testing.T) {
+		wpCfg := &SParams.WoodpeckerCfg
+		assert.Equal(t, wpCfg.MetaType.GetValue(), "etcd")
+		assert.Equal(t, wpCfg.MetaPrefix.GetValue(), "woodpecker")
+
+		assert.Equal(t, wpCfg.AppendQueueSize.GetAsInt(), 10000)
+		assert.Equal(t, wpCfg.AppendMaxRetries.GetAsInt(), 3)
+		assert.Equal(t, wpCfg.SegmentRollingMaxSize.GetAsSize(), int64(2*1024*1024*1024))
+		assert.Equal(t, wpCfg.SegmentRollingMaxTime.GetAsDurationByParse().Seconds(), float64(600))
+		assert.Equal(t, wpCfg.AuditorMaxInterval.GetAsDurationByParse().Seconds(), float64(10))
+
+		assert.Equal(t, wpCfg.SyncMaxInterval.GetAsDurationByParse().Milliseconds(), int64(200))
+		assert.Equal(t, wpCfg.SyncMaxEntries.GetAsInt(), 100000)
+		assert.Equal(t, wpCfg.SyncMaxBytes.GetAsSize(), int64(64*1024*1024))
+		assert.Equal(t, wpCfg.FlushMaxRetries.GetAsInt(), 5)
+		assert.Equal(t, wpCfg.FlushMaxSize.GetAsSize(), int64(8*1024*1024))
+		assert.Equal(t, wpCfg.FlushMaxThreads.GetAsInt(), 4)
+		assert.Equal(t, wpCfg.RetryInterval.GetAsDurationByParse().Milliseconds(), int64(1000))
+		assert.Equal(t, wpCfg.FragmentCachedMaxBytes.GetAsSize(), int64(512*1024*1024))
+		assert.Equal(t, wpCfg.FragmentCachedInterval.GetAsDurationByParse().Milliseconds(), int64(1000))
+
+		assert.Equal(t, wpCfg.StorageType.GetValue(), "minio")
+		assert.Equal(t, wpCfg.RootPath.GetValue(), "/var/lib/milvus/woodpecker")
+	})
+
 	t.Run("test pulsarConfig", func(t *testing.T) {
 		// test default value
 		{
@@ -91,7 +132,7 @@ func TestServiceParam(t *testing.T) {
 		{
 			assert.NotEqual(t, SParams.PulsarCfg.Address.GetValue(), "")
 			t.Logf("pulsar address = %s", SParams.PulsarCfg.Address.GetValue())
-			assert.Equal(t, SParams.PulsarCfg.MaxMessageSize.GetAsInt(), SuggestPulsarMaxMessageSize)
+			assert.Equal(t, SParams.PulsarCfg.MaxMessageSize.GetAsInt(), 2097152)
 		}
 
 		address := "pulsar://localhost:6650"
@@ -165,7 +206,7 @@ func TestServiceParam(t *testing.T) {
 			kc := &KafkaConfig{}
 			base := &BaseTable{mgr: config.NewManager()}
 			kc.Init(base)
-			assert.Empty(t, kc.Address.GetValue())
+			assert.Equal(t, "localhost:9092", kc.Address.GetValue())
 			assert.Empty(t, kc.SaslMechanisms.GetValue())
 			assert.Empty(t, kc.SecurityProtocol.GetValue())
 			assert.Equal(t, kc.ReadTimeout.GetAsDuration(time.Second), 10*time.Second)
@@ -199,8 +240,38 @@ func TestServiceParam(t *testing.T) {
 
 		assert.Equal(t, Params.IAMEndpoint.GetValue(), "")
 
+		assert.Equal(t, Params.GcpCredentialJSON.GetValue(), "")
+
 		t.Logf("Minio BucketName = %s", Params.BucketName.GetValue())
 
 		t.Logf("Minio rootpath = %s", Params.RootPath.GetValue())
 	})
+
+	t.Run("test metastore config", func(t *testing.T) {
+		Params := &SParams.MetaStoreCfg
+
+		assert.Equal(t, util.MetaStoreTypeEtcd, Params.MetaStoreType.GetValue())
+		assert.Equal(t, 86400*time.Second, Params.SnapshotTTLSeconds.GetAsDuration(time.Second))
+		assert.Equal(t, 3600*time.Second, Params.SnapshotReserveTimeSeconds.GetAsDuration(time.Second))
+		assert.Equal(t, 100000, Params.PaginationSize.GetAsInt())
+		assert.Equal(t, 32, Params.ReadConcurrency.GetAsInt())
+	})
+
+	t.Run("test profile config", func(t *testing.T) {
+		params := &SParams.ProfileCfg
+		assert.Equal(t, "/var/lib/milvus/data/pprof", params.PprofPath.GetValue())
+		bt.Save(params.PprofPath.Key, "/tmp/pprof")
+		assert.Equal(t, "/tmp/pprof", params.PprofPath.GetValue())
+	})
+}
+
+func TestRuntimConfig(t *testing.T) {
+	SetRole(typeutil.StandaloneRole)
+	assert.Equal(t, GetRole(), typeutil.StandaloneRole)
+
+	SetLocalComponentEnabled(typeutil.QueryNodeRole)
+	assert.True(t, IsLocalComponentEnabled(typeutil.QueryNodeRole))
+
+	SetLocalComponentEnabled(typeutil.QueryCoordRole)
+	assert.True(t, IsLocalComponentEnabled(typeutil.QueryCoordRole))
 }

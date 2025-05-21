@@ -22,10 +22,11 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/milvus-io/milvus/pkg/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
 )
 
 type MockMsg struct {
+	*msgstream.BaseMsg
 	Ctx context.Context
 }
 
@@ -43,6 +44,9 @@ func (bm *MockMsg) ID() msgstream.UniqueID {
 
 func (bm *MockMsg) SetID(id msgstream.UniqueID) {
 	// do nothing
+}
+
+func (bm *MockMsg) SetTs(ts uint64) {
 }
 
 func (bm *MockMsg) BeginTs() Timestamp {

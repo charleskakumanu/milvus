@@ -19,14 +19,18 @@
 package expr
 
 import (
+	"context"
 	"fmt"
+	"unsafe"
 
+	"github.com/cockroachdb/errors"
 	"github.com/expr-lang/expr"
 	"github.com/expr-lang/expr/vm"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 var (
@@ -37,7 +41,16 @@ var (
 
 func Init() {
 	v = &vm.VM{}
-	env = make(map[string]any)
+	env = map[string]any{
+		"ctx": context.TODO(),
+		"objSize": func(p any) int {
+			message, ok := p.(proto.Message)
+			if !ok {
+				return int(unsafe.Sizeof(p))
+			}
+			return proto.Size(message)
+		},
+	}
 	authKey = paramtable.Get().EtcdCfg.RootPath.GetValue()
 }
 
@@ -54,18 +67,18 @@ func Exec(code, auth string) (res string, err error) {
 		}
 	}()
 	if v == nil {
-		return "", fmt.Errorf("the expr isn't inited")
+		return "", errors.New("the expr isn't inited")
 	}
 	if code == "" {
-		return "", fmt.Errorf("the expr code is empty")
+		return "", errors.New("the expr code is empty")
 	}
 	if auth == "" {
-		return "", fmt.Errorf("the expr auth is empty")
+		return "", errors.New("the expr auth is empty")
 	}
 	if authKey != auth {
-		return "", fmt.Errorf("the expr auth is invalid")
+		return "", errors.New("the expr auth is invalid")
 	}
-	program, err := expr.Compile(code, expr.Env(env))
+	program, err := expr.Compile(code, expr.Env(env), expr.WithContext("ctx"))
 	if err != nil {
 		log.Warn("expr compile failed", zap.String("code", code), zap.Error(err))
 		return "", err

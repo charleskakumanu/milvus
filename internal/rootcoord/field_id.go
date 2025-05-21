@@ -16,7 +16,7 @@
 
 package rootcoord
 
-import "github.com/milvus-io/milvus/pkg/common"
+import "github.com/milvus-io/milvus/pkg/v2/common"
 
 // system field id:
 // 0: unique row id
@@ -28,6 +28,9 @@ import "github.com/milvus-io/milvus/pkg/common"
 const (
 	// StartOfUserFieldID id of user defined field begin from here
 	StartOfUserFieldID = common.StartOfUserFieldID
+
+	// StartOfUserFunctionID id of user defined function begin from here
+	StartOfUserFunctionID = common.StartOfUserFunctionID
 
 	// RowIDField id of row ID field
 	RowIDField = common.RowIDField

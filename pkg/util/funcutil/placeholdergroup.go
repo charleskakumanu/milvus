@@ -2,15 +2,61 @@ package funcutil
 
 import (
 	"encoding/binary"
-	"fmt"
 	"math"
 
 	"github.com/cockroachdb/errors"
-	"github.com/golang/protobuf/proto"
+	"github.com/samber/lo"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 )
+
+func SparseVectorDataToPlaceholderGroupBytes(contents [][]byte) []byte {
+	placeholderGroup := &commonpb.PlaceholderGroup{
+		Placeholders: []*commonpb.PlaceholderValue{{
+			Tag:    "$0",
+			Type:   commonpb.PlaceholderType_SparseFloatVector,
+			Values: contents,
+		}},
+	}
+
+	bytes, _ := proto.Marshal(placeholderGroup)
+	return bytes
+}
+
+func Float32VectorsToPlaceholderGroup(embs [][]float32) *commonpb.PlaceholderGroup {
+	result := make([][]byte, 0, len(embs))
+	for _, floatVector := range embs {
+		result = append(result, floatVectorToByteVector(floatVector))
+	}
+	placeholderGroup := &commonpb.PlaceholderGroup{
+		Placeholders: []*commonpb.PlaceholderValue{{
+			Tag:    "$0",
+			Type:   commonpb.PlaceholderType_FloatVector,
+			Values: result,
+		}},
+	}
+	return placeholderGroup
+}
+
+func Int8VectorsToPlaceholderGroup(embs [][]int8) *commonpb.PlaceholderGroup {
+	result := make([][]byte, len(embs))
+	for i, int8vector := range embs {
+		result[i] = make([]byte, len(int8vector))
+		for j, val := range int8vector {
+			result[i][j] = byte(val)
+		}
+	}
+	placeholderGroup := &commonpb.PlaceholderGroup{
+		Placeholders: []*commonpb.PlaceholderValue{{
+			Tag:    "$0",
+			Type:   commonpb.PlaceholderType_Int8Vector,
+			Values: result,
+		}},
+	}
+	return placeholderGroup
+}
 
 func FieldDataToPlaceholderGroupBytes(fieldData *schemapb.FieldData) ([]byte, error) {
 	placeholderValue, err := fieldDataToPlaceholderValue(fieldData)
@@ -83,14 +129,31 @@ func fieldDataToPlaceholderValue(fieldData *schemapb.FieldData) (*commonpb.Place
 			return nil, errors.New("vector data is not schemapb.VectorField_SparseFloatVector")
 		}
 		vec := vectors.SparseFloatVector
-		bytes, err := proto.Marshal(vec)
-		if err != nil {
-			return nil, fmt.Errorf("failed to marshal schemapb.SparseFloatArray to bytes: %w", err)
-		}
 		placeholderValue := &commonpb.PlaceholderValue{
 			Tag:    "$0",
 			Type:   commonpb.PlaceholderType_SparseFloatVector,
-			Values: [][]byte{bytes},
+			Values: vec.Contents,
+		}
+		return placeholderValue, nil
+	case schemapb.DataType_Int8Vector:
+		vectors := fieldData.GetVectors()
+		x, ok := vectors.GetData().(*schemapb.VectorField_Int8Vector)
+		if !ok {
+			return nil, errors.New("vector data is not schemapb.VectorField_Int8Vector")
+		}
+
+		placeholderValue := &commonpb.PlaceholderValue{
+			Tag:    "$0",
+			Type:   commonpb.PlaceholderType_Int8Vector,
+			Values: flattenedInt8VectorsToByteVectors(x.Int8Vector, int(vectors.Dim)),
+		}
+		return placeholderValue, nil
+	case schemapb.DataType_VarChar:
+		strs := fieldData.GetScalars().GetStringData().GetData()
+		placeholderValue := &commonpb.PlaceholderValue{
+			Tag:    "$0",
+			Type:   commonpb.PlaceholderType_VarChar,
+			Values: lo.Map(strs, func(str string, _ int) []byte { return []byte(str) }),
 		}
 		return placeholderValue, nil
 	default:
@@ -104,7 +167,6 @@ func flattenedFloatVectorsToByteVectors(flattenedVectors []float32, dimension in
 	for _, floatVector := range floatVectors {
 		result = append(result, floatVectorToByteVector(floatVector))
 	}
-
 	return result
 }
 
@@ -136,24 +198,31 @@ func flattenedByteVectorsToByteVectors(flattenedVectors []byte, dimension int) [
 
 func flattenedFloat16VectorsToByteVectors(flattenedVectors []byte, dimension int) [][]byte {
 	result := make([][]byte, 0)
-
 	vectorBytes := 2 * dimension
-
 	for i := 0; i < len(flattenedVectors); i += vectorBytes {
 		result = append(result, flattenedVectors[i:i+vectorBytes])
 	}
-
 	return result
 }
 
 func flattenedBFloat16VectorsToByteVectors(flattenedVectors []byte, dimension int) [][]byte {
 	result := make([][]byte, 0)
-
 	vectorBytes := 2 * dimension
-
 	for i := 0; i < len(flattenedVectors); i += vectorBytes {
 		result = append(result, flattenedVectors[i:i+vectorBytes])
 	}
-
 	return result
+}
+
+func flattenedInt8VectorsToByteVectors(flattenedVectors []byte, dimension int) [][]byte {
+	result := make([][]byte, 0)
+	vectorBytes := dimension
+	for i := 0; i < len(flattenedVectors); i += vectorBytes {
+		result = append(result, flattenedVectors[i:i+vectorBytes])
+	}
+	return result
+}
+
+func GetVarCharFromPlaceholder(holder *commonpb.PlaceholderValue) []string {
+	return lo.Map(holder.Values, func(bytes []byte, _ int) string { return string(bytes) })
 }

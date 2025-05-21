@@ -19,19 +19,27 @@ package pipeline
 import (
 	"github.com/milvus-io/milvus/internal/querynodev2/delegator"
 	base "github.com/milvus-io/milvus/internal/util/pipeline"
-	"github.com/milvus-io/milvus/pkg/mq/msgdispatcher"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/mq/msgdispatcher"
+	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 // pipeline used for querynode
 type Pipeline interface {
 	base.StreamPipeline
+	GetCollectionID() UniqueID
 }
 
 type pipeline struct {
 	base.StreamPipeline
 
-	collectionID UniqueID
+	collectionID  UniqueID
+	embeddingNode embeddingNode
+}
+
+func (p *pipeline) GetCollectionID() UniqueID {
+	return p.collectionID
 }
 
 func (p *pipeline) Close() {
@@ -39,23 +47,41 @@ func (p *pipeline) Close() {
 }
 
 func NewPipeLine(
-	collectionID UniqueID,
+	collection *Collection,
 	channel string,
 	manager *DataManager,
-	tSafeManager TSafeManager,
 	dispatcher msgdispatcher.Client,
 	delegator delegator.ShardDelegator,
 ) (Pipeline, error) {
+	collectionID := collection.ID()
+	replicateID, _ := common.GetReplicateID(collection.Schema().GetProperties())
+	if replicateID == "" {
+		replicateID, _ = common.GetReplicateID(collection.GetDBProperties())
+	}
+	replicateConfig := msgstream.GetReplicateConfig(replicateID, collection.GetDBName(), collection.Schema().Name)
 	pipelineQueueLength := paramtable.Get().QueryNodeCfg.FlowGraphMaxQueueLength.GetAsInt32()
 
 	p := &pipeline{
 		collectionID:   collectionID,
-		StreamPipeline: base.NewPipelineWithStream(dispatcher, nodeCtxTtInterval, enableTtChecker, channel),
+		StreamPipeline: base.NewPipelineWithStream(dispatcher, nodeCtxTtInterval, enableTtChecker, channel, replicateConfig),
 	}
 
 	filterNode := newFilterNode(collectionID, channel, manager, delegator, pipelineQueueLength)
+
+	embeddingNode, err := newEmbeddingNode(collectionID, channel, manager, pipelineQueueLength)
+	if err != nil {
+		return nil, err
+	}
+
 	insertNode := newInsertNode(collectionID, channel, manager, delegator, pipelineQueueLength)
-	deleteNode := newDeleteNode(collectionID, channel, manager, tSafeManager, delegator, pipelineQueueLength)
-	p.Add(filterNode, insertNode, deleteNode)
+	deleteNode := newDeleteNode(collectionID, channel, manager, delegator, pipelineQueueLength)
+
+	// skip add embedding node when collection has no function.
+	if embeddingNode != nil {
+		p.Add(filterNode, embeddingNode, insertNode, deleteNode)
+	} else {
+		p.Add(filterNode, insertNode, deleteNode)
+	}
+
 	return p, nil
 }

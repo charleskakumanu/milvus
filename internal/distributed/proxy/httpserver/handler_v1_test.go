@@ -1,9 +1,24 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package httpserver
 
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -20,13 +35,14 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/json"
 	"github.com/milvus-io/milvus/internal/mocks"
 	"github.com/milvus-io/milvus/internal/proxy"
 	"github.com/milvus-io/milvus/internal/types"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 const (
@@ -44,6 +60,7 @@ const (
 
 var StatusSuccess = commonpb.Status{
 	ErrorCode: commonpb.ErrorCode_Success,
+	Code:      merr.Code(nil),
 	Reason:    "",
 }
 
@@ -56,7 +73,7 @@ var DefaultShowCollectionsResp = milvuspb.ShowCollectionsResponse{
 
 var DefaultDescCollectionResp = milvuspb.DescribeCollectionResponse{
 	CollectionName: DefaultCollectionName,
-	Schema:         generateCollectionSchema(schemapb.DataType_Int64),
+	Schema:         generateCollectionSchema(schemapb.DataType_Int64, false, true),
 	ShardsNum:      ShardNumDefault,
 	Status:         &StatusSuccess,
 }
@@ -79,6 +96,11 @@ var DefaultTrueResp = milvuspb.BoolResponse{
 var DefaultFalseResp = milvuspb.BoolResponse{
 	Status: &StatusSuccess,
 	Value:  false,
+}
+
+func getDefaultRootPassword() string {
+	paramtable.Init()
+	return paramtable.Get().CommonCfg.DefaultRootPassword.GetValue()
 }
 
 func versional(path string) string {
@@ -121,13 +143,16 @@ func initHTTPServer(proxy types.ProxyComponent, needAuth bool) *gin.Engine {
 ----|----------------|----------------|----------------
 */
 func genAuthMiddleWare(needAuth bool) gin.HandlerFunc {
+	InitMockGlobalMetaCache()
+	proxy.AddRootUserToAdminRole()
 	if needAuth {
 		return func(c *gin.Context) {
+			// proxy.RemoveRootUserFromAdminRole()
 			c.Set(ContextUsername, "")
 			username, password, ok := ParseUsernamePassword(c)
 			if !ok {
 				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{HTTPReturnCode: merr.Code(merr.ErrNeedAuthenticate), HTTPReturnMessage: merr.ErrNeedAuthenticate.Error()})
-			} else if username == util.UserRoot && password != util.DefaultRootPassword {
+			} else if username == util.UserRoot && password != getDefaultRootPassword() {
 				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{HTTPReturnCode: merr.Code(merr.ErrNeedAuthenticate), HTTPReturnMessage: merr.ErrNeedAuthenticate.Error()})
 			} else {
 				c.Set(ContextUsername, username)
@@ -137,6 +162,10 @@ func genAuthMiddleWare(needAuth bool) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Set(ContextUsername, util.UserRoot)
 	}
+}
+
+func InitMockGlobalMetaCache() {
+	proxy.InitEmptyGlobalCache()
 }
 
 func Print(code int32, message string) string {
@@ -182,7 +211,7 @@ func TestVectorAuthenticate(t *testing.T) {
 
 	t.Run("root's password correct", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, versional(VectorCollectionsPath), nil)
-		req.SetBasicAuth(util.UserRoot, util.DefaultRootPassword)
+		req.SetBasicAuth(util.UserRoot, getDefaultRootPassword())
 		w := httptest.NewRecorder()
 		testEngine.ServeHTTP(w, req)
 		assert.Equal(t, http.StatusOK, w.Code)
@@ -236,7 +265,7 @@ func TestVectorListCollection(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			testEngine := initHTTPServer(tt.mp, true)
 			req := httptest.NewRequest(http.MethodGet, versional(VectorCollectionsPath), nil)
-			req.SetBasicAuth(util.UserRoot, util.DefaultRootPassword)
+			req.SetBasicAuth(util.UserRoot, getDefaultRootPassword())
 			w := httptest.NewRecorder()
 			testEngine.ServeHTTP(w, req)
 			assert.Equal(t, tt.exceptCode, w.Code)
@@ -271,7 +300,7 @@ func TestVectorCollectionsDescribe(t *testing.T) {
 		name:         "get load status fail",
 		mp:           mp2,
 		exceptCode:   http.StatusOK,
-		expectedBody: "{\"code\":200,\"data\":{\"collectionName\":\"" + DefaultCollectionName + "\",\"description\":\"\",\"enableDynamicField\":true,\"fields\":[{\"autoId\":false,\"description\":\"\",\"name\":\"book_id\",\"partitionKey\":false,\"primaryKey\":true,\"type\":\"Int64\"},{\"autoId\":false,\"description\":\"\",\"name\":\"word_count\",\"partitionKey\":false,\"primaryKey\":false,\"type\":\"Int64\"},{\"autoId\":false,\"description\":\"\",\"name\":\"book_intro\",\"partitionKey\":false,\"primaryKey\":false,\"type\":\"FloatVector(2)\"}],\"indexes\":[{\"fieldName\":\"book_intro\",\"indexName\":\"" + DefaultIndexName + "\",\"metricType\":\"COSINE\"}],\"load\":\"\",\"shardsNum\":1}}",
+		expectedBody: "{\"code\":200,\"data\":{\"collectionName\":\"" + DefaultCollectionName + "\",\"description\":\"\",\"enableDynamicField\":true,\"fields\":[{\"autoId\":false,\"clusteringKey\":false,\"description\":\"\",\"name\":\"book_id\",\"nullable\":false,\"partitionKey\":false,\"primaryKey\":true,\"type\":\"Int64\"},{\"autoId\":false,\"clusteringKey\":false,\"description\":\"\",\"name\":\"word_count\",\"nullable\":false,\"partitionKey\":false,\"primaryKey\":false,\"type\":\"Int64\"},{\"autoId\":false,\"clusteringKey\":false,\"description\":\"\",\"name\":\"book_intro\",\"nullable\":false,\"partitionKey\":false,\"primaryKey\":false,\"type\":\"FloatVector(2)\"}],\"indexes\":[{\"fieldName\":\"book_intro\",\"indexName\":\"" + DefaultIndexName + "\",\"metricType\":\"COSINE\"}],\"load\":\"\",\"shardsNum\":1}}",
 	})
 
 	mp3 := mocks.NewMockProxy(t)
@@ -282,7 +311,7 @@ func TestVectorCollectionsDescribe(t *testing.T) {
 		name:         "get indexes fail",
 		mp:           mp3,
 		exceptCode:   http.StatusOK,
-		expectedBody: "{\"code\":200,\"data\":{\"collectionName\":\"" + DefaultCollectionName + "\",\"description\":\"\",\"enableDynamicField\":true,\"fields\":[{\"autoId\":false,\"description\":\"\",\"name\":\"book_id\",\"partitionKey\":false,\"primaryKey\":true,\"type\":\"Int64\"},{\"autoId\":false,\"description\":\"\",\"name\":\"word_count\",\"partitionKey\":false,\"primaryKey\":false,\"type\":\"Int64\"},{\"autoId\":false,\"description\":\"\",\"name\":\"book_intro\",\"partitionKey\":false,\"primaryKey\":false,\"type\":\"FloatVector(2)\"}],\"indexes\":[],\"load\":\"LoadStateLoaded\",\"shardsNum\":1}}",
+		expectedBody: "{\"code\":200,\"data\":{\"collectionName\":\"" + DefaultCollectionName + "\",\"description\":\"\",\"enableDynamicField\":true,\"fields\":[{\"autoId\":false,\"clusteringKey\":false,\"description\":\"\",\"name\":\"book_id\",\"nullable\":false,\"partitionKey\":false,\"primaryKey\":true,\"type\":\"Int64\"},{\"autoId\":false,\"clusteringKey\":false,\"description\":\"\",\"name\":\"word_count\",\"nullable\":false,\"partitionKey\":false,\"primaryKey\":false,\"type\":\"Int64\"},{\"autoId\":false,\"clusteringKey\":false,\"description\":\"\",\"name\":\"book_intro\",\"nullable\":false,\"partitionKey\":false,\"primaryKey\":false,\"type\":\"FloatVector(2)\"}],\"indexes\":[],\"load\":\"LoadStateLoaded\",\"shardsNum\":1}}",
 	})
 
 	mp4 := mocks.NewMockProxy(t)
@@ -293,14 +322,14 @@ func TestVectorCollectionsDescribe(t *testing.T) {
 		name:         "show collection details success",
 		mp:           mp4,
 		exceptCode:   http.StatusOK,
-		expectedBody: "{\"code\":200,\"data\":{\"collectionName\":\"" + DefaultCollectionName + "\",\"description\":\"\",\"enableDynamicField\":true,\"fields\":[{\"autoId\":false,\"description\":\"\",\"name\":\"book_id\",\"partitionKey\":false,\"primaryKey\":true,\"type\":\"Int64\"},{\"autoId\":false,\"description\":\"\",\"name\":\"word_count\",\"partitionKey\":false,\"primaryKey\":false,\"type\":\"Int64\"},{\"autoId\":false,\"description\":\"\",\"name\":\"book_intro\",\"partitionKey\":false,\"primaryKey\":false,\"type\":\"FloatVector(2)\"}],\"indexes\":[{\"fieldName\":\"book_intro\",\"indexName\":\"" + DefaultIndexName + "\",\"metricType\":\"COSINE\"}],\"load\":\"LoadStateLoaded\",\"shardsNum\":1}}",
+		expectedBody: "{\"code\":200,\"data\":{\"collectionName\":\"" + DefaultCollectionName + "\",\"description\":\"\",\"enableDynamicField\":true,\"fields\":[{\"autoId\":false,\"clusteringKey\":false,\"description\":\"\",\"name\":\"book_id\",\"nullable\":false,\"partitionKey\":false,\"primaryKey\":true,\"type\":\"Int64\"},{\"autoId\":false,\"clusteringKey\":false,\"description\":\"\",\"name\":\"word_count\",\"nullable\":false,\"partitionKey\":false,\"primaryKey\":false,\"type\":\"Int64\"},{\"autoId\":false,\"clusteringKey\":false,\"description\":\"\",\"name\":\"book_intro\",\"nullable\":false,\"partitionKey\":false,\"primaryKey\":false,\"type\":\"FloatVector(2)\"}],\"indexes\":[{\"fieldName\":\"book_intro\",\"indexName\":\"" + DefaultIndexName + "\",\"metricType\":\"COSINE\"}],\"load\":\"LoadStateLoaded\",\"shardsNum\":1}}",
 	})
 
 	for _, tt := range testCases {
 		t.Run(tt.name, func(t *testing.T) {
 			testEngine := initHTTPServer(tt.mp, true)
 			req := httptest.NewRequest(http.MethodGet, versional(VectorCollectionsDescribePath)+"?collectionName="+DefaultCollectionName, nil)
-			req.SetBasicAuth(util.UserRoot, util.DefaultRootPassword)
+			req.SetBasicAuth(util.UserRoot, getDefaultRootPassword())
 			w := httptest.NewRecorder()
 			testEngine.ServeHTTP(w, req)
 			assert.Equal(t, tt.exceptCode, w.Code)
@@ -314,7 +343,7 @@ func TestVectorCollectionsDescribe(t *testing.T) {
 	t.Run("need collectionName", func(t *testing.T) {
 		testEngine := initHTTPServer(mocks.NewMockProxy(t), true)
 		req := httptest.NewRequest(http.MethodGet, versional(VectorCollectionsDescribePath)+"?"+DefaultCollectionName, nil)
-		req.SetBasicAuth(util.UserRoot, util.DefaultRootPassword)
+		req.SetBasicAuth(util.UserRoot, getDefaultRootPassword())
 		w := httptest.NewRecorder()
 		testEngine.ServeHTTP(w, req)
 		assert.Equal(t, http.StatusOK, w.Code)
@@ -335,7 +364,7 @@ func TestVectorCreateCollection(t *testing.T) {
 		expectedBody: PrintErr(ErrDefault),
 	})
 
-	err := merr.WrapErrCollectionNumLimitExceeded(65535)
+	err := merr.WrapErrCollectionNumLimitExceeded("default", 65535)
 	mp2 := mocks.NewMockProxy(t)
 	mp2.EXPECT().CreateCollection(mock.Anything, mock.Anything).Return(merr.Status(err), nil).Once()
 	testCases = append(testCases, testCase{
@@ -383,7 +412,7 @@ func TestVectorCreateCollection(t *testing.T) {
 			jsonBody := []byte(`{"collectionName": "` + DefaultCollectionName + `", "dimension": 2}`)
 			bodyReader := bytes.NewReader(jsonBody)
 			req := httptest.NewRequest(http.MethodPost, versional(VectorCollectionsCreatePath), bodyReader)
-			req.SetBasicAuth(util.UserRoot, util.DefaultRootPassword)
+			req.SetBasicAuth(util.UserRoot, getDefaultRootPassword())
 			w := httptest.NewRecorder()
 			testEngine.ServeHTTP(w, req)
 			assert.Equal(t, tt.exceptCode, w.Code)
@@ -440,7 +469,7 @@ func TestVectorDropCollection(t *testing.T) {
 			jsonBody := []byte(`{"collectionName": "` + DefaultCollectionName + `"}`)
 			bodyReader := bytes.NewReader(jsonBody)
 			req := httptest.NewRequest(http.MethodPost, versional(VectorCollectionsDropPath), bodyReader)
-			req.SetBasicAuth(util.UserRoot, util.DefaultRootPassword)
+			req.SetBasicAuth(util.UserRoot, getDefaultRootPassword())
 			w := httptest.NewRecorder()
 			testEngine.ServeHTTP(w, req)
 			assert.Equal(t, tt.exceptCode, w.Code)
@@ -508,15 +537,19 @@ func TestQuery(t *testing.T) {
 		name:         "query success",
 		mp:           mp5,
 		exceptCode:   200,
-		expectedBody: "{\"code\":200,\"data\":[{\"book_id\":1,\"book_intro\":[0.1,0.11],\"word_count\":1000},{\"book_id\":2,\"book_intro\":[0.2,0.22],\"word_count\":2000},{\"book_id\":3,\"book_intro\":[0.3,0.33],\"word_count\":3000}]}",
+		expectedBody: "{\"code\":200,\"data\":[{\"book_id\":1,\"book_intro\":[0.1,0.11],\"word_count\":1000},{\"book_id\":2,\"book_intro\":[0.2,0.22],\"word_count\":2000},{\"book_id\":3,\"book_intro\":[0.3,0.33],\"word_count\":3000}]}\n",
 	})
+
+	// disable rate limit
+	paramtable.Get().Save(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key, "false")
+	defer paramtable.Get().Save(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key, "true")
 
 	for _, tt := range testCases {
 		reqs := []*http.Request{genQueryRequest(), genGetRequest()}
 		t.Run(tt.name, func(t *testing.T) {
 			testEngine := initHTTPServer(tt.mp, true)
 			for _, req := range reqs {
-				req.SetBasicAuth(util.UserRoot, util.DefaultRootPassword)
+				req.SetBasicAuth(util.UserRoot, getDefaultRootPassword())
 				w := httptest.NewRecorder()
 				testEngine.ServeHTTP(w, req)
 				assert.Equal(t, tt.exceptCode, w.Code)
@@ -595,13 +628,17 @@ func TestDelete(t *testing.T) {
 		expectedBody: "{\"code\":200,\"data\":{}}",
 	})
 
+	// disable rate limit
+	paramtable.Get().Save(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key, "false")
+	defer paramtable.Get().Save(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key, "true")
+
 	for _, tt := range testCases {
 		t.Run(tt.name, func(t *testing.T) {
 			testEngine := initHTTPServer(tt.mp, true)
 			jsonBody := []byte(`{"collectionName": "` + DefaultCollectionName + `" , "id": [1,2,3]}`)
 			bodyReader := bytes.NewReader(jsonBody)
 			req := httptest.NewRequest(http.MethodPost, versional(VectorDeletePath), bodyReader)
-			req.SetBasicAuth(util.UserRoot, util.DefaultRootPassword)
+			req.SetBasicAuth(util.UserRoot, getDefaultRootPassword())
 			w := httptest.NewRecorder()
 			testEngine.ServeHTTP(w, req)
 			assert.Equal(t, tt.exceptCode, w.Code)
@@ -618,11 +655,15 @@ func TestDelete(t *testing.T) {
 }
 
 func TestDeleteForFilter(t *testing.T) {
+	paramtable.Init()
 	jsonBodyList := [][]byte{
 		[]byte(`{"collectionName": "` + DefaultCollectionName + `" , "id": [1,2,3]}`),
 		[]byte(`{"collectionName": "` + DefaultCollectionName + `" , "filter": "id in [1,2,3]"}`),
 		[]byte(`{"collectionName": "` + DefaultCollectionName + `" , "id": [1,2,3], "filter": "id in [1,2,3]"}`),
 	}
+	// disable rate limit
+	paramtable.Get().Save(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key, "false")
+	defer paramtable.Get().Save(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key, "true")
 	for _, jsonBody := range jsonBodyList {
 		t.Run("delete success", func(t *testing.T) {
 			mp := mocks.NewMockProxy(t)
@@ -633,7 +674,7 @@ func TestDeleteForFilter(t *testing.T) {
 			testEngine := initHTTPServer(mp, true)
 			bodyReader := bytes.NewReader(jsonBody)
 			req := httptest.NewRequest(http.MethodPost, versional(VectorDeletePath), bodyReader)
-			req.SetBasicAuth(util.UserRoot, util.DefaultRootPassword)
+			req.SetBasicAuth(util.UserRoot, getDefaultRootPassword())
 			w := httptest.NewRecorder()
 			testEngine.ServeHTTP(w, req)
 			assert.Equal(t, http.StatusOK, w.Code)
@@ -720,12 +761,16 @@ func TestInsert(t *testing.T) {
 		HTTPCollectionName: DefaultCollectionName,
 		HTTPReturnData:     rows[0],
 	})
+	// disable rate limit
+	paramtable.Get().Save(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key, "false")
+	defer paramtable.Get().Save(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key, "true")
+
 	for _, tt := range testCases {
 		t.Run(tt.name, func(t *testing.T) {
 			testEngine := initHTTPServer(tt.mp, true)
 			bodyReader := bytes.NewReader(data)
 			req := httptest.NewRequest(http.MethodPost, versional(VectorInsertPath), bodyReader)
-			req.SetBasicAuth(util.UserRoot, util.DefaultRootPassword)
+			req.SetBasicAuth(util.UserRoot, getDefaultRootPassword())
 			w := httptest.NewRecorder()
 			testEngine.ServeHTTP(w, req)
 			assert.Equal(t, tt.exceptCode, w.Code)
@@ -746,7 +791,7 @@ func TestInsert(t *testing.T) {
 		testEngine := initHTTPServer(mp, true)
 		bodyReader := bytes.NewReader([]byte(`{"collectionName": "` + DefaultCollectionName + `", "data": {}}`))
 		req := httptest.NewRequest(http.MethodPost, versional(VectorInsertPath), bodyReader)
-		req.SetBasicAuth(util.UserRoot, util.DefaultRootPassword)
+		req.SetBasicAuth(util.UserRoot, getDefaultRootPassword())
 		w := httptest.NewRecorder()
 		testEngine.ServeHTTP(w, req)
 		assert.Equal(t, http.StatusOK, w.Code)
@@ -761,10 +806,13 @@ func TestInsertForDataType(t *testing.T) {
 	paramtable.Init()
 	paramtable.Get().Save(proxy.Params.HTTPCfg.AcceptTypeAllowInt64.Key, "true")
 	schemas := map[string]*schemapb.CollectionSchema{
-		"[success]kinds of data type": newCollectionSchema(generateCollectionSchema(schemapb.DataType_Int64)),
-		"[success]with dynamic field": withDynamicField(newCollectionSchema(generateCollectionSchema(schemapb.DataType_Int64))),
-		"[success]with array fields":  withArrayField(newCollectionSchema(generateCollectionSchema(schemapb.DataType_Int64))),
+		"[success]kinds of data type": newCollectionSchema(generateCollectionSchema(schemapb.DataType_Int64, false, true)),
+		"[success]with dynamic field": withDynamicField(newCollectionSchema(generateCollectionSchema(schemapb.DataType_Int64, false, true))),
+		"[success]with array fields":  withArrayField(newCollectionSchema(generateCollectionSchema(schemapb.DataType_Int64, false, true))),
 	}
+	// disable rate limit
+	paramtable.Get().Save(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key, "false")
+	defer paramtable.Get().Save(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key, "true")
 	for name, schema := range schemas {
 		t.Run(name, func(t *testing.T) {
 			mp := mocks.NewMockProxy(t)
@@ -787,7 +835,7 @@ func TestInsertForDataType(t *testing.T) {
 			})
 			bodyReader := bytes.NewReader(data)
 			req := httptest.NewRequest(http.MethodPost, versional(VectorInsertPath), bodyReader)
-			req.SetBasicAuth(util.UserRoot, util.DefaultRootPassword)
+			req.SetBasicAuth(util.UserRoot, getDefaultRootPassword())
 			w := httptest.NewRecorder()
 			testEngine.ServeHTTP(w, req)
 			assert.Equal(t, http.StatusOK, w.Code)
@@ -812,7 +860,7 @@ func TestInsertForDataType(t *testing.T) {
 			})
 			bodyReader := bytes.NewReader(data)
 			req := httptest.NewRequest(http.MethodPost, versional(VectorInsertPath), bodyReader)
-			req.SetBasicAuth(util.UserRoot, util.DefaultRootPassword)
+			req.SetBasicAuth(util.UserRoot, getDefaultRootPassword())
 			w := httptest.NewRecorder()
 			testEngine.ServeHTTP(w, req)
 			assert.Equal(t, http.StatusOK, w.Code)
@@ -832,9 +880,12 @@ func TestReturnInt64(t *testing.T) {
 		schemapb.DataType_Int64:   "1,2,3",
 		schemapb.DataType_VarChar: "\"1\",\"2\",\"3\"",
 	}
+	// disable rate limit
+	paramtable.Get().Save(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key, "false")
+	defer paramtable.Get().Save(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key, "true")
 	for _, dataType := range schemas {
 		t.Run("[insert]httpCfg.allow: false", func(t *testing.T) {
-			schema := newCollectionSchema(generateCollectionSchema(dataType))
+			schema := newCollectionSchema(generateCollectionSchema(dataType, false, true))
 			mp := mocks.NewMockProxy(t)
 			mp.EXPECT().DescribeCollection(mock.Anything, mock.Anything).Return(&milvuspb.DescribeCollectionResponse{
 				CollectionName: DefaultCollectionName,
@@ -855,7 +906,7 @@ func TestReturnInt64(t *testing.T) {
 			})
 			bodyReader := bytes.NewReader(data)
 			req := httptest.NewRequest(http.MethodPost, versional(VectorInsertPath), bodyReader)
-			req.SetBasicAuth(util.UserRoot, util.DefaultRootPassword)
+			req.SetBasicAuth(util.UserRoot, getDefaultRootPassword())
 			w := httptest.NewRecorder()
 			testEngine.ServeHTTP(w, req)
 			assert.Equal(t, http.StatusOK, w.Code)
@@ -865,7 +916,7 @@ func TestReturnInt64(t *testing.T) {
 
 	for _, dataType := range schemas {
 		t.Run("[upsert]httpCfg.allow: false", func(t *testing.T) {
-			schema := newCollectionSchema(generateCollectionSchema(dataType))
+			schema := newCollectionSchema(generateCollectionSchema(dataType, false, true))
 			mp := mocks.NewMockProxy(t)
 			mp.EXPECT().DescribeCollection(mock.Anything, mock.Anything).Return(&milvuspb.DescribeCollectionResponse{
 				CollectionName: DefaultCollectionName,
@@ -886,7 +937,7 @@ func TestReturnInt64(t *testing.T) {
 			})
 			bodyReader := bytes.NewReader(data)
 			req := httptest.NewRequest(http.MethodPost, versional(VectorUpsertPath), bodyReader)
-			req.SetBasicAuth(util.UserRoot, util.DefaultRootPassword)
+			req.SetBasicAuth(util.UserRoot, getDefaultRootPassword())
 			w := httptest.NewRecorder()
 			testEngine.ServeHTTP(w, req)
 			assert.Equal(t, http.StatusOK, w.Code)
@@ -896,7 +947,7 @@ func TestReturnInt64(t *testing.T) {
 
 	for _, dataType := range schemas {
 		t.Run("[insert]httpCfg.allow: false, Accept-Type-Allow-Int64: true", func(t *testing.T) {
-			schema := newCollectionSchema(generateCollectionSchema(dataType))
+			schema := newCollectionSchema(generateCollectionSchema(dataType, false, true))
 			mp := mocks.NewMockProxy(t)
 			mp.EXPECT().DescribeCollection(mock.Anything, mock.Anything).Return(&milvuspb.DescribeCollectionResponse{
 				CollectionName: DefaultCollectionName,
@@ -917,7 +968,7 @@ func TestReturnInt64(t *testing.T) {
 			})
 			bodyReader := bytes.NewReader(data)
 			req := httptest.NewRequest(http.MethodPost, versional(VectorInsertPath), bodyReader)
-			req.SetBasicAuth(util.UserRoot, util.DefaultRootPassword)
+			req.SetBasicAuth(util.UserRoot, getDefaultRootPassword())
 			req.Header.Set(HTTPHeaderAllowInt64, "true")
 			w := httptest.NewRecorder()
 			testEngine.ServeHTTP(w, req)
@@ -928,7 +979,7 @@ func TestReturnInt64(t *testing.T) {
 
 	for _, dataType := range schemas {
 		t.Run("[upsert]httpCfg.allow: false, Accept-Type-Allow-Int64: true", func(t *testing.T) {
-			schema := newCollectionSchema(generateCollectionSchema(dataType))
+			schema := newCollectionSchema(generateCollectionSchema(dataType, false, true))
 			mp := mocks.NewMockProxy(t)
 			mp.EXPECT().DescribeCollection(mock.Anything, mock.Anything).Return(&milvuspb.DescribeCollectionResponse{
 				CollectionName: DefaultCollectionName,
@@ -949,7 +1000,7 @@ func TestReturnInt64(t *testing.T) {
 			})
 			bodyReader := bytes.NewReader(data)
 			req := httptest.NewRequest(http.MethodPost, versional(VectorUpsertPath), bodyReader)
-			req.SetBasicAuth(util.UserRoot, util.DefaultRootPassword)
+			req.SetBasicAuth(util.UserRoot, getDefaultRootPassword())
 			req.Header.Set(HTTPHeaderAllowInt64, "true")
 			w := httptest.NewRecorder()
 			testEngine.ServeHTTP(w, req)
@@ -961,7 +1012,7 @@ func TestReturnInt64(t *testing.T) {
 	paramtable.Get().Save(proxy.Params.HTTPCfg.AcceptTypeAllowInt64.Key, "true")
 	for _, dataType := range schemas {
 		t.Run("[insert]httpCfg.allow: true", func(t *testing.T) {
-			schema := newCollectionSchema(generateCollectionSchema(dataType))
+			schema := newCollectionSchema(generateCollectionSchema(dataType, false, true))
 			mp := mocks.NewMockProxy(t)
 			mp.EXPECT().DescribeCollection(mock.Anything, mock.Anything).Return(&milvuspb.DescribeCollectionResponse{
 				CollectionName: DefaultCollectionName,
@@ -982,7 +1033,7 @@ func TestReturnInt64(t *testing.T) {
 			})
 			bodyReader := bytes.NewReader(data)
 			req := httptest.NewRequest(http.MethodPost, versional(VectorInsertPath), bodyReader)
-			req.SetBasicAuth(util.UserRoot, util.DefaultRootPassword)
+			req.SetBasicAuth(util.UserRoot, getDefaultRootPassword())
 			w := httptest.NewRecorder()
 			testEngine.ServeHTTP(w, req)
 			assert.Equal(t, http.StatusOK, w.Code)
@@ -992,7 +1043,7 @@ func TestReturnInt64(t *testing.T) {
 
 	for _, dataType := range schemas {
 		t.Run("[upsert]httpCfg.allow: true", func(t *testing.T) {
-			schema := newCollectionSchema(generateCollectionSchema(dataType))
+			schema := newCollectionSchema(generateCollectionSchema(dataType, false, true))
 			mp := mocks.NewMockProxy(t)
 			mp.EXPECT().DescribeCollection(mock.Anything, mock.Anything).Return(&milvuspb.DescribeCollectionResponse{
 				CollectionName: DefaultCollectionName,
@@ -1013,7 +1064,7 @@ func TestReturnInt64(t *testing.T) {
 			})
 			bodyReader := bytes.NewReader(data)
 			req := httptest.NewRequest(http.MethodPost, versional(VectorUpsertPath), bodyReader)
-			req.SetBasicAuth(util.UserRoot, util.DefaultRootPassword)
+			req.SetBasicAuth(util.UserRoot, getDefaultRootPassword())
 			w := httptest.NewRecorder()
 			testEngine.ServeHTTP(w, req)
 			assert.Equal(t, http.StatusOK, w.Code)
@@ -1023,7 +1074,7 @@ func TestReturnInt64(t *testing.T) {
 
 	for _, dataType := range schemas {
 		t.Run("[insert]httpCfg.allow: true, Accept-Type-Allow-Int64: false", func(t *testing.T) {
-			schema := newCollectionSchema(generateCollectionSchema(dataType))
+			schema := newCollectionSchema(generateCollectionSchema(dataType, false, true))
 			mp := mocks.NewMockProxy(t)
 			mp.EXPECT().DescribeCollection(mock.Anything, mock.Anything).Return(&milvuspb.DescribeCollectionResponse{
 				CollectionName: DefaultCollectionName,
@@ -1044,7 +1095,7 @@ func TestReturnInt64(t *testing.T) {
 			})
 			bodyReader := bytes.NewReader(data)
 			req := httptest.NewRequest(http.MethodPost, versional(VectorInsertPath), bodyReader)
-			req.SetBasicAuth(util.UserRoot, util.DefaultRootPassword)
+			req.SetBasicAuth(util.UserRoot, getDefaultRootPassword())
 			req.Header.Set(HTTPHeaderAllowInt64, "false")
 			w := httptest.NewRecorder()
 			testEngine.ServeHTTP(w, req)
@@ -1055,7 +1106,7 @@ func TestReturnInt64(t *testing.T) {
 
 	for _, dataType := range schemas {
 		t.Run("[upsert]httpCfg.allow: true, Accept-Type-Allow-Int64: false", func(t *testing.T) {
-			schema := newCollectionSchema(generateCollectionSchema(dataType))
+			schema := newCollectionSchema(generateCollectionSchema(dataType, false, true))
 			mp := mocks.NewMockProxy(t)
 			mp.EXPECT().DescribeCollection(mock.Anything, mock.Anything).Return(&milvuspb.DescribeCollectionResponse{
 				CollectionName: DefaultCollectionName,
@@ -1076,7 +1127,7 @@ func TestReturnInt64(t *testing.T) {
 			})
 			bodyReader := bytes.NewReader(data)
 			req := httptest.NewRequest(http.MethodPost, versional(VectorUpsertPath), bodyReader)
-			req.SetBasicAuth(util.UserRoot, util.DefaultRootPassword)
+			req.SetBasicAuth(util.UserRoot, getDefaultRootPassword())
 			req.Header.Set(HTTPHeaderAllowInt64, "false")
 			w := httptest.NewRecorder()
 			testEngine.ServeHTTP(w, req)
@@ -1161,12 +1212,15 @@ func TestUpsert(t *testing.T) {
 		HTTPCollectionName: DefaultCollectionName,
 		HTTPReturnData:     rows[0],
 	})
+	// disable rate limit
+	paramtable.Get().Save(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key, "false")
+	defer paramtable.Get().Save(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key, "true")
 	for _, tt := range testCases {
 		t.Run(tt.name, func(t *testing.T) {
 			testEngine := initHTTPServer(tt.mp, true)
 			bodyReader := bytes.NewReader(data)
 			req := httptest.NewRequest(http.MethodPost, versional(VectorUpsertPath), bodyReader)
-			req.SetBasicAuth(util.UserRoot, util.DefaultRootPassword)
+			req.SetBasicAuth(util.UserRoot, getDefaultRootPassword())
 			w := httptest.NewRecorder()
 			testEngine.ServeHTTP(w, req)
 			assert.Equal(t, tt.exceptCode, w.Code)
@@ -1187,7 +1241,7 @@ func TestUpsert(t *testing.T) {
 		testEngine := initHTTPServer(mp, true)
 		bodyReader := bytes.NewReader([]byte(`{"collectionName": "` + DefaultCollectionName + `", "data": {}}`))
 		req := httptest.NewRequest(http.MethodPost, versional(VectorUpsertPath), bodyReader)
-		req.SetBasicAuth(util.UserRoot, util.DefaultRootPassword)
+		req.SetBasicAuth(util.UserRoot, getDefaultRootPassword())
 		w := httptest.NewRecorder()
 		testEngine.ServeHTTP(w, req)
 		assert.Equal(t, http.StatusOK, w.Code)
@@ -1196,6 +1250,195 @@ func TestUpsert(t *testing.T) {
 		err := json.Unmarshal(w.Body.Bytes(), &resp)
 		assert.Equal(t, nil, err)
 	})
+}
+
+func TestFp16Bf16VectorsV1(t *testing.T) {
+	paramtable.Init()
+	paramtable.Get().Save(proxy.Params.HTTPCfg.AcceptTypeAllowInt64.Key, "true")
+	mp := mocks.NewMockProxy(t)
+	collSchema := generateCollectionSchemaWithVectorFields()
+	testEngine := initHTTPServer(mp, true)
+	queryTestCases := []requestBodyTestCase{}
+	// disable rate limit
+	paramtable.Get().Save(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key, "false")
+	defer paramtable.Get().Save(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key, "true")
+	for _, path := range []string{VectorInsertPath, VectorUpsertPath} {
+		queryTestCases = append(queryTestCases,
+			requestBodyTestCase{
+				path: path,
+				requestBody: []byte(
+					`{
+					"collectionName": "book",
+					"data": [
+						{
+							"book_id": 0,
+							"word_count": 0,
+							"book_intro": [0.11825, 0.6],
+							"binaryVector": "AQ==",
+							"float16Vector": [3.0],
+							"bfloat16Vector": [4.4, 442],
+							"sparseFloatVector": {"1": 0.1, "2": 0.44},
+							"int8Vector": [1, 2]
+						}
+					]
+				}`),
+				errCode: 1804,
+				errMsg:  "fail to deal the insert data, error: []byte size 2 doesn't equal to vector dimension 2 of Float16Vector",
+			}, requestBodyTestCase{
+				path: path,
+				requestBody: []byte(
+					`{
+					"collectionName": "book",
+					"data": [
+						{
+							"book_id": 0,
+							"word_count": 0,
+							"book_intro": [0.11825, 0.6],
+							"binaryVector": "AQ==",
+							"float16Vector": [3, 3.0],
+							"bfloat16Vector": [4.4, 442],
+							"sparseFloatVector": {"1": 0.1, "2": 0.44},
+							"int8Vector": [1, 2]
+						}
+					]
+				}`),
+				errCode: 200,
+			}, requestBodyTestCase{
+				path: path,
+				// [3, 3] shouble be converted to [float(3), float(3)]
+				requestBody: []byte(
+					`{
+					"collectionName": "book",
+					"data": [
+						{
+							"book_id": 0,
+							"word_count": 0,
+							"book_intro": [0.11825, 0.6],
+							"binaryVector": "AQ==",
+							"float16Vector": [3, 3],
+							"bfloat16Vector": [4.4, 442],
+							"sparseFloatVector": {"1": 0.1, "2": 0.44},
+							"int8Vector": [1, 2]
+						}
+					]
+				}`),
+				errCode: 200,
+			}, requestBodyTestCase{
+				path: path,
+				requestBody: []byte(
+					`{
+					"collectionName": "book",
+					"data": [
+						{
+							"book_id": 0,
+							"word_count": 0,
+							"book_intro": [0.11825, 0.6],
+							"binaryVector": "AQ==",
+							"float16Vector": "AQIDBA==",
+							"bfloat16Vector": "AQIDBA==",
+							"sparseFloatVector": {"1": 0.1, "2": 0.44},
+							"int8Vector": [1, 2]
+						}
+					]
+				}`),
+				errCode: 200,
+			}, requestBodyTestCase{
+				path: path,
+				requestBody: []byte(
+					`{
+					"collectionName": "book",
+					"data": [
+						{
+							"book_id": 0,
+							"word_count": 0,
+							"book_intro": [0.11825, 0.6],
+							"binaryVector": "AQ==",
+							"float16Vector": [3, 3.0, 3],
+							"bfloat16Vector": [4.4, 44],
+							"sparseFloatVector": {"1": 0.1, "2": 0.44},
+							"int8Vector": [1, 2]
+						}
+					]
+				}`),
+				errMsg:  "fail to deal the insert data, error: []byte size 6 doesn't equal to vector dimension 2 of Float16Vector",
+				errCode: 1804,
+			}, requestBodyTestCase{
+				path: path,
+				requestBody: []byte(
+					`{
+					"collectionName": "book",
+					"data": [
+						{
+							"book_id": 0,
+							"word_count": 0,
+							"book_intro": [0.11825, 0.6],
+							"binaryVector": "AQ==",
+							"float16Vector": [3, 3.0],
+							"bfloat16Vector": [4.4, 442, 44],
+							"sparseFloatVector": {"1": 0.1, "2": 0.44},
+							"int8Vector": [1, 2]
+						}
+					]
+				}`),
+				errMsg:  "fail to deal the insert data, error: []byte size 6 doesn't equal to vector dimension 2 of BFloat16Vector",
+				errCode: 1804,
+			}, requestBodyTestCase{
+				path: path,
+				requestBody: []byte(
+					`{
+					"collectionName": "book",
+					"data": [
+						{
+							"book_id": 0,
+							"word_count": 0,
+							"book_intro": [0.11825, 0.6],
+							"binaryVector": "AQ==",
+							"float16Vector": "AQIDBA==",
+							"bfloat16Vector": [4.4, 442],
+							"sparseFloatVector": {"1": 0.1, "2": 0.44},
+							"int8Vector": [1, 2]
+						},
+						{
+							"book_id": 1,
+							"word_count": 0,
+							"book_intro": [0.11825, 0.6],
+							"binaryVector": "AQ==",
+							"float16Vector": [3.1, 3.1],
+							"bfloat16Vector": "AQIDBA==",
+							"sparseFloatVector": {"3": 1.1, "2": 0.44},
+							"int8Vector": [1, 2]
+						}
+					]
+				}`),
+				errCode: 200,
+			})
+	}
+	mp.EXPECT().DescribeCollection(mock.Anything, mock.Anything).Return(&milvuspb.DescribeCollectionResponse{
+		CollectionName: DefaultCollectionName,
+		Schema:         collSchema,
+		ShardsNum:      ShardNumDefault,
+		Status:         &StatusSuccess,
+	}, nil).Times(len(queryTestCases))
+	mp.EXPECT().Insert(mock.Anything, mock.Anything).Return(&milvuspb.MutationResult{Status: commonSuccessStatus, InsertCnt: int64(0), IDs: &schemapb.IDs{IdField: &schemapb.IDs_IntId{IntId: &schemapb.LongArray{Data: []int64{}}}}}, nil).Times(4)
+	mp.EXPECT().Upsert(mock.Anything, mock.Anything).Return(&milvuspb.MutationResult{Status: commonSuccessStatus, InsertCnt: int64(0), IDs: &schemapb.IDs{IdField: &schemapb.IDs_IntId{IntId: &schemapb.LongArray{Data: []int64{}}}}}, nil).Times(4)
+	for i, testcase := range queryTestCases {
+		t.Run(testcase.path, func(t *testing.T) {
+			bodyReader := bytes.NewReader(testcase.requestBody)
+			req := httptest.NewRequest(http.MethodPost, versional(testcase.path), bodyReader)
+			req.SetBasicAuth(util.UserRoot, getDefaultRootPassword())
+			w := httptest.NewRecorder()
+			testEngine.ServeHTTP(w, req)
+			assert.Equal(t, http.StatusOK, w.Code, "case %d: ", i, string(testcase.requestBody))
+			returnBody := &ReturnErrMsg{}
+			err := json.Unmarshal(w.Body.Bytes(), returnBody)
+			assert.Nil(t, err, "case %d: ", i)
+			assert.Equal(t, testcase.errCode, returnBody.Code, "case %d: ", i, string(testcase.requestBody))
+			if testcase.errCode != 0 {
+				assert.Equal(t, testcase.errMsg, returnBody.Message, "case %d: ", i, string(testcase.requestBody))
+			}
+			fmt.Println(w.Body.String())
+		})
+	}
 }
 
 func genIDs(dataType schemapb.DataType) *schemapb.IDs {
@@ -1257,8 +1500,11 @@ func TestSearch(t *testing.T) {
 		name:         "search success",
 		mp:           mp5,
 		exceptCode:   200,
-		expectedBody: "{\"code\":200,\"data\":[{\"book_id\":1,\"book_intro\":[0.1,0.11],\"distance\":0.01,\"word_count\":1000},{\"book_id\":2,\"book_intro\":[0.2,0.22],\"distance\":0.04,\"word_count\":2000},{\"book_id\":3,\"book_intro\":[0.3,0.33],\"distance\":0.09,\"word_count\":3000}]}",
+		expectedBody: "{\"code\":200,\"data\":[{\"book_id\":1,\"book_intro\":[0.1,0.11],\"distance\":0.01,\"word_count\":1000},{\"book_id\":2,\"book_intro\":[0.2,0.22],\"distance\":0.04,\"word_count\":2000},{\"book_id\":3,\"book_intro\":[0.3,0.33],\"distance\":0.09,\"word_count\":3000}]}\n",
 	})
+	// disable rate limit
+	paramtable.Get().Save(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key, "false")
+	defer paramtable.Get().Save(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key, "true")
 
 	for _, tt := range testCases {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1270,7 +1516,7 @@ func TestSearch(t *testing.T) {
 			})
 			bodyReader := bytes.NewReader(data)
 			req := httptest.NewRequest(http.MethodPost, versional(VectorSearchPath), bodyReader)
-			req.SetBasicAuth(util.UserRoot, util.DefaultRootPassword)
+			req.SetBasicAuth(util.UserRoot, getDefaultRootPassword())
 			w := httptest.NewRecorder()
 			testEngine.ServeHTTP(w, req)
 			assert.Equal(t, tt.exceptCode, w.Code)
@@ -1318,7 +1564,7 @@ func TestSearch(t *testing.T) {
 		})
 		bodyReader := bytes.NewReader(data)
 		req := httptest.NewRequest(http.MethodPost, versional(VectorSearchPath), bodyReader)
-		req.SetBasicAuth(util.UserRoot, util.DefaultRootPassword)
+		req.SetBasicAuth(util.UserRoot, getDefaultRootPassword())
 		w := httptest.NewRecorder()
 		testEngine.ServeHTTP(w, req)
 		assert.Equal(t, tt.exceptCode, w.Code)
@@ -1480,7 +1726,7 @@ func TestHttpRequestFormat(t *testing.T) {
 				testEngine := initHTTPServer(mocks.NewMockProxy(t), true)
 				bodyReader := bytes.NewReader(requestJsons[i])
 				req := httptest.NewRequest(http.MethodPost, path, bodyReader)
-				req.SetBasicAuth(util.UserRoot, util.DefaultRootPassword)
+				req.SetBasicAuth(util.UserRoot, getDefaultRootPassword())
 				w := httptest.NewRecorder()
 				testEngine.ServeHTTP(w, req)
 				assert.Equal(t, http.StatusOK, w.Code)

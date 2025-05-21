@@ -9,15 +9,20 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
+#include <algorithm>
 #include <cmath>
 #include <string>
 
+#include "bitset/detail/element_wise.h"
+#include "cachinglayer/Utils.h"
+#include "common/BitsetView.h"
 #include "common/QueryInfo.h"
 #include "common/Types.h"
+#include "query/CachedSearchIterator.h"
 #include "query/SearchBruteForce.h"
 #include "query/SearchOnSealed.h"
 #include "query/helper.h"
-#include "query/GroupByOperator.h"
+#include "exec/operator/Utils.h"
 
 namespace milvus::query {
 
@@ -42,19 +47,32 @@ SearchOnSealedIndex(const Schema& schema,
     // Keep the field_indexing smart pointer, until all reference by raw dropped.
     auto field_indexing = record.get_field_indexing(field_id);
     AssertInfo(field_indexing->metric_type_ == search_info.metric_type_,
-               "Metric type of field index isn't the same with search info");
+               "Metric type of field index isn't the same with search info,"
+               "field index: {}, search info: {}",
+               field_indexing->metric_type_,
+               search_info.metric_type_);
 
     auto dataset = knowhere::GenDataSet(num_queries, dim, query_data);
     dataset->SetIsSparse(is_sparse);
+    auto accessor = field_indexing->indexing_->PinCells({0})
+                        .via(&folly::InlineExecutor::instance())
+                        .get();
     auto vec_index =
-        dynamic_cast<index::VectorIndex*>(field_indexing->indexing_.get());
-    if (!PrepareVectorIteratorsFromIndex(search_info,
-                                         num_queries,
-                                         dataset,
-                                         search_result,
-                                         bitset,
-                                         *vec_index)) {
-        auto index_type = vec_index->GetIndexType();
+        dynamic_cast<index::VectorIndex*>(accessor->get_cell_of(0));
+
+    if (search_info.iterator_v2_info_.has_value()) {
+        CachedSearchIterator cached_iter(
+            *vec_index, dataset, search_info, bitset);
+        cached_iter.NextBatch(search_info, search_result);
+        return;
+    }
+
+    if (!milvus::exec::PrepareVectorIteratorsFromIndex(search_info,
+                                                       num_queries,
+                                                       dataset,
+                                                       search_result,
+                                                       bitset,
+                                                       *vec_index)) {
         vec_index->Query(dataset, search_info, bitset, search_result);
         float* distances = search_result.distances_.data();
         auto total_num = num_queries * topK;
@@ -71,14 +89,15 @@ SearchOnSealedIndex(const Schema& schema,
 }
 
 void
-SearchOnSealed(const Schema& schema,
-               const void* vec_data,
-               const SearchInfo& search_info,
-               const void* query_data,
-               int64_t num_queries,
-               int64_t row_count,
-               const BitsetView& bitset,
-               SearchResult& result) {
+SearchOnSealedColumn(const Schema& schema,
+                     ChunkedColumnInterface* column,
+                     const SearchInfo& search_info,
+                     const std::map<std::string, std::string>& index_info,
+                     const void* query_data,
+                     int64_t num_queries,
+                     int64_t row_count,
+                     const BitsetView& bitview,
+                     SearchResult& result) {
     auto field_id = search_info.field_id_;
     auto& field = schema[field_id];
 
@@ -87,28 +106,68 @@ SearchOnSealed(const Schema& schema,
                    ? 0
                    : field.get_dim();
 
-    query::dataset::SearchDataset dataset{search_info.metric_type_,
-                                          num_queries,
-                                          search_info.topk_,
-                                          search_info.round_decimal_,
-                                          dim,
-                                          query_data};
+    query::dataset::SearchDataset query_dataset{search_info.metric_type_,
+                                                num_queries,
+                                                search_info.topk_,
+                                                search_info.round_decimal_,
+                                                dim,
+                                                query_data};
 
     auto data_type = field.get_data_type();
     CheckBruteForceSearchParam(field, search_info);
-    if (search_info.group_by_field_id_.has_value()) {
-        auto sub_qr = BruteForceSearchIterators(
-            dataset, vec_data, row_count, search_info, bitset, data_type);
-        result.AssembleChunkVectorIterators(
-            num_queries, 1, -1, sub_qr.chunk_iterators());
-    } else {
-        auto sub_qr = BruteForceSearch(
-            dataset, vec_data, row_count, search_info, bitset, data_type);
-        result.distances_ = std::move(sub_qr.mutable_distances());
-        result.seg_offsets_ = std::move(sub_qr.mutable_seg_offsets());
+
+    if (search_info.iterator_v2_info_.has_value()) {
+        CachedSearchIterator cached_iter(
+            column, query_dataset, search_info, index_info, bitview, data_type);
+        cached_iter.NextBatch(search_info, result);
+        return;
     }
-    result.unity_topK_ = dataset.topk;
-    result.total_nq_ = dataset.num_queries;
+
+    auto num_chunk = column->num_chunks();
+
+    SubSearchResult final_qr(num_queries,
+                             search_info.topk_,
+                             search_info.metric_type_,
+                             search_info.round_decimal_);
+
+    auto offset = 0;
+    for (int i = 0; i < num_chunk; ++i) {
+        auto pw = column->DataOfChunk(i);
+        auto vec_data = pw.get();
+        auto chunk_size = column->chunk_row_nums(i);
+        auto raw_dataset =
+            query::dataset::RawDataset{offset, dim, chunk_size, vec_data};
+        if (milvus::exec::UseVectorIterator(search_info)) {
+            auto sub_qr =
+                PackBruteForceSearchIteratorsIntoSubResult(query_dataset,
+                                                           raw_dataset,
+                                                           search_info,
+                                                           index_info,
+                                                           bitview,
+                                                           data_type);
+            final_qr.merge(sub_qr);
+        } else {
+            auto sub_qr = BruteForceSearch(query_dataset,
+                                           raw_dataset,
+                                           search_info,
+                                           index_info,
+                                           bitview,
+                                           data_type);
+            final_qr.merge(sub_qr);
+        }
+        offset += chunk_size;
+    }
+    if (milvus::exec::UseVectorIterator(search_info)) {
+        result.AssembleChunkVectorIterators(num_queries,
+                                            num_chunk,
+                                            column->GetNumRowsUntilChunk(),
+                                            final_qr.chunk_iterators());
+    } else {
+        result.distances_ = std::move(final_qr.mutable_distances());
+        result.seg_offsets_ = std::move(final_qr.mutable_seg_offsets());
+    }
+    result.unity_topK_ = query_dataset.topk;
+    result.total_nq_ = query_dataset.num_queries;
 }
 
 }  // namespace milvus::query

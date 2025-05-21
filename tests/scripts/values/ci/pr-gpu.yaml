@@ -8,12 +8,14 @@ proxy:
       memory: "256Mi"
 
 rootCoordinator:
+  enabled: false
   resources:
     requests:
       cpu: "0.1"
       memory: "256Mi"
 
 queryCoordinator:
+  enabled: false
   resources:
     requests:
       cpu: "0.4"
@@ -34,12 +36,14 @@ queryNode:
       nvidia.com/gpu: 1
 
 indexCoordinator:
+  enabled: "false"
   resources:
     requests:
       cpu: "0.1"
       memory: "50Mi"
 
 indexNode:
+  enabled: "false"
   nodeSelector:
     nvidia.com/gpu.present: 'true'
   extraEnv:
@@ -54,6 +58,7 @@ indexNode:
       nvidia.com/gpu: 1
 
 dataCoordinator:
+  enabled: false
   resources:
     requests:
       cpu: "0.1"

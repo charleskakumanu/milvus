@@ -24,21 +24,21 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/stretchr/testify/suite"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
 	"github.com/milvus-io/milvus/internal/util/importutilv2"
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/util/indexparamcheck"
-	"github.com/milvus-io/milvus/pkg/util/metric"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/internal/util/indexparamcheck"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/metric"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/tests/integration"
 )
 
@@ -66,7 +66,7 @@ func (s *BulkInsertSuite) SetupTest() {
 	s.autoID = false
 
 	s.vecType = schemapb.DataType_FloatVector
-	s.indexType = indexparamcheck.IndexHNSW
+	s.indexType = "HNSW"
 	s.metricType = metric.L2
 }
 
@@ -76,7 +76,7 @@ func (s *BulkInsertSuite) run() {
 	)
 
 	c := s.Cluster
-	ctx, cancel := context.WithTimeout(c.GetContext(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(c.GetContext(), 240*time.Second)
 	defer cancel()
 
 	collectionName := "TestBulkInsert" + funcutil.GenRandomStr()
@@ -107,6 +107,8 @@ func (s *BulkInsertSuite) run() {
 	err = os.MkdirAll(c.ChunkManager.RootPath(), os.ModePerm)
 	s.NoError(err)
 
+	options := []*commonpb.KeyValuePair{}
+
 	switch s.fileType {
 	case importutilv2.Numpy:
 		importFile, err := GenerateNumpyFiles(c.ChunkManager, schema, rowCount)
@@ -135,11 +137,25 @@ func (s *BulkInsertSuite) run() {
 				},
 			},
 		}
+	case importutilv2.CSV:
+		filePath := fmt.Sprintf("/tmp/test_%d.csv", rand.Int())
+		sep := GenerateCSVFile(s.T(), filePath, schema, rowCount)
+		defer os.Remove(filePath)
+		options = []*commonpb.KeyValuePair{{Key: "sep", Value: string(sep)}}
+		s.NoError(err)
+		files = []*internalpb.ImportFile{
+			{
+				Paths: []string{
+					filePath,
+				},
+			},
+		}
 	}
 
 	importResp, err := c.Proxy.ImportV2(ctx, &internalpb.ImportRequest{
 		CollectionName: collectionName,
 		Files:          files,
+		Options:        options,
 	})
 	s.NoError(err)
 	s.Equal(int32(0), importResp.GetStatus().GetCode())
@@ -203,35 +219,40 @@ func (s *BulkInsertSuite) run() {
 }
 
 func (s *BulkInsertSuite) TestMultiFileTypes() {
-	fileTypeArr := []importutilv2.FileType{importutilv2.JSON, importutilv2.Numpy, importutilv2.Parquet}
+	fileTypeArr := []importutilv2.FileType{importutilv2.JSON, importutilv2.Numpy, importutilv2.Parquet, importutilv2.CSV}
 
 	for _, fileType := range fileTypeArr {
 		s.fileType = fileType
 
 		s.vecType = schemapb.DataType_BinaryVector
-		s.indexType = indexparamcheck.IndexFaissBinIvfFlat
+		s.indexType = "BIN_IVF_FLAT"
 		s.metricType = metric.HAMMING
 		s.run()
 
 		s.vecType = schemapb.DataType_FloatVector
-		s.indexType = indexparamcheck.IndexHNSW
+		s.indexType = "HNSW"
 		s.metricType = metric.L2
 		s.run()
 
 		s.vecType = schemapb.DataType_Float16Vector
-		s.indexType = indexparamcheck.IndexHNSW
+		s.indexType = "HNSW"
 		s.metricType = metric.L2
 		s.run()
 
 		s.vecType = schemapb.DataType_BFloat16Vector
-		s.indexType = indexparamcheck.IndexHNSW
+		s.indexType = "HNSW"
+		s.metricType = metric.L2
+		s.run()
+
+		s.vecType = schemapb.DataType_Int8Vector
+		s.indexType = "HNSW"
 		s.metricType = metric.L2
 		s.run()
 
 		// TODO: not support numpy for SparseFloatVector by now
 		if fileType != importutilv2.Numpy {
 			s.vecType = schemapb.DataType_SparseFloatVector
-			s.indexType = indexparamcheck.IndexSparseWand
+			s.indexType = "SPARSE_WAND"
 			s.metricType = metric.IP
 			s.run()
 		}

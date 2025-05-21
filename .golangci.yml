@@ -1,18 +1,5 @@
 run:
-  go: "1.21"
-  skip-dirs:
-    - build
-    - configs
-    - deployments
-    - docs
-    - scripts
-    - internal/core
-    - cmake_build
-    - mmap
-    - data
-    - ci
-  skip-files:
-    - partial_search_test.go
+  go: "1.22"
   build-tags:
     - dynamic
     - test
@@ -49,9 +36,8 @@ linters-settings:
     custom-order: true
   govet:
     enable: # add extra linters
-      - nilness 
+      - nilness
   gofumpt:
-    lang-version: "1.18"
     module-path: github.com/milvus-io
   goimports:
     local-prefixes: github.com/milvus-io
@@ -63,7 +49,7 @@ linters-settings:
         severity: warning
         disabled: false
         arguments:
-          - ["ID"] # Allow list
+          - ["ID", "IDS"] # Allow list
       - name: context-as-argument
         severity: warning
         disabled: false
@@ -121,6 +107,10 @@ linters-settings:
             desc: not allowed, use github.com/tikv/client-go/v2/txnkv
           - pkg: "github.com/tikv/client-go/v2/rawkv"
             desc: not allowed, use github.com/tikv/client-go/v2/txnkv
+          - pkg: "github.com/gogo/protobuf"
+            desc: "not allowed, gogo protobuf is deprecated"
+          - pkg: "github.com/golang/protobuf/proto"
+            desc: "not allowed, protobuf v1 is deprecated, use google.golang.org/protobuf/proto instead"
   forbidigo:
     forbid:
       - '^time\.Tick$'
@@ -138,11 +128,26 @@ linters-settings:
       #- 'fmt\.Print.*' WIP
 
 issues:
+  exclude-dirs:
+    - build
+    - configs
+    - deployments
+    - docs
+    - scripts
+    - internal/core
+    - cmake_build
+    - mmap
+    - data
+    - ci
+  exclude-files:
+    - partial_search_test.go
   exclude-use-default: false
   exclude-rules:
     - path: .+_test\.go
       linters:
         - forbidigo
+    - path: mocks\/(.)+mock_(.+)\.go
+      text: "don't use an underscore in package name"
   exclude:
     - should have a package comment
     - should have comment
@@ -170,6 +175,27 @@ issues:
     - SA1019
     # defer return errors
     - SA5001
+    # TODO: cleanup following exclusions, added on golangci-lint upgrade
+    - sloppyLen
+    - dupSubExpr
+    - assignOp
+    - ifElseChain
+    - elseif
+    - commentFormatting
+    - exitAfterDefer
+    - captLocal
+    - singleCaseSwitch
+    - typeSwitchVar
+    - indent-error-flow
+    - appendAssign
+    - deprecatedComment
+    - SA9009
+    - SA1006
+    - S1009
+    - offBy1
+    - unslice    
+    # Integer overflow conversion
+    - G115
 
   # Maximum issues count per one linter. Set to 0 to disable. Default is 50.
   max-issues-per-linter: 0

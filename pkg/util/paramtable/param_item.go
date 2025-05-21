@@ -1,13 +1,19 @@
-// Copyright (C) 2019-2020 Zilliz. All rights reserved.
-//
-// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
 // with the License. You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//	http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed under the License
-// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
-// or implied. See the License for the specific language governing permissions and limitations under the License.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package paramtable
 
 import (
@@ -16,10 +22,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/samber/lo"
 	"go.uber.org/atomic"
 
-	"github.com/milvus-io/milvus/pkg/config"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/config"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
 )
 
 type ParamItem struct {
@@ -49,44 +56,63 @@ func (pi *ParamItem) Init(manager *config.Manager) {
 
 // Get original value with error
 func (pi *ParamItem) get() (string, error) {
+	result, _, err := pi.getWithRaw()
+	return result, err
+}
+
+func (pi *ParamItem) getWithRaw() (result, raw string, err error) {
 	// For unittest.
 	if s := pi.tempValue.Load(); s != nil {
-		return *s, nil
+		return *s, *s, nil
 	}
 
 	if pi.manager == nil {
 		panic(fmt.Sprintf("manager is nil %s", pi.Key))
 	}
-	ret, err := pi.manager.GetConfig(pi.Key)
-	if err != nil {
+	// raw value set only once
+	_, raw, err = pi.manager.GetConfig(pi.Key)
+	if err != nil || raw == pi.DefaultValue {
+		// try fallback if the entry is not exist or default value,
+		//  because default value may already defined in milvus.yaml
+		//	and we don't want the fallback keys be overridden.
 		for _, key := range pi.FallbackKeys {
-			ret, err = pi.manager.GetConfig(key)
+			var fallbackRaw string
+			_, fallbackRaw, err = pi.manager.GetConfig(key)
 			if err == nil {
+				raw = fallbackRaw
 				break
 			}
 		}
 	}
 	if err != nil {
-		ret = pi.DefaultValue
+		// use default value
+		raw = pi.DefaultValue
 	}
+	result = raw
 	if pi.Formatter != nil {
-		ret = pi.Formatter(ret)
+		result = pi.Formatter(result)
 	}
-	if ret == "" && pi.PanicIfEmpty {
+	if result == "" && pi.PanicIfEmpty {
 		panic(fmt.Sprintf("%s is empty", pi.Key))
 	}
-	return ret, err
+	return result, raw, err
 }
 
 // SetTempValue set the value for this ParamItem,
 // Once value set, ParamItem will use the value instead of underlying config manager.
 // Usage: should only use for unittest, swap empty string will remove the value.
-func (pi *ParamItem) SwapTempValue(s string) *string {
+func (pi *ParamItem) SwapTempValue(s string) string {
 	if s == "" {
-		return pi.tempValue.Swap(nil)
+		if old := pi.tempValue.Swap(nil); old != nil {
+			return *old
+		}
+		return ""
 	}
 	pi.manager.EvictCachedValue(pi.Key)
-	return pi.tempValue.Swap(&s)
+	if old := pi.tempValue.Swap(&s); old != nil {
+		return *old
+	}
+	return ""
 }
 
 func (pi *ParamItem) GetValue() string {
@@ -100,9 +126,9 @@ func (pi *ParamItem) GetAsStrings() []string {
 			return strings
 		}
 	}
-	val := pi.GetValue()
+	val, raw, _ := pi.getWithRaw()
 	realStrs := getAsStrings(val)
-	pi.manager.CASCachedValue(pi.Key, val, realStrs)
+	pi.manager.CASCachedValue(pi.Key, raw, realStrs)
 	return realStrs
 }
 
@@ -112,9 +138,9 @@ func (pi *ParamItem) GetAsBool() bool {
 			return boolVal
 		}
 	}
-	val := pi.GetValue()
+	val, raw, _ := pi.getWithRaw()
 	boolVal := getAsBool(val)
-	pi.manager.CASCachedValue(pi.Key, val, boolVal)
+	pi.manager.CASCachedValue(pi.Key, raw, boolVal)
 	return boolVal
 }
 
@@ -124,9 +150,9 @@ func (pi *ParamItem) GetAsInt() int {
 			return intVal
 		}
 	}
-	val := pi.GetValue()
+	val, raw, _ := pi.getWithRaw()
 	intVal := getAsInt(val)
-	pi.manager.CASCachedValue(pi.Key, val, intVal)
+	pi.manager.CASCachedValue(pi.Key, raw, intVal)
 	return intVal
 }
 
@@ -136,9 +162,9 @@ func (pi *ParamItem) GetAsInt32() int32 {
 			return int32Val
 		}
 	}
-	val := pi.GetValue()
+	val, raw, _ := pi.getWithRaw()
 	int32Val := int32(getAsInt64(val))
-	pi.manager.CASCachedValue(pi.Key, val, int32Val)
+	pi.manager.CASCachedValue(pi.Key, raw, int32Val)
 	return int32Val
 }
 
@@ -148,9 +174,9 @@ func (pi *ParamItem) GetAsUint() uint {
 			return uintVal
 		}
 	}
-	val := pi.GetValue()
+	val, raw, _ := pi.getWithRaw()
 	uintVal := uint(getAsUint64(val))
-	pi.manager.CASCachedValue(pi.Key, val, uintVal)
+	pi.manager.CASCachedValue(pi.Key, raw, uintVal)
 	return uintVal
 }
 
@@ -160,9 +186,9 @@ func (pi *ParamItem) GetAsUint32() uint32 {
 			return uint32Val
 		}
 	}
-	val := pi.GetValue()
+	val, raw, _ := pi.getWithRaw()
 	uint32Val := uint32(getAsUint64(val))
-	pi.manager.CASCachedValue(pi.Key, val, uint32Val)
+	pi.manager.CASCachedValue(pi.Key, raw, uint32Val)
 	return uint32Val
 }
 
@@ -172,9 +198,9 @@ func (pi *ParamItem) GetAsUint64() uint64 {
 			return uint64Val
 		}
 	}
-	val := pi.GetValue()
+	val, raw, _ := pi.getWithRaw()
 	uint64Val := getAsUint64(val)
-	pi.manager.CASCachedValue(pi.Key, val, uint64Val)
+	pi.manager.CASCachedValue(pi.Key, raw, uint64Val)
 	return uint64Val
 }
 
@@ -184,9 +210,9 @@ func (pi *ParamItem) GetAsUint16() uint16 {
 			return uint16Val
 		}
 	}
-	val := pi.GetValue()
+	val, raw, _ := pi.getWithRaw()
 	uint16Val := uint16(getAsUint64(val))
-	pi.manager.CASCachedValue(pi.Key, val, uint16Val)
+	pi.manager.CASCachedValue(pi.Key, raw, uint16Val)
 	return uint16Val
 }
 
@@ -196,9 +222,9 @@ func (pi *ParamItem) GetAsInt64() int64 {
 			return int64Val
 		}
 	}
-	val := pi.GetValue()
+	val, raw, _ := pi.getWithRaw()
 	int64Val := getAsInt64(val)
-	pi.manager.CASCachedValue(pi.Key, val, int64Val)
+	pi.manager.CASCachedValue(pi.Key, raw, int64Val)
 	return int64Val
 }
 
@@ -208,9 +234,9 @@ func (pi *ParamItem) GetAsFloat() float64 {
 			return floatVal
 		}
 	}
-	val := pi.GetValue()
+	val, raw, _ := pi.getWithRaw()
 	floatVal := getAsFloat(val)
-	pi.manager.CASCachedValue(pi.Key, val, floatVal)
+	pi.manager.CASCachedValue(pi.Key, raw, floatVal)
 	return floatVal
 }
 
@@ -220,9 +246,9 @@ func (pi *ParamItem) GetAsDuration(unit time.Duration) time.Duration {
 			return durationVal
 		}
 	}
-	val := pi.GetValue()
+	val, raw, _ := pi.getWithRaw()
 	durationVal := getAsDuration(val, unit)
-	pi.manager.CASCachedValue(pi.Key, val, durationVal)
+	pi.manager.CASCachedValue(pi.Key, raw, durationVal)
 	return durationVal
 }
 
@@ -232,6 +258,18 @@ func (pi *ParamItem) GetAsJSONMap() map[string]string {
 
 func (pi *ParamItem) GetAsRoleDetails() map[string](map[string]([](map[string]string))) {
 	return getAndConvert(pi.GetValue(), funcutil.JSONToRoleDetails, nil)
+}
+
+func (pi *ParamItem) GetAsDurationByParse() time.Duration {
+	val, _ := pi.get()
+	durationVal, err := time.ParseDuration(val)
+	if err != nil {
+		durationVal, err = time.ParseDuration(pi.DefaultValue)
+		if err != nil {
+			panic(fmt.Sprintf("unreachable: parse duration from default value failed, %s, err: %s", pi.DefaultValue, err.Error()))
+		}
+	}
+	return durationVal
 }
 
 func (pi *ParamItem) GetAsSize() int64 {
@@ -282,6 +320,7 @@ type ParamGroup struct {
 	Export    bool
 
 	GetFunc func() map[string]string
+	DocFunc func(string) string
 
 	manager *config.Manager
 }
@@ -298,13 +337,24 @@ func (pg *ParamGroup) GetValue() map[string]string {
 	return values
 }
 
+func (pg *ParamGroup) GetDoc(key string) string {
+	if pg.DocFunc != nil {
+		return pg.DocFunc(key)
+	}
+	return ""
+}
+
 func ParseAsStings(v string) []string {
 	return getAsStrings(v)
 }
 
 func getAsStrings(v string) []string {
+	if len(v) == 0 {
+		return []string{}
+	}
 	return getAndConvert(v, func(value string) ([]string, error) {
-		return strings.Split(value, ","), nil
+		ret := strings.Split(value, ",")
+		return lo.Map(ret, func(rg string, _ int) string { return strings.TrimSpace(rg) }), nil
 	}, []string{})
 }
 
@@ -351,40 +401,4 @@ func getAndConvert[T any](v string, converter func(input string) (T, error), def
 		return defaultValue
 	}
 	return t
-}
-
-type RuntimeParamItem struct {
-	value atomic.Value
-}
-
-func (rpi *RuntimeParamItem) GetValue() any {
-	return rpi.value.Load()
-}
-
-func (rpi *RuntimeParamItem) GetAsString() string {
-	value, ok := rpi.value.Load().(string)
-	if !ok {
-		return ""
-	}
-	return value
-}
-
-func (rpi *RuntimeParamItem) GetAsTime() time.Time {
-	value, ok := rpi.value.Load().(time.Time)
-	if !ok {
-		return time.Time{}
-	}
-	return value
-}
-
-func (rpi *RuntimeParamItem) GetAsInt64() int64 {
-	value, ok := rpi.value.Load().(int64)
-	if !ok {
-		return 0
-	}
-	return value
-}
-
-func (rpi *RuntimeParamItem) SetValue(value any) {
-	rpi.value.Store(value)
 }

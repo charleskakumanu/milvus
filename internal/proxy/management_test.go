@@ -31,38 +31,35 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	management "github.com/milvus-io/milvus/internal/http"
 	"github.com/milvus-io/milvus/internal/mocks"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
-	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 )
 
 type ProxyManagementSuite struct {
 	suite.Suite
 
-	querycoord *mocks.MockQueryCoordClient
-	datacoord  *mocks.MockDataCoordClient
-	proxy      *Proxy
+	mixcoord *mocks.MockMixCoordClient
+	proxy    *Proxy
 }
 
 func (s *ProxyManagementSuite) SetupTest() {
-	s.datacoord = mocks.NewMockDataCoordClient(s.T())
-	s.querycoord = mocks.NewMockQueryCoordClient(s.T())
+	s.mixcoord = mocks.NewMockMixCoordClient(s.T())
 
 	s.proxy = &Proxy{
-		dataCoord:  s.datacoord,
-		queryCoord: s.querycoord,
+		mixCoord: s.mixcoord,
 	}
 }
 
 func (s *ProxyManagementSuite) TearDownTest() {
-	s.datacoord.AssertExpectations(s.T())
+	s.mixcoord.AssertExpectations(s.T())
 }
 
 func (s *ProxyManagementSuite) TestPauseDataCoordGC() {
 	s.Run("normal", func() {
 		s.SetupTest()
 		defer s.TearDownTest()
-		s.datacoord.EXPECT().GcControl(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, req *datapb.GcControlRequest, options ...grpc.CallOption) (*commonpb.Status, error) {
+		s.mixcoord.EXPECT().GcControl(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, req *datapb.GcControlRequest, options ...grpc.CallOption) (*commonpb.Status, error) {
 			s.Equal(datapb.GcCommand_Pause, req.GetCommand())
 			return &commonpb.Status{}, nil
 		})
@@ -79,7 +76,7 @@ func (s *ProxyManagementSuite) TestPauseDataCoordGC() {
 	s.Run("return_error", func() {
 		s.SetupTest()
 		defer s.TearDownTest()
-		s.datacoord.EXPECT().GcControl(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, req *datapb.GcControlRequest, options ...grpc.CallOption) (*commonpb.Status, error) {
+		s.mixcoord.EXPECT().GcControl(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, req *datapb.GcControlRequest, options ...grpc.CallOption) (*commonpb.Status, error) {
 			return &commonpb.Status{}, errors.New("mock")
 		})
 
@@ -95,7 +92,7 @@ func (s *ProxyManagementSuite) TestPauseDataCoordGC() {
 	s.Run("return_failure", func() {
 		s.SetupTest()
 		defer s.TearDownTest()
-		s.datacoord.EXPECT().GcControl(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, req *datapb.GcControlRequest, options ...grpc.CallOption) (*commonpb.Status, error) {
+		s.mixcoord.EXPECT().GcControl(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, req *datapb.GcControlRequest, options ...grpc.CallOption) (*commonpb.Status, error) {
 			return &commonpb.Status{
 				ErrorCode: commonpb.ErrorCode_UnexpectedError,
 				Reason:    "mocked",
@@ -116,7 +113,7 @@ func (s *ProxyManagementSuite) TestResumeDatacoordGC() {
 	s.Run("normal", func() {
 		s.SetupTest()
 		defer s.TearDownTest()
-		s.datacoord.EXPECT().GcControl(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, req *datapb.GcControlRequest, options ...grpc.CallOption) (*commonpb.Status, error) {
+		s.mixcoord.EXPECT().GcControl(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, req *datapb.GcControlRequest, options ...grpc.CallOption) (*commonpb.Status, error) {
 			s.Equal(datapb.GcCommand_Resume, req.GetCommand())
 			return &commonpb.Status{}, nil
 		})
@@ -133,7 +130,7 @@ func (s *ProxyManagementSuite) TestResumeDatacoordGC() {
 	s.Run("return_error", func() {
 		s.SetupTest()
 		defer s.TearDownTest()
-		s.datacoord.EXPECT().GcControl(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, req *datapb.GcControlRequest, options ...grpc.CallOption) (*commonpb.Status, error) {
+		s.mixcoord.EXPECT().GcControl(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, req *datapb.GcControlRequest, options ...grpc.CallOption) (*commonpb.Status, error) {
 			return &commonpb.Status{}, errors.New("mock")
 		})
 
@@ -149,7 +146,7 @@ func (s *ProxyManagementSuite) TestResumeDatacoordGC() {
 	s.Run("return_failure", func() {
 		s.SetupTest()
 		defer s.TearDownTest()
-		s.datacoord.EXPECT().GcControl(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, req *datapb.GcControlRequest, options ...grpc.CallOption) (*commonpb.Status, error) {
+		s.mixcoord.EXPECT().GcControl(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, req *datapb.GcControlRequest, options ...grpc.CallOption) (*commonpb.Status, error) {
 			return &commonpb.Status{
 				ErrorCode: commonpb.ErrorCode_UnexpectedError,
 				Reason:    "mocked",
@@ -171,7 +168,7 @@ func (s *ProxyManagementSuite) TestListQueryNode() {
 		s.SetupTest()
 		defer s.TearDownTest()
 
-		s.querycoord.EXPECT().ListQueryNode(mock.Anything, mock.Anything).Return(&querypb.ListQueryNodeResponse{
+		s.mixcoord.EXPECT().ListQueryNode(mock.Anything, mock.Anything).Return(&querypb.ListQueryNodeResponse{
 			Status: merr.Success(),
 			NodeInfos: []*querypb.NodeInfo{
 				{
@@ -195,7 +192,7 @@ func (s *ProxyManagementSuite) TestListQueryNode() {
 		s.SetupTest()
 		defer s.TearDownTest()
 
-		s.querycoord.EXPECT().ListQueryNode(mock.Anything, mock.Anything).Return(nil, errors.New("mocked error"))
+		s.mixcoord.EXPECT().ListQueryNode(mock.Anything, mock.Anything).Return(nil, errors.New("mocked error"))
 		req, err := http.NewRequest(http.MethodPost, management.RouteListQueryNode, nil)
 		s.Require().NoError(err)
 
@@ -208,7 +205,7 @@ func (s *ProxyManagementSuite) TestListQueryNode() {
 		s.SetupTest()
 		defer s.TearDownTest()
 
-		s.querycoord.EXPECT().ListQueryNode(mock.Anything, mock.Anything).Return(&querypb.ListQueryNodeResponse{
+		s.mixcoord.EXPECT().ListQueryNode(mock.Anything, mock.Anything).Return(&querypb.ListQueryNodeResponse{
 			Status: merr.Status(merr.ErrServiceNotReady),
 		}, nil)
 
@@ -226,9 +223,8 @@ func (s *ProxyManagementSuite) TestGetQueryNodeDistribution() {
 		s.SetupTest()
 		defer s.TearDownTest()
 
-		s.querycoord.EXPECT().GetQueryNodeDistribution(mock.Anything, mock.Anything).Return(&querypb.GetQueryNodeDistributionResponse{
+		s.mixcoord.EXPECT().GetQueryNodeDistribution(mock.Anything, mock.Anything).Return(&querypb.GetQueryNodeDistributionResponse{
 			Status:           merr.Success(),
-			ID:               1,
 			ChannelNames:     []string{"channel-1"},
 			SealedSegmentIDs: []int64{1, 2, 3},
 		}, nil)
@@ -240,7 +236,7 @@ func (s *ProxyManagementSuite) TestGetQueryNodeDistribution() {
 		recorder := httptest.NewRecorder()
 		s.proxy.GetQueryNodeDistribution(recorder, req)
 		s.Equal(http.StatusOK, recorder.Code)
-		s.Equal(`{"ID":1,"channel_names":["channel-1"],"sealed_segmentIDs":[1,2,3]}`, recorder.Body.String())
+		s.Equal(`{"channel_names":["channel-1"],"sealed_segmentIDs":["1","2","3"]}`, recorder.Body.String())
 	})
 
 	s.Run("return_error", func() {
@@ -263,7 +259,7 @@ func (s *ProxyManagementSuite) TestGetQueryNodeDistribution() {
 		s.Equal(http.StatusBadRequest, recorder.Code)
 
 		// test rpc return error
-		s.querycoord.EXPECT().GetQueryNodeDistribution(mock.Anything, mock.Anything).Return(nil, errors.New("mocked error"))
+		s.mixcoord.EXPECT().GetQueryNodeDistribution(mock.Anything, mock.Anything).Return(nil, errors.New("mocked error"))
 		req, err = http.NewRequest(http.MethodPost, management.RouteGetQueryNodeDistribution, strings.NewReader("node_id=1"))
 		s.Require().NoError(err)
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -276,7 +272,7 @@ func (s *ProxyManagementSuite) TestGetQueryNodeDistribution() {
 		s.SetupTest()
 		defer s.TearDownTest()
 
-		s.querycoord.EXPECT().GetQueryNodeDistribution(mock.Anything, mock.Anything).Return(nil, errors.New("mocked error"))
+		s.mixcoord.EXPECT().GetQueryNodeDistribution(mock.Anything, mock.Anything).Return(nil, errors.New("mocked error"))
 		req, err := http.NewRequest(http.MethodPost, management.RouteGetQueryNodeDistribution, strings.NewReader("node_id=1"))
 		s.Require().NoError(err)
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -291,7 +287,7 @@ func (s *ProxyManagementSuite) TestSuspendQueryCoordBalance() {
 		s.SetupTest()
 		defer s.TearDownTest()
 
-		s.querycoord.EXPECT().SuspendBalance(mock.Anything, mock.Anything).Return(merr.Success(), nil)
+		s.mixcoord.EXPECT().SuspendBalance(mock.Anything, mock.Anything).Return(merr.Success(), nil)
 
 		req, err := http.NewRequest(http.MethodPost, management.RouteSuspendQueryCoordBalance, nil)
 		s.Require().NoError(err)
@@ -306,7 +302,7 @@ func (s *ProxyManagementSuite) TestSuspendQueryCoordBalance() {
 		s.SetupTest()
 		defer s.TearDownTest()
 
-		s.querycoord.EXPECT().SuspendBalance(mock.Anything, mock.Anything).Return(nil, errors.New("mocked error"))
+		s.mixcoord.EXPECT().SuspendBalance(mock.Anything, mock.Anything).Return(nil, errors.New("mocked error"))
 		req, err := http.NewRequest(http.MethodPost, management.RouteSuspendQueryCoordBalance, nil)
 		s.Require().NoError(err)
 
@@ -319,7 +315,7 @@ func (s *ProxyManagementSuite) TestSuspendQueryCoordBalance() {
 		s.SetupTest()
 		defer s.TearDownTest()
 
-		s.querycoord.EXPECT().SuspendBalance(mock.Anything, mock.Anything).Return(merr.Status(merr.ErrServiceNotReady), nil)
+		s.mixcoord.EXPECT().SuspendBalance(mock.Anything, mock.Anything).Return(merr.Status(merr.ErrServiceNotReady), nil)
 		req, err := http.NewRequest(http.MethodPost, management.RouteSuspendQueryCoordBalance, nil)
 		s.Require().NoError(err)
 
@@ -334,7 +330,7 @@ func (s *ProxyManagementSuite) TestResumeQueryCoordBalance() {
 		s.SetupTest()
 		defer s.TearDownTest()
 
-		s.querycoord.EXPECT().ResumeBalance(mock.Anything, mock.Anything).Return(merr.Success(), nil)
+		s.mixcoord.EXPECT().ResumeBalance(mock.Anything, mock.Anything).Return(merr.Success(), nil)
 
 		req, err := http.NewRequest(http.MethodPost, management.RouteResumeQueryCoordBalance, nil)
 		s.Require().NoError(err)
@@ -349,7 +345,7 @@ func (s *ProxyManagementSuite) TestResumeQueryCoordBalance() {
 		s.SetupTest()
 		defer s.TearDownTest()
 
-		s.querycoord.EXPECT().ResumeBalance(mock.Anything, mock.Anything).Return(nil, errors.New("mocked error"))
+		s.mixcoord.EXPECT().ResumeBalance(mock.Anything, mock.Anything).Return(nil, errors.New("mocked error"))
 		req, err := http.NewRequest(http.MethodPost, management.RouteResumeQueryCoordBalance, nil)
 		s.Require().NoError(err)
 
@@ -362,7 +358,7 @@ func (s *ProxyManagementSuite) TestResumeQueryCoordBalance() {
 		s.SetupTest()
 		defer s.TearDownTest()
 
-		s.querycoord.EXPECT().ResumeBalance(mock.Anything, mock.Anything).Return(merr.Status(merr.ErrServiceNotReady), nil)
+		s.mixcoord.EXPECT().ResumeBalance(mock.Anything, mock.Anything).Return(merr.Status(merr.ErrServiceNotReady), nil)
 		req, err := http.NewRequest(http.MethodPost, management.RouteResumeQueryCoordBalance, nil)
 		s.Require().NoError(err)
 
@@ -372,12 +368,74 @@ func (s *ProxyManagementSuite) TestResumeQueryCoordBalance() {
 	})
 }
 
+func (s *ProxyManagementSuite) TestCheckBalanceStatus() {
+	s.Run("normal", func() {
+		s.SetupTest()
+		defer s.TearDownTest()
+
+		s.mixcoord.EXPECT().CheckBalanceStatus(mock.Anything, mock.Anything).Return(&querypb.CheckBalanceStatusResponse{
+			Status:   merr.Success(),
+			IsActive: true,
+		}, nil).Times(1)
+
+		req, err := http.NewRequest(http.MethodPost, management.RouteQueryCoordBalanceStatus, nil)
+		s.Require().NoError(err)
+
+		recorder := httptest.NewRecorder()
+		s.proxy.CheckQueryCoordBalanceStatus(recorder, req)
+		s.Equal(http.StatusOK, recorder.Code)
+		s.Equal(`{"msg": "OK", "status": "active"}`, recorder.Body.String())
+
+		s.mixcoord.EXPECT().CheckBalanceStatus(mock.Anything, mock.Anything).Return(&querypb.CheckBalanceStatusResponse{
+			Status:   merr.Success(),
+			IsActive: false,
+		}, nil).Times(1)
+
+		req, err = http.NewRequest(http.MethodPost, management.RouteQueryCoordBalanceStatus, nil)
+		s.Require().NoError(err)
+		recorder = httptest.NewRecorder()
+		s.proxy.CheckQueryCoordBalanceStatus(recorder, req)
+		s.Equal(http.StatusOK, recorder.Code)
+		s.Equal(`{"msg": "OK", "status": "suspended"}`, recorder.Body.String())
+	})
+
+	s.Run("return_error", func() {
+		s.SetupTest()
+		defer s.TearDownTest()
+
+		s.mixcoord.EXPECT().CheckBalanceStatus(mock.Anything, mock.Anything).Return(nil, errors.New("mocked error"))
+
+		req, err := http.NewRequest(http.MethodPost, management.RouteQueryCoordBalanceStatus, nil)
+		s.Require().NoError(err)
+
+		recorder := httptest.NewRecorder()
+		s.proxy.CheckQueryCoordBalanceStatus(recorder, req)
+		s.Equal(http.StatusInternalServerError, recorder.Code)
+	})
+
+	s.Run("return_failure", func() {
+		s.SetupTest()
+		defer s.TearDownTest()
+
+		req, err := http.NewRequest(http.MethodPost, management.RouteQueryCoordBalanceStatus, nil)
+		s.Require().NoError(err)
+
+		s.mixcoord.EXPECT().CheckBalanceStatus(mock.Anything, mock.Anything).Return(&querypb.CheckBalanceStatusResponse{
+			Status: merr.Status(merr.ErrServiceNotReady),
+		}, nil)
+
+		recorder := httptest.NewRecorder()
+		s.proxy.CheckQueryCoordBalanceStatus(recorder, req)
+		s.Equal(http.StatusInternalServerError, recorder.Code)
+	})
+}
+
 func (s *ProxyManagementSuite) TestSuspendQueryNode() {
 	s.Run("normal", func() {
 		s.SetupTest()
 		defer s.TearDownTest()
 
-		s.querycoord.EXPECT().SuspendNode(mock.Anything, mock.Anything).Return(merr.Success(), nil)
+		s.mixcoord.EXPECT().SuspendNode(mock.Anything, mock.Anything).Return(merr.Success(), nil)
 
 		req, err := http.NewRequest(http.MethodPost, management.RouteSuspendQueryNode, strings.NewReader("node_id=1"))
 		s.Require().NoError(err)
@@ -409,7 +467,7 @@ func (s *ProxyManagementSuite) TestSuspendQueryNode() {
 		s.Equal(http.StatusBadRequest, recorder.Code)
 
 		// test rpc return error
-		s.querycoord.EXPECT().SuspendNode(mock.Anything, mock.Anything).Return(nil, errors.New("mocked error"))
+		s.mixcoord.EXPECT().SuspendNode(mock.Anything, mock.Anything).Return(nil, errors.New("mocked error"))
 		req, err = http.NewRequest(http.MethodPost, management.RouteSuspendQueryNode, strings.NewReader("node_id=1"))
 		s.Require().NoError(err)
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -422,7 +480,7 @@ func (s *ProxyManagementSuite) TestSuspendQueryNode() {
 		s.SetupTest()
 		defer s.TearDownTest()
 
-		s.querycoord.EXPECT().SuspendNode(mock.Anything, mock.Anything).Return(merr.Status(merr.ErrServiceNotReady), nil)
+		s.mixcoord.EXPECT().SuspendNode(mock.Anything, mock.Anything).Return(merr.Status(merr.ErrServiceNotReady), nil)
 		req, err := http.NewRequest(http.MethodPost, management.RouteSuspendQueryNode, strings.NewReader("node_id=1"))
 		s.Require().NoError(err)
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -437,7 +495,7 @@ func (s *ProxyManagementSuite) TestResumeQueryNode() {
 		s.SetupTest()
 		defer s.TearDownTest()
 
-		s.querycoord.EXPECT().ResumeNode(mock.Anything, mock.Anything).Return(merr.Success(), nil)
+		s.mixcoord.EXPECT().ResumeNode(mock.Anything, mock.Anything).Return(merr.Success(), nil)
 
 		req, err := http.NewRequest(http.MethodPost, management.RouteResumeQueryNode, strings.NewReader("node_id=1"))
 		s.Require().NoError(err)
@@ -469,7 +527,7 @@ func (s *ProxyManagementSuite) TestResumeQueryNode() {
 		s.Equal(http.StatusBadRequest, recorder.Code)
 
 		// test rpc return error
-		s.querycoord.EXPECT().ResumeNode(mock.Anything, mock.Anything).Return(nil, errors.New("mocked error"))
+		s.mixcoord.EXPECT().ResumeNode(mock.Anything, mock.Anything).Return(nil, errors.New("mocked error"))
 		req, err = http.NewRequest(http.MethodPost, management.RouteResumeQueryNode, strings.NewReader("node_id=1"))
 		s.Require().NoError(err)
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -482,7 +540,7 @@ func (s *ProxyManagementSuite) TestResumeQueryNode() {
 		s.SetupTest()
 		defer s.TearDownTest()
 
-		s.querycoord.EXPECT().ResumeNode(mock.Anything, mock.Anything).Return(nil, errors.New("mocked error"))
+		s.mixcoord.EXPECT().ResumeNode(mock.Anything, mock.Anything).Return(nil, errors.New("mocked error"))
 		req, err := http.NewRequest(http.MethodPost, management.RouteResumeQueryNode, strings.NewReader("node_id=1"))
 		s.Require().NoError(err)
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -497,7 +555,7 @@ func (s *ProxyManagementSuite) TestTransferSegment() {
 		s.SetupTest()
 		defer s.TearDownTest()
 
-		s.querycoord.EXPECT().TransferSegment(mock.Anything, mock.Anything).Return(merr.Success(), nil)
+		s.mixcoord.EXPECT().TransferSegment(mock.Anything, mock.Anything).Return(merr.Success(), nil)
 
 		req, err := http.NewRequest(http.MethodPost, management.RouteTransferSegment, strings.NewReader("source_node_id=1&target_node_id=1&segment_id=1&copy_mode=false"))
 		s.Require().NoError(err)
@@ -537,7 +595,7 @@ func (s *ProxyManagementSuite) TestTransferSegment() {
 		s.Equal(http.StatusBadRequest, recorder.Code)
 
 		// test rpc return error
-		s.querycoord.EXPECT().TransferSegment(mock.Anything, mock.Anything).Return(nil, errors.New("mocked error"))
+		s.mixcoord.EXPECT().TransferSegment(mock.Anything, mock.Anything).Return(nil, errors.New("mocked error"))
 		req, err = http.NewRequest(http.MethodPost, management.RouteTransferSegment, strings.NewReader("source_node_id=1&target_node_id=1&segment_id=1"))
 		s.Require().NoError(err)
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -550,7 +608,7 @@ func (s *ProxyManagementSuite) TestTransferSegment() {
 		s.SetupTest()
 		defer s.TearDownTest()
 
-		s.querycoord.EXPECT().TransferSegment(mock.Anything, mock.Anything).Return(merr.Status(merr.ErrServiceNotReady), nil)
+		s.mixcoord.EXPECT().TransferSegment(mock.Anything, mock.Anything).Return(merr.Status(merr.ErrServiceNotReady), nil)
 		req, err := http.NewRequest(http.MethodPost, management.RouteTransferSegment, strings.NewReader("source_node_id=1"))
 		s.Require().NoError(err)
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -565,7 +623,7 @@ func (s *ProxyManagementSuite) TestTransferChannel() {
 		s.SetupTest()
 		defer s.TearDownTest()
 
-		s.querycoord.EXPECT().TransferChannel(mock.Anything, mock.Anything).Return(merr.Success(), nil)
+		s.mixcoord.EXPECT().TransferChannel(mock.Anything, mock.Anything).Return(merr.Success(), nil)
 
 		req, err := http.NewRequest(http.MethodPost, management.RouteTransferChannel, strings.NewReader("source_node_id=1&target_node_id=1&segment_id=1&copy_mode=false"))
 		s.Require().NoError(err)
@@ -605,7 +663,7 @@ func (s *ProxyManagementSuite) TestTransferChannel() {
 		s.Equal(http.StatusBadRequest, recorder.Code)
 
 		// test rpc return error
-		s.querycoord.EXPECT().TransferChannel(mock.Anything, mock.Anything).Return(nil, errors.New("mocked error"))
+		s.mixcoord.EXPECT().TransferChannel(mock.Anything, mock.Anything).Return(nil, errors.New("mocked error"))
 		req, err = http.NewRequest(http.MethodPost, management.RouteTransferChannel, strings.NewReader("source_node_id=1&target_node_id=1&segment_id=1"))
 		s.Require().NoError(err)
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -618,7 +676,7 @@ func (s *ProxyManagementSuite) TestTransferChannel() {
 		s.SetupTest()
 		defer s.TearDownTest()
 
-		s.querycoord.EXPECT().TransferChannel(mock.Anything, mock.Anything).Return(merr.Status(merr.ErrServiceNotReady), nil)
+		s.mixcoord.EXPECT().TransferChannel(mock.Anything, mock.Anything).Return(merr.Status(merr.ErrServiceNotReady), nil)
 		req, err := http.NewRequest(http.MethodPost, management.RouteTransferChannel, strings.NewReader("source_node_id=1"))
 		s.Require().NoError(err)
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -633,7 +691,7 @@ func (s *ProxyManagementSuite) TestCheckQueryNodeDistribution() {
 		s.SetupTest()
 		defer s.TearDownTest()
 
-		s.querycoord.EXPECT().CheckQueryNodeDistribution(mock.Anything, mock.Anything).Return(merr.Success(), nil)
+		s.mixcoord.EXPECT().CheckQueryNodeDistribution(mock.Anything, mock.Anything).Return(merr.Success(), nil)
 
 		req, err := http.NewRequest(http.MethodPost, management.RouteCheckQueryNodeDistribution, strings.NewReader("source_node_id=1&target_node_id=1"))
 		s.Require().NoError(err)
@@ -664,7 +722,7 @@ func (s *ProxyManagementSuite) TestCheckQueryNodeDistribution() {
 		s.Equal(http.StatusBadRequest, recorder.Code)
 
 		// test rpc return error
-		s.querycoord.EXPECT().CheckQueryNodeDistribution(mock.Anything, mock.Anything).Return(nil, errors.New("mocked error"))
+		s.mixcoord.EXPECT().CheckQueryNodeDistribution(mock.Anything, mock.Anything).Return(nil, errors.New("mocked error"))
 		req, err = http.NewRequest(http.MethodPost, management.RouteCheckQueryNodeDistribution, strings.NewReader("source_node_id=1&target_node_id=1"))
 		s.Require().NoError(err)
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -677,7 +735,7 @@ func (s *ProxyManagementSuite) TestCheckQueryNodeDistribution() {
 		s.SetupTest()
 		defer s.TearDownTest()
 
-		s.querycoord.EXPECT().CheckQueryNodeDistribution(mock.Anything, mock.Anything).Return(merr.Status(merr.ErrServiceNotReady), nil)
+		s.mixcoord.EXPECT().CheckQueryNodeDistribution(mock.Anything, mock.Anything).Return(merr.Status(merr.ErrServiceNotReady), nil)
 		req, err := http.NewRequest(http.MethodPost, management.RouteCheckQueryNodeDistribution, strings.NewReader("source_node_id=1&target_node_id=1"))
 		s.Require().NoError(err)
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")

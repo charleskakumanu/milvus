@@ -3,20 +3,23 @@ package tasks
 import (
 	"context"
 
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/querynodev2/segments"
+	"github.com/milvus-io/milvus/internal/util/searchutil/scheduler"
+	"github.com/milvus-io/milvus/internal/util/segcore"
 	"github.com/milvus-io/milvus/internal/util/streamrpc"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
 )
 
-var _ Task = &QueryStreamTask{}
+var _ scheduler.Task = &QueryStreamTask{}
 
 func NewQueryStreamTask(ctx context.Context,
 	collection *segments.Collection,
 	manager *segments.Manager,
 	req *querypb.QueryRequest,
 	srv streamrpc.QueryStreamServer,
-	streamBatchSize int,
+	minMsgSize int,
+	maxMsgSize int,
 ) *QueryStreamTask {
 	return &QueryStreamTask{
 		ctx:            ctx,
@@ -24,7 +27,8 @@ func NewQueryStreamTask(ctx context.Context,
 		segmentManager: manager,
 		req:            req,
 		srv:            srv,
-		batchSize:      streamBatchSize,
+		minMsgSize:     minMsgSize,
+		maxMsgSize:     maxMsgSize,
 		notifier:       make(chan error, 1),
 	}
 }
@@ -35,7 +39,8 @@ type QueryStreamTask struct {
 	segmentManager *segments.Manager
 	req            *querypb.QueryRequest
 	srv            streamrpc.QueryStreamServer
-	batchSize      int
+	minMsgSize     int
+	maxMsgSize     int
 	notifier       chan error
 }
 
@@ -55,19 +60,19 @@ func (t *QueryStreamTask) PreExecute() error {
 }
 
 func (t *QueryStreamTask) Execute() error {
-	retrievePlan, err := segments.NewRetrievePlan(
-		t.ctx,
-		t.collection,
+	retrievePlan, err := segcore.NewRetrievePlan(
+		t.collection.GetCCollection(),
 		t.req.Req.GetSerializedExprPlan(),
 		t.req.Req.GetMvccTimestamp(),
 		t.req.Req.Base.GetMsgID(),
+		t.req.Req.GetConsistencyLevel(),
 	)
 	if err != nil {
 		return err
 	}
 	defer retrievePlan.Delete()
 
-	srv := streamrpc.NewResultCacheServer(t.srv, t.batchSize)
+	srv := streamrpc.NewResultCacheServer(t.srv, t.minMsgSize, t.maxMsgSize)
 	defer srv.Flush()
 
 	segments, err := segments.RetrieveStream(t.ctx, t.segmentManager, retrievePlan, t.req, srv)

@@ -17,13 +17,14 @@
 package delegator
 
 import (
+	"context"
 	"sync"
 	"time"
 
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/v2/log"
 )
 
 type ExcludedSegments struct {
@@ -45,7 +46,7 @@ func (s *ExcludedSegments) Insert(excludeInfo map[int64]uint64) {
 	defer s.mu.Unlock()
 
 	for segmentID, ts := range excludeInfo {
-		log.Debug("add exclude info",
+		log.Ctx(context.TODO()).Debug("add exclude info",
 			zap.Int64("segmentID", segmentID),
 			zap.Uint64("ts", ts),
 		)
@@ -76,13 +77,11 @@ func (s *ExcludedSegments) CleanInvalid(ts uint64) {
 
 	for _, segmentID := range invalidExcludedInfos {
 		delete(s.segments, segmentID)
-		log.Info("remove segment from exclude info", zap.Int64("segmentID", segmentID))
+		log.Ctx(context.TODO()).Info("remove segment from exclude info", zap.Int64("segmentID", segmentID))
 	}
 	s.lastClean.Store(time.Now())
 }
 
 func (s *ExcludedSegments) ShouldClean() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	return time.Since(s.lastClean.Load()) > s.cleanInterval
 }

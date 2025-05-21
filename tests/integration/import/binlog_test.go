@@ -21,21 +21,21 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/samber/lo"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/metric"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/metric"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/tests/integration"
 )
 
@@ -238,12 +238,23 @@ func (s *BulkInsertSuite) TestBinlogImport() {
 
 	s.WaitForIndexBuilt(ctx, collectionName, integration.FloatVecField)
 
+	flushedSegmentsResp, err := c.MixCoordClient.GetFlushedSegments(ctx, &datapb.GetFlushedSegmentsRequest{
+		CollectionID:     collectionID,
+		PartitionID:      partitionID,
+		IncludeUnhealthy: false,
+	})
+	s.NoError(merr.CheckRPCCall(flushedSegmentsResp, err))
+	flushedSegments := flushedSegmentsResp.GetSegments()
+	log.Info("flushed segments", zap.Int64s("segments", flushedSegments))
+	segmentBinlogPrefixes := make([]string, 0)
+	for _, segmentID := range flushedSegments {
+		segmentBinlogPrefixes = append(segmentBinlogPrefixes,
+			fmt.Sprintf("/tmp/%s/insert_log/%d/%d/%d", paramtable.Get().EtcdCfg.RootPath.GetValue(), collectionID, partitionID, segmentID))
+	}
 	// binlog import
 	files := []*internalpb.ImportFile{
 		{
-			Paths: []string{
-				fmt.Sprintf("/tmp/%s/insert_log/%d/%d/", paramtable.Get().EtcdCfg.RootPath.GetValue(), collectionID, partitionID),
-			},
+			Paths: segmentBinlogPrefixes,
 		},
 	}
 	importResp, err := c.Proxy.ImportV2(ctx, &internalpb.ImportRequest{
@@ -268,8 +279,11 @@ func (s *BulkInsertSuite) TestBinlogImport() {
 		return segment.GetCollectionID() == newCollectionID
 	})
 	log.Info("Show segments", zap.Any("segments", segments))
-	s.Equal(1, len(segments))
-	segment := segments[0]
+	s.Equal(2, len(segments))
+	segment, ok := lo.Find(segments, func(segment *datapb.SegmentInfo) bool {
+		return segment.GetState() == commonpb.SegmentState_Flushed
+	})
+	s.True(ok)
 	s.Equal(commonpb.SegmentState_Flushed, segment.GetState())
 	s.True(len(segment.GetBinlogs()) > 0)
 	s.NoError(CheckLogID(segment.GetBinlogs()))

@@ -29,12 +29,13 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/util/importutilv2/common"
-	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 )
 
 type reader struct {
 	ctx    context.Context
 	cm     storage.ChunkManager
+	cmrs   map[int64]storage.FileReader
 	schema *schemapb.CollectionSchema
 
 	fileSize *atomic.Int64
@@ -45,10 +46,15 @@ type reader struct {
 }
 
 func NewReader(ctx context.Context, cm storage.ChunkManager, schema *schemapb.CollectionSchema, paths []string, bufferSize int) (*reader, error) {
+	for _, fieldSchema := range schema.Fields {
+		if fieldSchema.GetNullable() {
+			return nil, merr.WrapErrParameterInvalidMsg(fmt.Sprintf("not support bulk insert numpy files in field(%s) which set nullable == true", fieldSchema.GetName()))
+		}
+	}
 	fields := lo.KeyBy(schema.GetFields(), func(field *schemapb.FieldSchema) int64 {
 		return field.GetFieldID()
 	})
-	count, err := calcRowCount(bufferSize, schema)
+	count, err := common.EstimateReadCountPerBatch(bufferSize, schema)
 	if err != nil {
 		return nil, err
 	}
@@ -67,6 +73,7 @@ func NewReader(ctx context.Context, cm storage.ChunkManager, schema *schemapb.Co
 	return &reader{
 		ctx:      ctx,
 		cm:       cm,
+		cmrs:     readers,
 		schema:   schema,
 		fileSize: atomic.NewInt64(0),
 		paths:    paths,
@@ -89,7 +96,7 @@ func (r *reader) Read() (*storage.InsertData, error) {
 		if data == nil {
 			return nil, io.EOF
 		}
-		err = insertData.Data[fieldID].AppendRows(data)
+		err = insertData.Data[fieldID].AppendRows(data, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -114,37 +121,45 @@ func (r *reader) Size() (int64, error) {
 }
 
 func (r *reader) Close() {
-	for _, cr := range r.frs {
-		cr.Close()
+	for _, cmr := range r.cmrs {
+		cmr.Close()
 	}
 }
 
-func CreateReaders(ctx context.Context, cm storage.ChunkManager, schema *schemapb.CollectionSchema, paths []string) (map[int64]io.Reader, error) {
-	readers := make(map[int64]io.Reader)
+func CreateReaders(ctx context.Context, cm storage.ChunkManager, schema *schemapb.CollectionSchema, paths []string) (map[int64]storage.FileReader, error) {
+	readers := make(map[int64]storage.FileReader)
 	nameToPath := lo.SliceToMap(paths, func(path string) (string, string) {
 		nameWithExt := filepath.Base(path)
 		name := strings.TrimSuffix(nameWithExt, filepath.Ext(nameWithExt))
 		return name, path
 	})
 	for _, field := range schema.GetFields() {
+		path, hasPath := nameToPath[field.GetName()]
 		if field.GetIsPrimaryKey() && field.GetAutoID() {
-			if _, ok := nameToPath[field.GetName()]; ok {
+			if hasPath {
 				return nil, merr.WrapErrImportFailed(
 					fmt.Sprintf("the primary key '%s' is auto-generated, no need to provide", field.GetName()))
 			}
 			continue
 		}
-		if _, ok := nameToPath[field.GetName()]; !ok {
+		if field.GetIsFunctionOutput() {
+			if hasPath {
+				return nil, merr.WrapErrImportFailed(
+					fmt.Sprintf("field %s is Function output, should not be provided. Provided files: %v", field.GetName(), lo.Values(nameToPath)))
+			}
+			continue
+		}
+		if !hasPath {
 			if field.GetIsDynamic() {
 				continue
 			}
 			return nil, merr.WrapErrImportFailed(
 				fmt.Sprintf("no file for field: %s, files: %v", field.GetName(), lo.Values(nameToPath)))
 		}
-		reader, err := cm.Reader(ctx, nameToPath[field.GetName()])
+		reader, err := cm.Reader(ctx, path)
 		if err != nil {
 			return nil, merr.WrapErrImportFailed(
-				fmt.Sprintf("failed to read the file '%s', error: %s", nameToPath[field.GetName()], err.Error()))
+				fmt.Sprintf("failed to read the file '%s', error: %s", path, err.Error()))
 		}
 		readers[field.GetFieldID()] = reader
 	}

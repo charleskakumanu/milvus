@@ -18,7 +18,7 @@ package analyzecgowrapper
 
 /*
 
-#cgo pkg-config: milvus_common
+#cgo pkg-config: milvus_core
 
 #include <stdlib.h>	// free
 #include "common/type_c.h"
@@ -29,8 +29,8 @@ import (
 	"fmt"
 	"unsafe"
 
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 )
 
 // HandleCStatus deal with the error returned from CGO

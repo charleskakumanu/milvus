@@ -22,11 +22,15 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/errors"
+	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
+
+const InputErrorFlagKey string = "is_input_error"
 
 // Code returns the error code of the given error,
 // WARN: DO NOT use this for now
@@ -36,14 +40,14 @@ func Code(err error) int32 {
 	}
 
 	cause := errors.Cause(err)
-	switch cause := cause.(type) {
+	switch specificErr := cause.(type) {
 	case milvusError:
-		return cause.code()
+		return specificErr.code()
 
 	default:
-		if errors.Is(cause, context.Canceled) {
+		if errors.Is(specificErr, context.Canceled) {
 			return CanceledCode
-		} else if errors.Is(cause, context.DeadlineExceeded) {
+		} else if errors.Is(specificErr, context.DeadlineExceeded) {
 			return TimeoutCode
 		} else {
 			return errUnexpected.code()
@@ -71,7 +75,8 @@ func Status(err error) *commonpb.Status {
 	}
 
 	code := Code(err)
-	return &commonpb.Status{
+
+	status := &commonpb.Status{
 		Code:   code,
 		Reason: previousLastError(err).Error(),
 		// Deprecated, for compatibility
@@ -79,6 +84,11 @@ func Status(err error) *commonpb.Status {
 		Retriable: IsRetryableErr(err),
 		Detail:    err.Error(),
 	}
+
+	if GetErrorType(err) == InputError {
+		status.ExtraInfo = map[string]string{InputErrorFlagKey: "true"}
+	}
+	return status
 }
 
 func previousLastError(err error) error {
@@ -144,7 +154,7 @@ func oldCode(code int32) commonpb.ErrorCode {
 	case ErrNodeNotMatch.code():
 		return commonpb.ErrorCode_NodeIDNotMatch
 
-	case ErrCollectionNotFound.code(), ErrPartitionNotFound.code(), ErrReplicaNotFound.code():
+	case ErrPartitionNotFound.code(), ErrReplicaNotFound.code():
 		return commonpb.ErrorCode_MetaFailed
 
 	case ErrReplicaNotAvailable.code(), ErrChannelNotAvailable.code(), ErrNodeNotAvailable.code():
@@ -173,6 +183,9 @@ func oldCode(code int32) commonpb.ErrorCode {
 
 	case ErrChannelLack.code():
 		return commonpb.ErrorCode_MetaFailed
+
+	case ErrCollectionSchemaMismatch.code():
+		return commonpb.ErrorCode_SchemaMismatch
 
 	default:
 		return commonpb.ErrorCode_UnexpectedError
@@ -233,12 +246,18 @@ func Error(status *commonpb.Status) error {
 		return nil
 	}
 
+	var eType ErrorType
+	_, ok := status.GetExtraInfo()[InputErrorFlagKey]
+	if ok {
+		eType = InputError
+	}
+
 	// use code first
 	code := status.GetCode()
 	if code == 0 {
-		return newMilvusErrorWithDetail(status.GetReason(), status.GetDetail(), Code(OldCodeToMerr(status.GetErrorCode())), false)
+		return newMilvusError(status.GetReason(), Code(OldCodeToMerr(status.GetErrorCode())), false, WithDetail(status.GetDetail()), WithErrorType(eType))
 	}
-	return newMilvusErrorWithDetail(status.GetReason(), status.GetDetail(), code, status.GetRetriable())
+	return newMilvusError(status.GetReason(), code, status.GetRetriable(), WithDetail(status.GetDetail()), WithErrorType(eType))
 }
 
 // SegcoreError returns a merr according to the given segcore error code and message
@@ -251,18 +270,6 @@ func SegcoreError(code int32, msg string) error {
 // otherwise returns ErrServiceNotReady wrapped with current state
 func CheckHealthy(state commonpb.StateCode) error {
 	if state != commonpb.StateCode_Healthy {
-		return WrapErrServiceNotReady(paramtable.GetRole(), paramtable.GetNodeID(), state.String())
-	}
-
-	return nil
-}
-
-// CheckHealthyStandby checks whether the state is healthy or standby,
-// returns nil if healthy or standby
-// otherwise returns ErrServiceNotReady wrapped with current state
-// this method only used in GetMetrics
-func CheckHealthyStandby(state commonpb.StateCode) error {
-	if state != commonpb.StateCode_Healthy && state != commonpb.StateCode_StandBy {
 		return WrapErrServiceNotReady(paramtable.GetRole(), paramtable.GetNodeID(), state.String())
 	}
 
@@ -293,6 +300,39 @@ func AnalyzeState(role string, nodeID int64, state *milvuspb.ComponentStates) er
 	return nil
 }
 
+func WrapErrAsInputError(err error) error {
+	if merr, ok := err.(milvusError); ok {
+		WithErrorType(InputError)(&merr)
+		return merr
+	}
+	return err
+}
+
+func WrapErrAsInputErrorWhen(err error, targets ...milvusError) error {
+	if merr, ok := err.(milvusError); ok {
+		for _, target := range targets {
+			if target.errCode == merr.errCode {
+				log.Info("mark error as input error", zap.Error(err))
+				WithErrorType(InputError)(&merr)
+				return merr
+			}
+		}
+	}
+	return err
+}
+
+func WrapErrCollectionReplicateMode(operation string) error {
+	return wrapFields(ErrCollectionReplicateMode, value("operation", operation))
+}
+
+func GetErrorType(err error) ErrorType {
+	if merr, ok := err.(milvusError); ok {
+		return merr.errType
+	}
+
+	return SystemError
+}
+
 // Service related
 func WrapErrServiceNotReady(role string, sessionID int64, state string, msg ...string) error {
 	err := wrapFieldsWithDesc(ErrServiceNotReady,
@@ -314,9 +354,12 @@ func WrapErrServiceUnavailable(reason string, msg ...string) error {
 }
 
 func WrapErrServiceMemoryLimitExceeded(predict, limit float32, msg ...string) error {
+	toMB := func(mem float32) float32 {
+		return mem / 1024 / 1024
+	}
 	err := wrapFields(ErrServiceMemoryLimitExceeded,
-		value("predict", predict),
-		value("limit", limit),
+		value("predict(MB)", toMB(predict)),
+		value("limit(MB)", toMB(limit)),
 	)
 	if len(msg) > 0 {
 		err = errors.Wrap(err, strings.Join(msg, "->"))
@@ -324,8 +367,8 @@ func WrapErrServiceMemoryLimitExceeded(predict, limit float32, msg ...string) er
 	return err
 }
 
-func WrapErrServiceRequestLimitExceeded(limit int32, msg ...string) error {
-	err := wrapFields(ErrServiceRequestLimitExceeded,
+func WrapErrTooManyRequests(limit int32, msg ...string) error {
+	err := wrapFields(ErrServiceTooManyRequests,
 		value("limit", limit),
 	)
 	if len(msg) > 0 {
@@ -354,9 +397,12 @@ func WrapErrServiceCrossClusterRouting(expectedCluster, actualCluster string, ms
 }
 
 func WrapErrServiceDiskLimitExceeded(predict, limit float32, msg ...string) error {
+	toMB := func(mem float32) float32 {
+		return mem / 1024 / 1024
+	}
 	err := wrapFields(ErrServiceDiskLimitExceeded,
-		value("predict", predict),
-		value("limit", limit),
+		value("predict(MB)", toMB(predict)),
+		value("limit(MB)", toMB(limit)),
 	)
 	if len(msg) > 0 {
 		err = errors.Wrap(err, strings.Join(msg, "->"))
@@ -409,6 +455,14 @@ func WrapErrDatabaseNameInvalid(database any, msg ...string) error {
 	return err
 }
 
+func WrapErrPrivilegeGroupNameInvalid(privilegeGroup any, msg ...string) error {
+	err := wrapFields(ErrPrivilegeGroupInvalidName, value("privilegeGroup", privilegeGroup))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
 // Collection related
 func WrapErrCollectionNotFound(collection any, msg ...string) error {
 	err := wrapFields(ErrCollectionNotFound, value("collection", collection))
@@ -437,8 +491,8 @@ func WrapErrCollectionNotLoaded(collection any, msg ...string) error {
 	return err
 }
 
-func WrapErrCollectionNumLimitExceeded(limit int, msg ...string) error {
-	err := wrapFields(ErrCollectionNumLimitExceeded, value("limit", limit))
+func WrapErrCollectionNumLimitExceeded(db string, limit int, msg ...string) error {
+	err := wrapFields(ErrCollectionNumLimitExceeded, value("dbName", db), value("limit", limit))
 	if len(msg) > 0 {
 		err = errors.Wrap(err, strings.Join(msg, "->"))
 	}
@@ -495,6 +549,14 @@ func WrapErrCollectionVectorClusteringKeyNotAllowed(collection any, msgAndArgs .
 	if len(msgAndArgs) > 0 {
 		msg := msgAndArgs[0].(string)
 		err = errors.Wrapf(err, msg, msgAndArgs[1:]...)
+	}
+	return err
+}
+
+func WrapErrCollectionSchemaMisMatch(collection any, msg ...string) error {
+	err := wrapFields(ErrCollectionSchemaMismatch, value("collection", collection))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
 	}
 	return err
 }
@@ -602,6 +664,15 @@ func WrapErrResourceGroupIllegalConfig(rg any, cfg any, msg ...string) error {
 	return err
 }
 
+// WrapErrStreamingNodeNotEnough make a streaming node is not enough error
+func WrapErrStreamingNodeNotEnough(current int, expected int, msg ...string) error {
+	err := wrapFields(ErrServiceResourceInsufficient, value("currentStreamingNode", current), value("expectedStreamingNode", expected))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
 // go:deprecated
 // WrapErrResourceGroupNodeNotEnough wraps ErrResourceGroupNodeNotEnough with resource group
 func WrapErrResourceGroupNodeNotEnough(rg any, current any, expected any, msg ...string) error {
@@ -639,36 +710,33 @@ func WrapErrReplicaNotAvailable(id int64, msg ...string) error {
 }
 
 // Channel related
-func WrapErrChannelNotFound(name string, msg ...string) error {
-	err := wrapFields(ErrChannelNotFound, value("channel", name))
+
+func warpChannelErr(mErr milvusError, name string, msg ...string) error {
+	err := wrapFields(mErr, value("channel", name))
 	if len(msg) > 0 {
 		err = errors.Wrap(err, strings.Join(msg, "->"))
 	}
 	return err
+}
+
+func WrapErrChannelNotFound(name string, msg ...string) error {
+	return warpChannelErr(ErrChannelNotFound, name, msg...)
+}
+
+func WrapErrChannelCPExceededMaxLag(name string, msg ...string) error {
+	return warpChannelErr(ErrChannelCPExceededMaxLag, name, msg...)
 }
 
 func WrapErrChannelLack(name string, msg ...string) error {
-	err := wrapFields(ErrChannelLack, value("channel", name))
-	if len(msg) > 0 {
-		err = errors.Wrap(err, strings.Join(msg, "->"))
-	}
-	return err
+	return warpChannelErr(ErrChannelLack, name, msg...)
 }
 
 func WrapErrChannelReduplicate(name string, msg ...string) error {
-	err := wrapFields(ErrChannelReduplicate, value("channel", name))
-	if len(msg) > 0 {
-		err = errors.Wrap(err, strings.Join(msg, "->"))
-	}
-	return err
+	return warpChannelErr(ErrChannelReduplicate, name, msg...)
 }
 
 func WrapErrChannelNotAvailable(name string, msg ...string) error {
-	err := wrapFields(ErrChannelNotAvailable, value("channel", name))
-	if len(msg) > 0 {
-		err = errors.Wrap(err, strings.Join(msg, "->"))
-	}
-	return err
+	return warpChannelErr(ErrChannelNotAvailable, name, msg...)
 }
 
 // Segment related
@@ -729,8 +797,8 @@ func WrapErrIndexNotFound(indexName string, msg ...string) error {
 	return err
 }
 
-func WrapErrIndexNotFoundForSegment(segmentID int64, msg ...string) error {
-	err := wrapFields(ErrIndexNotFound, value("segmentID", segmentID))
+func WrapErrIndexNotFoundForSegments(segmentIDs []int64, msg ...string) error {
+	err := wrapFields(ErrIndexNotFound, value("segmentIDs", segmentIDs))
 	if len(msg) > 0 {
 		err = errors.Wrap(err, strings.Join(msg, "->"))
 	}
@@ -755,6 +823,14 @@ func WrapErrIndexNotSupported(indexType string, msg ...string) error {
 
 func WrapErrIndexDuplicate(indexName string, msg ...string) error {
 	err := wrapFields(ErrIndexDuplicate, value("indexName", indexName))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrTaskDuplicate(taskType string, msg ...string) error {
+	err := wrapFields(ErrTaskDuplicate, value("taskType", taskType))
 	if len(msg) > 0 {
 		err = errors.Wrap(err, strings.Join(msg, "->"))
 	}
@@ -1119,4 +1195,56 @@ func WrapErrClusteringCompactionSubmitTaskFail(taskType string, err error) error
 
 func WrapErrClusteringCompactionMetaError(operation string, err error) error {
 	return wrapFieldsWithDesc(ErrClusteringCompactionMetaError, err.Error(), value("operation", operation))
+}
+
+func WrapErrCleanPartitionStatsFail(msg ...string) error {
+	err := error(ErrCleanPartitionStatsFail)
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrAnalyzeTaskNotFound(id int64) error {
+	return wrapFields(ErrAnalyzeTaskNotFound, value("analyzeId", id))
+}
+
+func WrapErrBuildCompactionRequestFail(err error) error {
+	return wrapFieldsWithDesc(ErrBuildCompactionRequestFail, err.Error())
+}
+
+func WrapErrGetCompactionPlanResultFail(err error) error {
+	return wrapFieldsWithDesc(ErrGetCompactionPlanResultFail, err.Error())
+}
+
+func WrapErrCompactionResult(msg ...string) error {
+	err := error(ErrCompactionResult)
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrDataNodeSlotExhausted(msg ...string) error {
+	err := error(ErrDataNodeSlotExhausted)
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrDuplicatedCompactionTask(msg ...string) error {
+	err := error(ErrDuplicatedCompactionTask)
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrOldSessionExists(msg ...string) error {
+	err := error(ErrOldSessionExists)
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
 }

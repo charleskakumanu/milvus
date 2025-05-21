@@ -9,11 +9,14 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
+#include "pthread.h"
 #include "config/ConfigKnowhere.h"
+#include "fmt/core.h"
 #include "log/Log.h"
 #include "segcore/SegcoreConfig.h"
 #include "segcore/segcore_init_c.h"
-
+#include "cachinglayer/Manager.h"
+#include "cachinglayer/Utils.h"
 namespace milvus::segcore {
 
 std::once_flag close_glog_once;
@@ -74,6 +77,7 @@ SegcoreSetSimdType(const char* value) {
     LOG_DEBUG("set config simd_type: {}", value);
     auto real_type = milvus::config::KnowhereSetSimdType(value);
     char* ret = reinterpret_cast<char*>(malloc(real_type.length() + 1));
+    AssertInfo(ret != nullptr, "memmory allocation for ret failed!");
     memcpy(ret, real_type.c_str(), real_type.length());
     ret[real_type.length()] = 0;
     return ret;
@@ -101,6 +105,49 @@ GetCurrentIndexVersion() {
 extern "C" int32_t
 GetMinimalIndexVersion() {
     return milvus::config::GetMinimalIndexVersion();
+}
+
+extern "C" int32_t
+GetMaximumIndexVersion() {
+    return milvus::config::GetMaximumIndexVersion();
+}
+
+extern "C" void
+SetThreadName(const char* name) {
+#ifdef __linux__
+    pthread_setname_np(pthread_self(), name);
+#elif __APPLE__
+    pthread_setname_np(name);
+#endif
+}
+
+extern "C" void
+ConfigureTieredStorage(const CacheWarmupPolicy scalarFieldCacheWarmupPolicy,
+                       const CacheWarmupPolicy vectorFieldCacheWarmupPolicy,
+                       const CacheWarmupPolicy scalarIndexCacheWarmupPolicy,
+                       const CacheWarmupPolicy vectorIndexCacheWarmupPolicy,
+                       const int64_t memory_low_watermark_bytes,
+                       const int64_t memory_high_watermark_bytes,
+                       const int64_t memory_max_bytes,
+                       const int64_t disk_low_watermark_bytes,
+                       const int64_t disk_high_watermark_bytes,
+                       const int64_t disk_max_bytes,
+                       const bool evictionEnabled,
+                       const int64_t cache_touch_window_ms,
+                       const int64_t eviction_interval_ms) {
+    milvus::cachinglayer::Manager::ConfigureTieredStorage(
+        {scalarFieldCacheWarmupPolicy,
+         vectorFieldCacheWarmupPolicy,
+         scalarIndexCacheWarmupPolicy,
+         vectorIndexCacheWarmupPolicy},
+        {memory_low_watermark_bytes,
+         memory_high_watermark_bytes,
+         memory_max_bytes,
+         disk_low_watermark_bytes,
+         disk_high_watermark_bytes,
+         disk_max_bytes},
+        evictionEnabled,
+        {cache_touch_window_ms, eviction_interval_ms});
 }
 
 }  // namespace milvus::segcore

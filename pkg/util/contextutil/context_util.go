@@ -22,10 +22,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc/metadata"
 
-	"github.com/milvus-io/milvus/pkg/util"
-	"github.com/milvus-io/milvus/pkg/util/crypto"
+	"github.com/milvus-io/milvus/pkg/v2/util"
+	"github.com/milvus-io/milvus/pkg/v2/util/crypto"
 )
 
 type ctxTenantKey struct{}
@@ -72,7 +73,7 @@ func GetCurUserFromContext(ctx context.Context) (string, error) {
 func GetAuthInfoFromContext(ctx context.Context) (string, string, error) {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
-		return "", "", fmt.Errorf("fail to get md from the context")
+		return "", "", errors.New("fail to get md from the context")
 	}
 	authorization, ok := md[strings.ToLower(util.HeaderAuthorize)]
 	if !ok || len(authorization) < 1 {
@@ -118,6 +119,18 @@ func WithDeadlineCause(parent context.Context, deadline time.Time, err error) (c
 	})
 
 	return ctx, func() {
+		cancel(context.Canceled)
+	}
+}
+
+// MergeContext create a cancellation context that cancels when any of the given contexts are canceled.
+func MergeContext(ctx1 context.Context, ctx2 context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancelCause(ctx1)
+	stop := context.AfterFunc(ctx2, func() {
+		cancel(context.Cause(ctx2))
+	})
+	return ctx, func() {
+		stop()
 		cancel(context.Canceled)
 	}
 }

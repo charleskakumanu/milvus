@@ -21,14 +21,13 @@
 #include "index/IndexFactory.h"
 #include "pb/plan.pb.h"
 #include "plan/PlanNode.h"
-#include "query/Expr.h"
-#include "query/ExprImpl.h"
 #include "query/Plan.h"
 #include "query/PlanNode.h"
-#include "query/generated/ExecExprVisitor.h"
+#include "query/ExecPlanNodeVisitor.h"
 #include "segcore/SegmentGrowingImpl.h"
 #include "simdjson/padded_string.h"
 #include "test_utils/DataGen.h"
+#include "test_utils/GenExprProto.h"
 
 using namespace milvus;
 using namespace milvus::query;
@@ -598,7 +597,6 @@ TEST(Expr, TestArrayRange) {
     }
 
     auto seg_promote = dynamic_cast<SegmentGrowingImpl*>(seg.get());
-    query::ExecPlanNodeVisitor visitor(*seg_promote, MAX_TIMESTAMP);
     for (auto [clause, array_type, ref_func] : testcases) {
         auto loc = raw_plan_tmp.find("@@@@");
         auto raw_plan = raw_plan_tmp;
@@ -607,17 +605,38 @@ TEST(Expr, TestArrayRange) {
         auto plan =
             CreateSearchPlanByExpr(*schema, plan_str.data(), plan_str.size());
         BitsetType final;
-        visitor.ExecuteExprNode(plan->plan_node_->filter_plannode_.value(),
-                                seg_promote,
-                                N * num_iters,
-                                final);
+        final = ExecuteQueryExpr(
+            plan->plan_node_->plannodes_->sources()[0]->sources()[0],
+            seg_promote,
+            N * num_iters,
+            MAX_TIMESTAMP);
         EXPECT_EQ(final.size(), N * num_iters);
+
+        // specify some offsets and do scalar filtering on these offsets
+        milvus::exec::OffsetVector offsets;
+        offsets.reserve(N * num_iters / 2);
+        for (auto i = 0; i < N * num_iters; ++i) {
+            if (i % 2 == 0) {
+                offsets.emplace_back(i);
+            }
+        }
+        auto col_vec = milvus::test::gen_filter_res(
+            plan->plan_node_->plannodes_->sources()[0]->sources()[0].get(),
+            seg_promote,
+            N * num_iters,
+            MAX_TIMESTAMP,
+            &offsets);
+        BitsetTypeView view(col_vec->GetRawData(), col_vec->size());
+        EXPECT_EQ(view.size(), N * num_iters / 2);
 
         for (int i = 0; i < N * num_iters; ++i) {
             auto ans = final[i];
             auto array = milvus::Array(array_cols[array_type][i]);
             auto ref = ref_func(array);
             ASSERT_EQ(ans, ref);
+            if (i % 2 == 0) {
+                ASSERT_EQ(view[int(i / 2)], ref);
+            }
         }
     }
 }
@@ -715,7 +734,6 @@ TEST(Expr, TestArrayEqual) {
     }
 
     auto seg_promote = dynamic_cast<SegmentGrowingImpl*>(seg.get());
-    query::ExecPlanNodeVisitor visitor(*seg_promote, MAX_TIMESTAMP);
     for (auto [clause, ref_func] : testcases) {
         auto loc = raw_plan_tmp.find("@@@@");
         auto raw_plan = raw_plan_tmp;
@@ -724,11 +742,29 @@ TEST(Expr, TestArrayEqual) {
         auto plan =
             CreateSearchPlanByExpr(*schema, plan_str.data(), plan_str.size());
         BitsetType final;
-        visitor.ExecuteExprNode(plan->plan_node_->filter_plannode_.value(),
-                                seg_promote,
-                                N * num_iters,
-                                final);
+        final = ExecuteQueryExpr(
+            plan->plan_node_->plannodes_->sources()[0]->sources()[0],
+            seg_promote,
+            N * num_iters,
+            MAX_TIMESTAMP);
         EXPECT_EQ(final.size(), N * num_iters);
+
+        // specify some offsets and do scalar filtering on these offsets
+        milvus::exec::OffsetVector offsets;
+        offsets.reserve(N * num_iters / 2);
+        for (auto i = 0; i < N * num_iters; ++i) {
+            if (i % 2 == 0) {
+                offsets.emplace_back(i);
+            }
+        }
+        auto col_vec = milvus::test::gen_filter_res(
+            plan->plan_node_->plannodes_->sources()[0]->sources()[0].get(),
+            seg_promote,
+            N * num_iters,
+            MAX_TIMESTAMP,
+            &offsets);
+        BitsetTypeView view(col_vec->GetRawData(), col_vec->size());
+        EXPECT_EQ(view.size(), N * num_iters / 2);
 
         for (int i = 0; i < N * num_iters; ++i) {
             auto ans = final[i];
@@ -738,6 +774,109 @@ TEST(Expr, TestArrayEqual) {
                 array_values.push_back(array.get_data<int64_t>(j));
             }
             auto ref = ref_func(array_values);
+            ASSERT_EQ(ans, ref);
+            if (i % 2 == 0) {
+                ASSERT_EQ(view[int(i / 2)], ref);
+            }
+        }
+    }
+}
+
+TEST(Expr, TestArrayNullExpr) {
+    std::vector<std::tuple<std::string, std::function<bool(bool)>>> testcases =
+        {
+            {R"(null_expr: <
+                column_info: <
+                    field_id: 102
+                    data_type: Array
+                    element_type:Int64
+                    nullable: true
+                  >
+                op:IsNull
+        >)",
+             [](bool v) { return !v; }},
+        };
+
+    std::string raw_plan_tmp = R"(vector_anns: <
+                                    field_id: 100
+                                    predicates: <
+                                      @@@@
+                                    >
+                                    query_info: <
+                                      topk: 10
+                                      round_decimal: 3
+                                      metric_type: "L2"
+                                      search_params: "{\"nprobe\": 10}"
+                                    >
+                                    placeholder_tag: "$0"
+     >)";
+    auto schema = std::make_shared<Schema>();
+    auto vec_fid = schema->AddDebugField(
+        "fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
+    auto i64_fid = schema->AddDebugField("id", DataType::INT64);
+    auto long_array_fid = schema->AddDebugField(
+        "long_array", DataType::ARRAY, DataType::INT64, true);
+    schema->set_primary_field_id(i64_fid);
+
+    auto seg = CreateGrowingSegment(schema, empty_index_meta);
+    int N = 1000;
+    std::vector<ScalarArray> long_array_col;
+    int num_iters = 1;
+    FixedVector<bool> valid_data;
+
+    for (int iter = 0; iter < num_iters; ++iter) {
+        auto raw_data = DataGen(schema, N, iter, 0, 1, 3);
+        auto new_long_array_col = raw_data.get_col<ScalarArray>(long_array_fid);
+        long_array_col.insert(long_array_col.end(),
+                              new_long_array_col.begin(),
+                              new_long_array_col.end());
+        auto new_valid_col = raw_data.get_col_valid(long_array_fid);
+        valid_data.insert(
+            valid_data.end(), new_valid_col.begin(), new_valid_col.end());
+        seg->PreInsert(N);
+        seg->Insert(iter * N,
+                    N,
+                    raw_data.row_ids_.data(),
+                    raw_data.timestamps_.data(),
+                    raw_data.raw_);
+    }
+
+    auto seg_promote = dynamic_cast<SegmentGrowingImpl*>(seg.get());
+    for (auto [clause, ref_func] : testcases) {
+        auto loc = raw_plan_tmp.find("@@@@");
+        auto raw_plan = raw_plan_tmp;
+        raw_plan.replace(loc, 4, clause);
+        auto plan_str = translate_text_plan_to_binary_plan(raw_plan.c_str());
+        auto plan =
+            CreateSearchPlanByExpr(*schema, plan_str.data(), plan_str.size());
+        BitsetType final;
+        final = ExecuteQueryExpr(
+            plan->plan_node_->plannodes_->sources()[0]->sources()[0],
+            seg_promote,
+            N * num_iters,
+            MAX_TIMESTAMP);
+        EXPECT_EQ(final.size(), N * num_iters);
+
+        // specify some offsets and do scalar filtering on these offsets
+        milvus::exec::OffsetVector offsets;
+        offsets.reserve(N * num_iters / 2);
+        for (auto i = 0; i < N * num_iters; ++i) {
+            if (i % 2 == 0) {
+                offsets.emplace_back(i);
+            }
+        }
+        auto col_vec = milvus::test::gen_filter_res(
+            plan->plan_node_->plannodes_->sources()[0]->sources()[0].get(),
+            seg_promote,
+            N * num_iters,
+            MAX_TIMESTAMP,
+            &offsets);
+        BitsetTypeView view(col_vec->GetRawData(), col_vec->size());
+        EXPECT_EQ(view.size(), N * num_iters / 2);
+        for (int i = 0; i < N * num_iters; ++i) {
+            auto ans = final[i];
+            auto valid = valid_data[i];
+            auto ref = ref_func(valid);
             ASSERT_EQ(ans, ref);
         }
     }
@@ -815,8 +954,11 @@ TEST(Expr, PraseArrayContainsExpr) {
         auto schema = std::make_shared<Schema>();
         schema->AddDebugField(
             "fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
-        schema->AddField(
-            FieldName("array"), FieldId(101), DataType::ARRAY, DataType::INT64);
+        schema->AddField(FieldName("array"),
+                         FieldId(101),
+                         DataType::ARRAY,
+                         DataType::INT64,
+                         false);
         auto plan =
             CreateSearchPlanByExpr(*schema, plan_str.data(), plan_str.size());
     }
@@ -888,7 +1030,6 @@ TEST(Expr, TestArrayContains) {
     }
 
     auto seg_promote = dynamic_cast<SegmentGrowingImpl*>(seg.get());
-    query::ExecPlanNodeVisitor visitor(*seg_promote, MAX_TIMESTAMP);
 
     std::vector<ArrayTestcase<bool>> bool_testcases{{{true, true}, {}},
                                                     {{false, false}, {}}};
@@ -918,13 +1059,27 @@ TEST(Expr, TestArrayContains) {
         BitsetType final;
         auto plan =
             std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID, expr);
-        visitor.ExecuteExprNode(plan, seg_promote, N * num_iters, final);
+        final =
+            ExecuteQueryExpr(plan, seg_promote, N * num_iters, MAX_TIMESTAMP);
         std::cout << "cost"
                   << std::chrono::duration_cast<std::chrono::microseconds>(
                          std::chrono::steady_clock::now() - start)
                          .count()
                   << std::endl;
         EXPECT_EQ(final.size(), N * num_iters);
+
+        // specify some offsets and do scalar filtering on these offsets
+        milvus::exec::OffsetVector offsets;
+        offsets.reserve(N * num_iters / 2);
+        for (auto i = 0; i < N * num_iters; ++i) {
+            if (i % 2 == 0) {
+                offsets.emplace_back(i);
+            }
+        }
+        auto col_vec = milvus::test::gen_filter_res(
+            plan.get(), seg_promote, N * num_iters, MAX_TIMESTAMP, &offsets);
+        BitsetTypeView view(col_vec->GetRawData(), col_vec->size());
+        EXPECT_EQ(view.size(), N * num_iters / 2);
 
         for (int i = 0; i < N * num_iters; ++i) {
             auto ans = final[i];
@@ -934,6 +1089,9 @@ TEST(Expr, TestArrayContains) {
                 res.push_back(array.get_data<bool>(j));
             }
             ASSERT_EQ(ans, check(res)) << "@" << i;
+            if (i % 2 == 0) {
+                ASSERT_EQ(view[int(i / 2)], check(res)) << "@" << i;
+            }
         }
     }
 
@@ -972,13 +1130,27 @@ TEST(Expr, TestArrayContains) {
         BitsetType final;
         auto plan =
             std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID, expr);
-        visitor.ExecuteExprNode(plan, seg_promote, N * num_iters, final);
+        final =
+            ExecuteQueryExpr(plan, seg_promote, N * num_iters, MAX_TIMESTAMP);
         std::cout << "cost"
                   << std::chrono::duration_cast<std::chrono::microseconds>(
                          std::chrono::steady_clock::now() - start)
                          .count()
                   << std::endl;
         EXPECT_EQ(final.size(), N * num_iters);
+
+        // specify some offsets and do scalar filtering on these offsets
+        milvus::exec::OffsetVector offsets;
+        offsets.reserve(N * num_iters / 2);
+        for (auto i = 0; i < N * num_iters; ++i) {
+            if (i % 2 == 0) {
+                offsets.emplace_back(i);
+            }
+        }
+        auto col_vec = milvus::test::gen_filter_res(
+            plan.get(), seg_promote, N * num_iters, MAX_TIMESTAMP, &offsets);
+        BitsetTypeView view(col_vec->GetRawData(), col_vec->size());
+        EXPECT_EQ(view.size(), N * num_iters / 2);
 
         for (int i = 0; i < N * num_iters; ++i) {
             auto ans = final[i];
@@ -988,6 +1160,9 @@ TEST(Expr, TestArrayContains) {
                 res.push_back(array.get_data<double>(j));
             }
             ASSERT_EQ(ans, check(res));
+            if (i % 2 == 0) {
+                ASSERT_EQ(view[int(i / 2)], check(res));
+            }
         }
     }
 
@@ -1016,13 +1191,27 @@ TEST(Expr, TestArrayContains) {
         BitsetType final;
         auto plan =
             std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID, expr);
-        visitor.ExecuteExprNode(plan, seg_promote, N * num_iters, final);
+        final =
+            ExecuteQueryExpr(plan, seg_promote, N * num_iters, MAX_TIMESTAMP);
         std::cout << "cost"
                   << std::chrono::duration_cast<std::chrono::microseconds>(
                          std::chrono::steady_clock::now() - start)
                          .count()
                   << std::endl;
         EXPECT_EQ(final.size(), N * num_iters);
+
+        // specify some offsets and do scalar filtering on these offsets
+        milvus::exec::OffsetVector offsets;
+        offsets.reserve(N * num_iters / 2);
+        for (auto i = 0; i < N * num_iters; ++i) {
+            if (i % 2 == 0) {
+                offsets.emplace_back(i);
+            }
+        }
+        auto col_vec = milvus::test::gen_filter_res(
+            plan.get(), seg_promote, N * num_iters, MAX_TIMESTAMP, &offsets);
+        BitsetTypeView view(col_vec->GetRawData(), col_vec->size());
+        EXPECT_EQ(view.size(), N * num_iters / 2);
 
         for (int i = 0; i < N * num_iters; ++i) {
             auto ans = final[i];
@@ -1032,6 +1221,9 @@ TEST(Expr, TestArrayContains) {
                 res.push_back(array.get_data<float>(j));
             }
             ASSERT_EQ(ans, check(res));
+            if (i % 2 == 0) {
+                ASSERT_EQ(view[int(i / 2)], check(res));
+            }
         }
     }
 
@@ -1070,13 +1262,27 @@ TEST(Expr, TestArrayContains) {
         BitsetType final;
         auto plan =
             std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID, expr);
-        visitor.ExecuteExprNode(plan, seg_promote, N * num_iters, final);
+        final =
+            ExecuteQueryExpr(plan, seg_promote, N * num_iters, MAX_TIMESTAMP);
         std::cout << "cost"
                   << std::chrono::duration_cast<std::chrono::microseconds>(
                          std::chrono::steady_clock::now() - start)
                          .count()
                   << std::endl;
         EXPECT_EQ(final.size(), N * num_iters);
+
+        // specify some offsets and do scalar filtering on these offsets
+        milvus::exec::OffsetVector offsets;
+        offsets.reserve(N * num_iters / 2);
+        for (auto i = 0; i < N * num_iters; ++i) {
+            if (i % 2 == 0) {
+                offsets.emplace_back(i);
+            }
+        }
+        auto col_vec = milvus::test::gen_filter_res(
+            plan.get(), seg_promote, N * num_iters, MAX_TIMESTAMP, &offsets);
+        BitsetTypeView view(col_vec->GetRawData(), col_vec->size());
+        EXPECT_EQ(view.size(), N * num_iters / 2);
 
         for (int i = 0; i < N * num_iters; ++i) {
             auto ans = final[i];
@@ -1086,6 +1292,9 @@ TEST(Expr, TestArrayContains) {
                 res.push_back(array.get_data<int64_t>(j));
             }
             ASSERT_EQ(ans, check(res));
+            if (i % 2 == 0) {
+                ASSERT_EQ(view[int(i / 2)], check(res));
+            }
         }
     }
 
@@ -1115,13 +1324,27 @@ TEST(Expr, TestArrayContains) {
         BitsetType final;
         auto plan =
             std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID, expr);
-        visitor.ExecuteExprNode(plan, seg_promote, N * num_iters, final);
+        final =
+            ExecuteQueryExpr(plan, seg_promote, N * num_iters, MAX_TIMESTAMP);
         std::cout << "cost"
                   << std::chrono::duration_cast<std::chrono::microseconds>(
                          std::chrono::steady_clock::now() - start)
                          .count()
                   << std::endl;
         EXPECT_EQ(final.size(), N * num_iters);
+
+        // specify some offsets and do scalar filtering on these offsets
+        milvus::exec::OffsetVector offsets;
+        offsets.reserve(N * num_iters / 2);
+        for (auto i = 0; i < N * num_iters; ++i) {
+            if (i % 2 == 0) {
+                offsets.emplace_back(i);
+            }
+        }
+        auto col_vec = milvus::test::gen_filter_res(
+            plan.get(), seg_promote, N * num_iters, MAX_TIMESTAMP, &offsets);
+        BitsetTypeView view(col_vec->GetRawData(), col_vec->size());
+        EXPECT_EQ(view.size(), N * num_iters / 2);
 
         for (int i = 0; i < N * num_iters; ++i) {
             auto ans = final[i];
@@ -1131,6 +1354,9 @@ TEST(Expr, TestArrayContains) {
                 res.push_back(array.get_data<int64_t>(j));
             }
             ASSERT_EQ(ans, check(res));
+            if (i % 2 == 0) {
+                ASSERT_EQ(view[int(i / 2)], check(res));
+            }
         }
     }
 
@@ -1167,13 +1393,27 @@ TEST(Expr, TestArrayContains) {
         BitsetType final;
         auto plan =
             std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID, expr);
-        visitor.ExecuteExprNode(plan, seg_promote, N * num_iters, final);
+        final =
+            ExecuteQueryExpr(plan, seg_promote, N * num_iters, MAX_TIMESTAMP);
         std::cout << "cost"
                   << std::chrono::duration_cast<std::chrono::microseconds>(
                          std::chrono::steady_clock::now() - start)
                          .count()
                   << std::endl;
         EXPECT_EQ(final.size(), N * num_iters);
+
+        // specify some offsets and do scalar filtering on these offsets
+        milvus::exec::OffsetVector offsets;
+        offsets.reserve(N * num_iters / 2);
+        for (auto i = 0; i < N * num_iters; ++i) {
+            if (i % 2 == 0) {
+                offsets.emplace_back(i);
+            }
+        }
+        auto col_vec = milvus::test::gen_filter_res(
+            plan.get(), seg_promote, N * num_iters, MAX_TIMESTAMP, &offsets);
+        BitsetTypeView view(col_vec->GetRawData(), col_vec->size());
+        EXPECT_EQ(view.size(), N * num_iters / 2);
 
         for (int i = 0; i < N * num_iters; ++i) {
             auto ans = final[i];
@@ -1183,6 +1423,76 @@ TEST(Expr, TestArrayContains) {
                 res.push_back(array.get_data<std::string_view>(j));
             }
             ASSERT_EQ(ans, check(res));
+            if (i % 2 == 0) {
+                ASSERT_EQ(view[int(i / 2)], check(res));
+            }
+        }
+    }
+}
+
+TEST(Expr, TestArrayContainsEmptyValues) {
+    auto schema = std::make_shared<Schema>();
+    auto int_array_fid =
+        schema->AddDebugField("int_array", DataType::ARRAY, DataType::INT8);
+    auto long_array_fid =
+        schema->AddDebugField("long_array", DataType::ARRAY, DataType::INT64);
+    auto bool_array_fid =
+        schema->AddDebugField("bool_array", DataType::ARRAY, DataType::BOOL);
+    auto float_array_fid =
+        schema->AddDebugField("float_array", DataType::ARRAY, DataType::FLOAT);
+    auto double_array_fid = schema->AddDebugField(
+        "double_array", DataType::ARRAY, DataType::DOUBLE);
+    auto string_array_fid = schema->AddDebugField(
+        "string_array", DataType::ARRAY, DataType::VARCHAR);
+    schema->set_primary_field_id(schema->AddDebugField("id", DataType::INT64));
+    std::vector<FieldId> fields = {
+        int_array_fid,
+        long_array_fid,
+        bool_array_fid,
+        float_array_fid,
+        double_array_fid,
+        string_array_fid,
+    };
+
+    auto dummy_seg = CreateGrowingSegment(schema, empty_index_meta);
+
+    int N = 1000;
+    std::vector<int> age_col;
+    int num_iters = 100;
+    for (int iter = 0; iter < num_iters; ++iter) {
+        auto raw_data = DataGen(schema, N, iter);
+        dummy_seg->PreInsert(N);
+        dummy_seg->Insert(iter * N,
+                          N,
+                          raw_data.row_ids_.data(),
+                          raw_data.timestamps_.data(),
+                          raw_data.raw_);
+    }
+
+    auto seg_promote = dynamic_cast<SegmentGrowingImpl*>(dummy_seg.get());
+    std::vector<proto::plan::GenericValue> empty_values;
+
+    for (auto field_id : fields) {
+        auto start = std::chrono::steady_clock::now();
+        auto expr = std::make_shared<milvus::expr::JsonContainsExpr>(
+            expr::ColumnInfo(field_id, DataType::ARRAY),
+            proto::plan::JSONContainsExpr_JSONOp_ContainsAny,
+            true,
+            empty_values);
+
+        BitsetType final;
+        auto plan =
+            std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID, expr);
+        final =
+            ExecuteQueryExpr(plan, seg_promote, N * num_iters, MAX_TIMESTAMP);
+        std::cout << "cost"
+                  << std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count()
+                  << std::endl;
+        EXPECT_EQ(final.size(), N * num_iters);
+        for (int i = 0; i < N * num_iters; ++i) {
+            ASSERT_EQ(final[i], true);
         }
     }
 }
@@ -1234,7 +1544,6 @@ TEST(Expr, TestArrayBinaryArith) {
     }
 
     auto seg_promote = dynamic_cast<SegmentGrowingImpl*>(seg.get());
-    query::ExecPlanNodeVisitor visitor(*seg_promote, MAX_TIMESTAMP);
 
     std::vector<std::tuple<std::string,
                            std::string,
@@ -2115,17 +2424,38 @@ TEST(Expr, TestArrayBinaryArith) {
         auto plan =
             CreateSearchPlanByExpr(*schema, plan_str.data(), plan_str.size());
         BitsetType final;
-        visitor.ExecuteExprNode(plan->plan_node_->filter_plannode_.value(),
-                                seg_promote,
-                                N * num_iters,
-                                final);
+        final = ExecuteQueryExpr(
+            plan->plan_node_->plannodes_->sources()[0]->sources()[0],
+            seg_promote,
+            N * num_iters,
+            MAX_TIMESTAMP);
         EXPECT_EQ(final.size(), N * num_iters);
+
+        // specify some offsets and do scalar filtering on these offsets
+        milvus::exec::OffsetVector offsets;
+        offsets.reserve(N * num_iters / 2);
+        for (auto i = 0; i < N * num_iters; ++i) {
+            if (i % 2 == 0) {
+                offsets.emplace_back(i);
+            }
+        }
+        auto col_vec = milvus::test::gen_filter_res(
+            plan->plan_node_->plannodes_->sources()[0]->sources()[0].get(),
+            seg_promote,
+            N * num_iters,
+            MAX_TIMESTAMP,
+            &offsets);
+        BitsetTypeView view(col_vec->GetRawData(), col_vec->size());
+        EXPECT_EQ(view.size(), N * num_iters / 2);
 
         for (int i = 0; i < N * num_iters; ++i) {
             auto ans = final[i];
             auto array = milvus::Array(array_cols[array_type][i]);
             auto ref = ref_func(array);
             ASSERT_EQ(ans, ref);
+            if (i % 2 == 0) {
+                ASSERT_EQ(view[int(i / 2)], ref);
+            }
         }
     }
 }
@@ -2165,7 +2495,6 @@ TEST(Expr, TestArrayStringMatch) {
     }
 
     auto seg_promote = dynamic_cast<SegmentGrowingImpl*>(seg.get());
-    query::ExecPlanNodeVisitor visitor(*seg_promote, MAX_TIMESTAMP);
 
     std::vector<UnaryRangeTestcase<std::string>> prefix_testcases{
         {OpType::PrefixMatch,
@@ -2199,11 +2528,13 @@ TEST(Expr, TestArrayStringMatch) {
             milvus::expr::ColumnInfo(
                 string_array_fid, DataType::ARRAY, testcase.nested_path),
             testcase.op_type,
-            value);
+            value,
+            std::vector<proto::plan::GenericValue>{});
         BitsetType final;
         auto plan =
             std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID, expr);
-        visitor.ExecuteExprNode(plan, seg_promote, N * num_iters, final);
+        final =
+            ExecuteQueryExpr(plan, seg_promote, N * num_iters, MAX_TIMESTAMP);
         std::cout << "cost"
                   << std::chrono::duration_cast<std::chrono::microseconds>(
                          std::chrono::steady_clock::now() - start)
@@ -2211,10 +2542,26 @@ TEST(Expr, TestArrayStringMatch) {
                   << std::endl;
         EXPECT_EQ(final.size(), N * num_iters);
 
+        // specify some offsets and do scalar filtering on these offsets
+        milvus::exec::OffsetVector offsets;
+        offsets.reserve(N * num_iters / 2);
+        for (auto i = 0; i < N * num_iters; ++i) {
+            if (i % 2 == 0) {
+                offsets.emplace_back(i);
+            }
+        }
+        auto col_vec = milvus::test::gen_filter_res(
+            plan.get(), seg_promote, N * num_iters, MAX_TIMESTAMP, &offsets);
+        BitsetTypeView view(col_vec->GetRawData(), col_vec->size());
+        EXPECT_EQ(view.size(), N * num_iters / 2);
+
         for (int i = 0; i < N * num_iters; ++i) {
             auto ans = final[i];
             auto array = milvus::Array(array_cols["string"][i]);
             ASSERT_EQ(ans, testcase.check_func(array));
+            if (i % 2 == 0) {
+                ASSERT_EQ(view[int(i / 2)], testcase.check_func(array));
+            }
         }
     }
 }
@@ -2265,7 +2612,6 @@ TEST(Expr, TestArrayInTerm) {
     }
 
     auto seg_promote = dynamic_cast<SegmentGrowingImpl*>(seg.get());
-    query::ExecPlanNodeVisitor visitor(*seg_promote, MAX_TIMESTAMP);
 
     std::vector<std::tuple<std::string,
                            std::string,
@@ -2408,16 +2754,37 @@ TEST(Expr, TestArrayInTerm) {
         auto plan =
             CreateSearchPlanByExpr(*schema, plan_str.data(), plan_str.size());
         BitsetType final;
-        visitor.ExecuteExprNode(plan->plan_node_->filter_plannode_.value(),
-                                seg_promote,
-                                N * num_iters,
-                                final);
+        final = ExecuteQueryExpr(
+            plan->plan_node_->plannodes_->sources()[0]->sources()[0],
+            seg_promote,
+            N * num_iters,
+            MAX_TIMESTAMP);
         EXPECT_EQ(final.size(), N * num_iters);
+
+        // specify some offsets and do scalar filtering on these offsets
+        milvus::exec::OffsetVector offsets;
+        offsets.reserve(N * num_iters / 2);
+        for (auto i = 0; i < N * num_iters; ++i) {
+            if (i % 2 == 0) {
+                offsets.emplace_back(i);
+            }
+        }
+        auto col_vec = milvus::test::gen_filter_res(
+            plan->plan_node_->plannodes_->sources()[0]->sources()[0].get(),
+            seg_promote,
+            N * num_iters,
+            MAX_TIMESTAMP,
+            &offsets);
+        BitsetTypeView view(col_vec->GetRawData(), col_vec->size());
+        EXPECT_EQ(view.size(), N * num_iters / 2);
 
         for (int i = 0; i < N * num_iters; ++i) {
             auto ans = final[i];
             auto array = milvus::Array(array_cols[array_type][i]);
             ASSERT_EQ(ans, ref_func(array));
+            if (i % 2 == 0) {
+                ASSERT_EQ(view[int(i / 2)], ref_func(array));
+            }
         }
     }
 }
@@ -2448,7 +2815,6 @@ TEST(Expr, TestTermInArray) {
     }
 
     auto seg_promote = dynamic_cast<SegmentGrowingImpl*>(seg.get());
-    query::ExecPlanNodeVisitor visitor(*seg_promote, MAX_TIMESTAMP);
 
     struct TermTestCases {
         std::vector<int64_t> values;
@@ -2496,7 +2862,8 @@ TEST(Expr, TestTermInArray) {
         BitsetType final;
         auto plan =
             std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID, expr);
-        visitor.ExecuteExprNode(plan, seg_promote, N * num_iters, final);
+        final =
+            ExecuteQueryExpr(plan, seg_promote, N * num_iters, MAX_TIMESTAMP);
         std::cout << "cost"
                   << std::chrono::duration_cast<std::chrono::microseconds>(
                          std::chrono::steady_clock::now() - start)
@@ -2504,10 +2871,26 @@ TEST(Expr, TestTermInArray) {
                   << std::endl;
         EXPECT_EQ(final.size(), N * num_iters);
 
+        // specify some offsets and do scalar filtering on these offsets
+        milvus::exec::OffsetVector offsets;
+        offsets.reserve(N * num_iters / 2);
+        for (auto i = 0; i < N * num_iters; ++i) {
+            if (i % 2 == 0) {
+                offsets.emplace_back(i);
+            }
+        }
+        auto col_vec = milvus::test::gen_filter_res(
+            plan.get(), seg_promote, N * num_iters, MAX_TIMESTAMP, &offsets);
+        BitsetTypeView view(col_vec->GetRawData(), col_vec->size());
+        EXPECT_EQ(view.size(), N * num_iters / 2);
+
         for (int i = 0; i < N * num_iters; ++i) {
             auto ans = final[i];
             auto array = milvus::Array(array_cols["long"][i]);
             ASSERT_EQ(ans, testcase.check_func(array));
+            if (i % 2 == 0) {
+                ASSERT_EQ(view[int(i / 2)], testcase.check_func(array));
+            }
         }
     }
 }

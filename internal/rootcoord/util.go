@@ -17,17 +17,28 @@
 package rootcoord
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
+	"math"
 	"strconv"
+	"time"
 
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/mq/msgstream"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/json"
+	"github.com/milvus-io/milvus/internal/types"
+	"github.com/milvus-io/milvus/internal/util/proxyutil"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
+	"github.com/milvus-io/milvus/pkg/v2/util/parameterutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/tsoutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 // EqualKeyPairArray check whether 2 KeyValuePairs are equal
@@ -40,6 +51,23 @@ func EqualKeyPairArray(p1 []*commonpb.KeyValuePair, p2 []*commonpb.KeyValuePair)
 		m1[p.Key] = p.Value
 	}
 	for _, p := range p2 {
+		val, ok := m1[p.Key]
+		if !ok {
+			return false
+		}
+		if val != p.Value {
+			return false
+		}
+	}
+	return ContainsKeyPairArray(p1, p2)
+}
+
+func ContainsKeyPairArray(src []*commonpb.KeyValuePair, target []*commonpb.KeyValuePair) bool {
+	m1 := make(map[string]string)
+	for _, p := range target {
+		m1[p.Key] = p.Value
+	}
+	for _, p := range src {
 		val, ok := m1[p.Key]
 		if !ok {
 			return false
@@ -203,4 +231,257 @@ func getRateLimitConfig(properties map[string]string, configKey string, configVa
 	}
 
 	return configValue
+}
+
+func getQueryCoordMetrics(ctx context.Context, mixCoord types.MixCoord) (*metricsinfo.QueryCoordTopology, error) {
+	req, err := metricsinfo.ConstructRequestByMetricType(metricsinfo.SystemInfoMetrics)
+	if err != nil {
+		return nil, err
+	}
+
+	rsp, err := mixCoord.GetQcMetrics(ctx, req)
+	if err = merr.CheckRPCCall(rsp, err); err != nil {
+		return nil, err
+	}
+	queryCoordTopology := &metricsinfo.QueryCoordTopology{}
+	if err := metricsinfo.UnmarshalTopology(rsp.GetResponse(), queryCoordTopology); err != nil {
+		return nil, err
+	}
+
+	return queryCoordTopology, nil
+}
+
+func getDataCoordMetrics(ctx context.Context, mixCoord types.MixCoord) (*metricsinfo.DataCoordTopology, error) {
+	req, err := metricsinfo.ConstructRequestByMetricType(metricsinfo.SystemInfoMetrics)
+	if err != nil {
+		return nil, err
+	}
+
+	rsp, err := mixCoord.GetDcMetrics(ctx, req)
+	if err = merr.CheckRPCCall(rsp, err); err != nil {
+		return nil, err
+	}
+	dataCoordTopology := &metricsinfo.DataCoordTopology{}
+	if err = metricsinfo.UnmarshalTopology(rsp.GetResponse(), dataCoordTopology); err != nil {
+		return nil, err
+	}
+
+	return dataCoordTopology, nil
+}
+
+func getProxyMetrics(ctx context.Context, proxies proxyutil.ProxyClientManagerInterface) ([]*metricsinfo.ProxyInfos, error) {
+	resp, err := proxies.GetProxyMetrics(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	ret := make([]*metricsinfo.ProxyInfos, 0, len(resp))
+	for _, rsp := range resp {
+		proxyMetric := &metricsinfo.ProxyInfos{}
+		err = metricsinfo.UnmarshalComponentInfos(rsp.GetResponse(), proxyMetric)
+		if err != nil {
+			return nil, err
+		}
+		ret = append(ret, proxyMetric)
+	}
+
+	return ret, nil
+}
+
+func CheckTimeTickLagExceeded(ctx context.Context, mixcoord types.MixCoord, maxDelay time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, GetMetricsTimeout)
+	defer cancel()
+
+	now := time.Now()
+	group := &errgroup.Group{}
+	queryNodeTTDelay := typeutil.NewConcurrentMap[string, time.Duration]()
+	dataNodeTTDelay := typeutil.NewConcurrentMap[string, time.Duration]()
+
+	group.Go(func() error {
+		queryCoordTopology, err := getQueryCoordMetrics(ctx, mixcoord)
+		if err != nil {
+			return err
+		}
+
+		for _, queryNodeMetric := range queryCoordTopology.Cluster.ConnectedNodes {
+			qm := queryNodeMetric.QuotaMetrics
+			if qm != nil {
+				if qm.Fgm.NumFlowGraph > 0 && qm.Fgm.MinFlowGraphChannel != "" {
+					minTt, _ := tsoutil.ParseTS(qm.Fgm.MinFlowGraphTt)
+					delay := now.Sub(minTt)
+
+					if delay.Milliseconds() >= maxDelay.Milliseconds() {
+						queryNodeTTDelay.Insert(qm.Fgm.MinFlowGraphChannel, delay)
+					}
+				}
+			}
+		}
+		return nil
+	})
+
+	// get Data cluster metrics
+	group.Go(func() error {
+		dataCoordTopology, err := getDataCoordMetrics(ctx, mixcoord)
+		if err != nil {
+			return err
+		}
+
+		for _, dataNodeMetric := range dataCoordTopology.Cluster.ConnectedDataNodes {
+			dm := dataNodeMetric.QuotaMetrics
+			if dm != nil {
+				if dm.Fgm.NumFlowGraph > 0 && dm.Fgm.MinFlowGraphChannel != "" {
+					minTt, _ := tsoutil.ParseTS(dm.Fgm.MinFlowGraphTt)
+					delay := now.Sub(minTt)
+
+					if delay.Milliseconds() >= maxDelay.Milliseconds() {
+						dataNodeTTDelay.Insert(dm.Fgm.MinFlowGraphChannel, delay)
+					}
+				}
+			}
+		}
+		return nil
+	})
+
+	err := group.Wait()
+	if err != nil {
+		return err
+	}
+
+	var maxLagChannel string
+	var maxLag time.Duration
+	findMaxLagChannel := func(params ...*typeutil.ConcurrentMap[string, time.Duration]) {
+		for _, param := range params {
+			param.Range(func(k string, v time.Duration) bool {
+				if v > maxLag {
+					maxLag = v
+					maxLagChannel = k
+				}
+				return true
+			})
+		}
+	}
+
+	var errStr string
+	findMaxLagChannel(queryNodeTTDelay)
+	if maxLag > 0 && len(maxLagChannel) != 0 {
+		errStr = fmt.Sprintf("query max timetick lag:%s on channel:%s", maxLag, maxLagChannel)
+	}
+	maxLagChannel = ""
+	maxLag = 0
+	findMaxLagChannel(dataNodeTTDelay)
+	if maxLag > 0 && len(maxLagChannel) != 0 {
+		if errStr != "" {
+			errStr += ", "
+		}
+		errStr += fmt.Sprintf("data max timetick lag:%s on channel:%s", maxLag, maxLagChannel)
+	}
+	if errStr != "" {
+		return fmt.Errorf("max timetick lag execced threhold: %s", errStr)
+	}
+
+	return nil
+}
+
+func checkFieldSchema(fieldSchemas []*schemapb.FieldSchema) error {
+	for _, fieldSchema := range fieldSchemas {
+		if fieldSchema.GetNullable() && typeutil.IsVectorType(fieldSchema.GetDataType()) {
+			msg := fmt.Sprintf("vector type not support null, type:%s, name:%s", fieldSchema.GetDataType().String(), fieldSchema.GetName())
+			return merr.WrapErrParameterInvalidMsg(msg)
+		}
+		if fieldSchema.GetNullable() && fieldSchema.IsPrimaryKey {
+			msg := fmt.Sprintf("primary field not support null, type:%s, name:%s", fieldSchema.GetDataType().String(), fieldSchema.GetName())
+			return merr.WrapErrParameterInvalidMsg(msg)
+		}
+		if fieldSchema.GetDefaultValue() != nil {
+			if fieldSchema.IsPrimaryKey {
+				msg := fmt.Sprintf("primary field not support default_value, type:%s, name:%s", fieldSchema.GetDataType().String(), fieldSchema.GetName())
+				return merr.WrapErrParameterInvalidMsg(msg)
+			}
+			dtype := fieldSchema.GetDataType()
+			if dtype == schemapb.DataType_Array || dtype == schemapb.DataType_JSON || typeutil.IsVectorType(dtype) {
+				msg := fmt.Sprintf("type not support default_value, type:%s, name:%s", fieldSchema.GetDataType().String(), fieldSchema.GetName())
+				return merr.WrapErrParameterInvalidMsg(msg)
+			}
+			errTypeMismatch := func(fieldName, fieldType, defaultValueType string) error {
+				msg := fmt.Sprintf("type (%s) of field (%s) is not equal to the type(%s) of default_value", fieldType, fieldName, defaultValueType)
+				return merr.WrapErrParameterInvalidMsg(msg)
+			}
+			switch fieldSchema.GetDefaultValue().Data.(type) {
+			case *schemapb.ValueField_BoolData:
+				if dtype != schemapb.DataType_Bool {
+					return errTypeMismatch(fieldSchema.GetName(), dtype.String(), "DataType_Bool")
+				}
+			case *schemapb.ValueField_IntData:
+				if dtype != schemapb.DataType_Int32 && dtype != schemapb.DataType_Int16 && dtype != schemapb.DataType_Int8 {
+					return errTypeMismatch(fieldSchema.GetName(), dtype.String(), "DataType_Int")
+				}
+				defaultValue := fieldSchema.GetDefaultValue().GetIntData()
+				if dtype == schemapb.DataType_Int16 {
+					if defaultValue > math.MaxInt16 || defaultValue < math.MinInt16 {
+						return merr.WrapErrParameterInvalidRange(math.MinInt16, math.MaxInt16, defaultValue, "default value out of range")
+					}
+				}
+				if dtype == schemapb.DataType_Int8 {
+					if defaultValue > math.MaxInt8 || defaultValue < math.MinInt8 {
+						return merr.WrapErrParameterInvalidRange(math.MinInt8, math.MaxInt8, defaultValue, "default value out of range")
+					}
+				}
+			case *schemapb.ValueField_LongData:
+				if dtype != schemapb.DataType_Int64 {
+					return errTypeMismatch(fieldSchema.GetName(), dtype.String(), "DataType_Int64")
+				}
+			case *schemapb.ValueField_FloatData:
+				if dtype != schemapb.DataType_Float {
+					return errTypeMismatch(fieldSchema.GetName(), dtype.String(), "DataType_Float")
+				}
+			case *schemapb.ValueField_DoubleData:
+				if dtype != schemapb.DataType_Double {
+					return errTypeMismatch(fieldSchema.GetName(), dtype.String(), "DataType_Double")
+				}
+			case *schemapb.ValueField_StringData:
+				if dtype != schemapb.DataType_VarChar {
+					return errTypeMismatch(fieldSchema.GetName(), dtype.String(), "DataType_VarChar")
+				}
+				maxLength, err := parameterutil.GetMaxLength(fieldSchema)
+				if err != nil {
+					return err
+				}
+				defaultValueLength := len(fieldSchema.GetDefaultValue().GetStringData())
+				if int64(defaultValueLength) > maxLength {
+					msg := fmt.Sprintf("the length (%d) of string exceeds max length (%d)", defaultValueLength, maxLength)
+					return merr.WrapErrParameterInvalid("valid length string", "string length exceeds max length", msg)
+				}
+			default:
+				panic("default value unsupport data type")
+			}
+		}
+		if err := checkDupKvPairs(fieldSchema.GetTypeParams(), "type"); err != nil {
+			return err
+		}
+		if err := checkDupKvPairs(fieldSchema.GetIndexParams(), "index"); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func checkDupKvPairs(params []*commonpb.KeyValuePair, paramType string) error {
+	set := typeutil.NewSet[string]()
+	for _, kv := range params {
+		if set.Contain(kv.GetKey()) {
+			return merr.WrapErrParameterInvalidMsg("duplicated %s param key \"%s\"", paramType, kv.GetKey())
+		}
+		set.Insert(kv.GetKey())
+	}
+	return nil
+}
+
+func validateFieldDataType(fieldSchemas []*schemapb.FieldSchema) error {
+	for _, field := range fieldSchemas {
+		if _, ok := schemapb.DataType_name[int32(field.GetDataType())]; !ok || field.GetDataType() == schemapb.DataType_None {
+			return merr.WrapErrParameterInvalid("valid field", fmt.Sprintf("field data type: %s is not supported", field.GetDataType()))
+		}
+	}
+	return nil
 }

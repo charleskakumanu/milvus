@@ -1,30 +1,46 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package httpserver
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"strconv"
 
 	"github.com/cockroachdb/errors"
 	"github.com/gin-gonic/gin"
 	"github.com/gin-gonic/gin/binding"
-	"github.com/golang/protobuf/proto"
 	"github.com/tidwall/gjson"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/json"
 	"github.com/milvus-io/milvus/internal/proxy"
 	"github.com/milvus-io/milvus/internal/types"
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/metric"
-	"github.com/milvus-io/milvus/pkg/util/requestutil"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/metric"
+	"github.com/milvus-io/milvus/pkg/v2/util/requestutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 var RestRequestInterceptorErr = errors.New("interceptor error placeholder")
@@ -517,6 +533,13 @@ func (h *HandlersV1) query(c *gin.Context) {
 	username, _ := c.Get(ContextUsername)
 	ctx := proxy.NewContextWithMetadata(c, username.(string), req.DbName)
 	response, err := h.executeRestRequestInterceptor(ctx, c, req, func(reqCtx context.Context, req any) (any, error) {
+		if _, err := CheckLimiter(ctx, req, h.proxy); err != nil {
+			c.AbortWithStatusJSON(http.StatusOK, gin.H{
+				HTTPReturnCode:    merr.Code(err),
+				HTTPReturnMessage: err.Error() + ", error: " + err.Error(),
+			})
+			return nil, err
+		}
 		return h.proxy.Query(reqCtx, req.(*milvuspb.QueryRequest))
 	})
 	if err == RestRequestInterceptorErr {
@@ -538,7 +561,7 @@ func (h *HandlersV1) query(c *gin.Context) {
 				HTTPReturnMessage: merr.ErrInvalidSearchResult.Error() + ", error: " + err.Error(),
 			})
 		} else {
-			HTTPReturn(c, http.StatusOK, gin.H{HTTPReturnCode: http.StatusOK, HTTPReturnData: outputData})
+			HTTPReturnStream(c, http.StatusOK, gin.H{HTTPReturnCode: http.StatusOK, HTTPReturnData: outputData})
 		}
 	}
 }
@@ -588,6 +611,13 @@ func (h *HandlersV1) get(c *gin.Context) {
 			return nil, RestRequestInterceptorErr
 		}
 		queryReq := req.(*milvuspb.QueryRequest)
+		if _, err := CheckLimiter(ctx, req, h.proxy); err != nil {
+			c.AbortWithStatusJSON(http.StatusOK, gin.H{
+				HTTPReturnCode:    merr.Code(err),
+				HTTPReturnMessage: err.Error() + ", error: " + err.Error(),
+			})
+			return nil, err
+		}
 		queryReq.Expr = filter
 		return h.proxy.Query(reqCtx, queryReq)
 	})
@@ -610,7 +640,7 @@ func (h *HandlersV1) get(c *gin.Context) {
 				HTTPReturnMessage: merr.ErrInvalidSearchResult.Error() + ", error: " + err.Error(),
 			})
 		} else {
-			HTTPReturn(c, http.StatusOK, gin.H{HTTPReturnCode: http.StatusOK, HTTPReturnData: outputData})
+			HTTPReturnStream(c, http.StatusOK, gin.H{HTTPReturnCode: http.StatusOK, HTTPReturnData: outputData})
 		}
 	}
 }
@@ -660,6 +690,13 @@ func (h *HandlersV1) delete(c *gin.Context) {
 				return nil, RestRequestInterceptorErr
 			}
 			deleteReq.Expr = filter
+		}
+		if _, err := CheckLimiter(ctx, req, h.proxy); err != nil {
+			c.AbortWithStatusJSON(http.StatusOK, gin.H{
+				HTTPReturnCode:    merr.Code(err),
+				HTTPReturnMessage: err.Error() + ", error: " + err.Error(),
+			})
+			return nil, err
 		}
 		return h.proxy.Delete(ctx, deleteReq)
 	})
@@ -718,7 +755,7 @@ func (h *HandlersV1) insert(c *gin.Context) {
 			return nil, RestRequestInterceptorErr
 		}
 		body, _ := c.Get(gin.BodyBytesKey)
-		err, httpReq.Data = checkAndSetData(string(body.([]byte)), collSchema)
+		err, httpReq.Data, _ = checkAndSetData(body.([]byte), collSchema)
 		if err != nil {
 			log.Warn("high level restful api, fail to deal with insert data", zap.Any("body", body), zap.Error(err))
 			HTTPAbortReturn(c, http.StatusOK, gin.H{
@@ -728,7 +765,7 @@ func (h *HandlersV1) insert(c *gin.Context) {
 			return nil, RestRequestInterceptorErr
 		}
 		insertReq := req.(*milvuspb.InsertRequest)
-		insertReq.FieldsData, err = anyToColumns(httpReq.Data, collSchema)
+		insertReq.FieldsData, err = anyToColumns(httpReq.Data, nil, collSchema, true)
 		if err != nil {
 			log.Warn("high level restful api, fail to deal with insert data", zap.Any("data", httpReq.Data), zap.Error(err))
 			HTTPAbortReturn(c, http.StatusOK, gin.H{
@@ -736,6 +773,13 @@ func (h *HandlersV1) insert(c *gin.Context) {
 				HTTPReturnMessage: merr.ErrInvalidInsertData.Error() + ", error: " + err.Error(),
 			})
 			return nil, RestRequestInterceptorErr
+		}
+		if _, err := CheckLimiter(ctx, req, h.proxy); err != nil {
+			c.AbortWithStatusJSON(http.StatusOK, gin.H{
+				HTTPReturnCode:    merr.Code(err),
+				HTTPReturnMessage: err.Error() + ", error: " + err.Error(),
+			})
+			return nil, err
 		}
 		return h.proxy.Insert(ctx, insertReq)
 	})
@@ -817,7 +861,7 @@ func (h *HandlersV1) upsert(c *gin.Context) {
 			}
 		}
 		body, _ := c.Get(gin.BodyBytesKey)
-		err, httpReq.Data = checkAndSetData(string(body.([]byte)), collSchema)
+		err, httpReq.Data, _ = checkAndSetData(body.([]byte), collSchema)
 		if err != nil {
 			log.Warn("high level restful api, fail to deal with upsert data", zap.Any("body", body), zap.Error(err))
 			HTTPAbortReturn(c, http.StatusOK, gin.H{
@@ -827,7 +871,7 @@ func (h *HandlersV1) upsert(c *gin.Context) {
 			return nil, RestRequestInterceptorErr
 		}
 		upsertReq := req.(*milvuspb.UpsertRequest)
-		upsertReq.FieldsData, err = anyToColumns(httpReq.Data, collSchema)
+		upsertReq.FieldsData, err = anyToColumns(httpReq.Data, nil, collSchema, false)
 		if err != nil {
 			log.Warn("high level restful api, fail to deal with upsert data", zap.Any("data", httpReq.Data), zap.Error(err))
 			HTTPAbortReturn(c, http.StatusOK, gin.H{
@@ -835,6 +879,13 @@ func (h *HandlersV1) upsert(c *gin.Context) {
 				HTTPReturnMessage: merr.ErrInvalidInsertData.Error() + ", error: " + err.Error(),
 			})
 			return nil, RestRequestInterceptorErr
+		}
+		if _, err := CheckLimiter(ctx, req, h.proxy); err != nil {
+			c.AbortWithStatusJSON(http.StatusOK, gin.H{
+				HTTPReturnCode:    merr.Code(err),
+				HTTPReturnMessage: err.Error() + ", error: " + err.Error(),
+			})
+			return nil, err
 		}
 		return h.proxy.Upsert(ctx, upsertReq)
 	})
@@ -932,6 +983,13 @@ func (h *HandlersV1) search(c *gin.Context) {
 	username, _ := c.Get(ContextUsername)
 	ctx := proxy.NewContextWithMetadata(c, username.(string), req.DbName)
 	response, err := h.executeRestRequestInterceptor(ctx, c, req, func(reqCtx context.Context, req any) (any, error) {
+		if _, err := CheckLimiter(ctx, req, h.proxy); err != nil {
+			c.AbortWithStatusJSON(http.StatusOK, gin.H{
+				HTTPReturnCode:    merr.Code(err),
+				HTTPReturnMessage: err.Error() + ", error: " + err.Error(),
+			})
+			return nil, err
+		}
 		return h.proxy.Search(ctx, req.(*milvuspb.SearchRequest))
 	})
 	if err == RestRequestInterceptorErr {
@@ -956,7 +1014,7 @@ func (h *HandlersV1) search(c *gin.Context) {
 					HTTPReturnMessage: merr.ErrInvalidSearchResult.Error() + ", error: " + err.Error(),
 				})
 			} else {
-				HTTPReturn(c, http.StatusOK, gin.H{HTTPReturnCode: http.StatusOK, HTTPReturnData: outputData})
+				HTTPReturnStream(c, http.StatusOK, gin.H{HTTPReturnCode: http.StatusOK, HTTPReturnData: outputData})
 			}
 		}
 	}

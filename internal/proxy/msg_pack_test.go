@@ -20,19 +20,19 @@ import (
 	"context"
 	"testing"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/allocator"
-	"github.com/milvus-io/milvus/pkg/mq/msgstream"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/testutils"
+	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/testutils"
 )
 
 func TestRepackInsertData(t *testing.T) {
@@ -45,8 +45,8 @@ func TestRepackInsertData(t *testing.T) {
 
 	ctx := context.Background()
 
-	rc := NewRootCoordMock()
-	defer rc.Close()
+	mix := NewMixCoordMock()
+	defer mix.Close()
 
 	cache := NewMockCache(t)
 	cache.On("GetPartitionID",
@@ -57,13 +57,13 @@ func TestRepackInsertData(t *testing.T) {
 	).Return(int64(1), nil)
 	globalMetaCache = cache
 
-	idAllocator, err := allocator.NewIDAllocator(ctx, rc, paramtable.GetNodeID())
+	idAllocator, err := allocator.NewIDAllocator(ctx, mix, paramtable.GetNodeID())
 	assert.NoError(t, err)
 	_ = idAllocator.Start()
 	defer idAllocator.Close()
 
 	t.Run("create collection", func(t *testing.T) {
-		resp, err := rc.CreateCollection(ctx, &milvuspb.CreateCollectionRequest{
+		resp, err := mix.CreateCollection(ctx, &milvuspb.CreateCollectionRequest{
 			Base:           nil,
 			DbName:         dbName,
 			CollectionName: collectionName,
@@ -71,7 +71,7 @@ func TestRepackInsertData(t *testing.T) {
 		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
 		assert.NoError(t, err)
 
-		resp, err = rc.CreatePartition(ctx, &milvuspb.CreatePartitionRequest{
+		resp, err = mix.CreatePartition(ctx, &milvuspb.CreatePartitionRequest{
 			Base: &commonpb.MsgBase{
 				MsgType:   commonpb.MsgType_CreatePartition,
 				MsgID:     0,
@@ -91,7 +91,7 @@ func TestRepackInsertData(t *testing.T) {
 		BaseMsg: msgstream.BaseMsg{
 			HashValues: hash,
 		},
-		InsertRequest: msgpb.InsertRequest{
+		InsertRequest: &msgpb.InsertRequest{
 			Base: &commonpb.MsgBase{
 				MsgType:  commonpb.MsgType_Insert,
 				MsgID:    0,
@@ -151,13 +151,12 @@ func TestRepackInsertDataWithPartitionKey(t *testing.T) {
 	ctx := context.Background()
 	dbName := GetCurDBNameFromContextOrDefault(ctx)
 
-	rc := NewRootCoordMock()
-	defer rc.Close()
+	mix := NewMixCoordMock()
 
-	err := InitMetaCache(ctx, rc, nil, nil)
+	err := InitMetaCache(ctx, mix, nil)
 	assert.NoError(t, err)
 
-	idAllocator, err := allocator.NewIDAllocator(ctx, rc, paramtable.GetNodeID())
+	idAllocator, err := allocator.NewIDAllocator(ctx, mix, paramtable.GetNodeID())
 	assert.NoError(t, err)
 	_ = idAllocator.Start()
 	defer idAllocator.Close()
@@ -178,7 +177,7 @@ func TestRepackInsertDataWithPartitionKey(t *testing.T) {
 		marshaledSchema, err := proto.Marshal(schema)
 		assert.NoError(t, err)
 
-		resp, err := rc.CreateCollection(ctx, &milvuspb.CreateCollectionRequest{
+		resp, err := mix.CreateCollection(ctx, &milvuspb.CreateCollectionRequest{
 			Base:           nil,
 			DbName:         dbName,
 			CollectionName: collectionName,
@@ -201,7 +200,7 @@ func TestRepackInsertDataWithPartitionKey(t *testing.T) {
 		BaseMsg: msgstream.BaseMsg{
 			HashValues: hash,
 		},
-		InsertRequest: msgpb.InsertRequest{
+		InsertRequest: &msgpb.InsertRequest{
 			Base: &commonpb.MsgBase{
 				MsgType:  commonpb.MsgType_Insert,
 				MsgID:    0,

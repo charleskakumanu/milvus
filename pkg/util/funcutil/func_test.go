@@ -21,6 +21,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"net"
 	"reflect"
 	"strconv"
 	"testing"
@@ -35,8 +36,8 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/pkg/util"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/util"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 func Test_CheckGrpcReady(t *testing.T) {
@@ -54,6 +55,35 @@ func Test_CheckGrpcReady(t *testing.T) {
 	cancel()
 }
 
+func Test_GetValidLocalIPNoValid(t *testing.T) {
+	addrs := make([]net.Addr, 0, 1)
+	addrs = append(addrs, &net.IPNet{IP: net.IPv4(127, 1, 1, 1), Mask: net.IPv4Mask(255, 255, 255, 255)})
+	ip := GetValidLocalIP(addrs)
+	assert.Equal(t, "", ip)
+}
+
+func Test_GetValidLocalIPIPv4(t *testing.T) {
+	addrs := make([]net.Addr, 0, 1)
+	addrs = append(addrs, &net.IPNet{IP: net.IPv4(100, 1, 1, 1), Mask: net.IPv4Mask(255, 255, 255, 255)})
+	ip := GetValidLocalIP(addrs)
+	assert.Equal(t, "100.1.1.1", ip)
+}
+
+func Test_GetValidLocalIPIPv6(t *testing.T) {
+	addrs := make([]net.Addr, 0, 1)
+	addrs = append(addrs, &net.IPNet{IP: net.IP{8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, Mask: net.IPMask{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}})
+	ip := GetValidLocalIP(addrs)
+	assert.Equal(t, "[800::]", ip)
+}
+
+func Test_GetValidLocalIPIPv4Priority(t *testing.T) {
+	addrs := make([]net.Addr, 0, 1)
+	addrs = append(addrs, &net.IPNet{IP: net.IP{8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, Mask: net.IPMask{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}})
+	addrs = append(addrs, &net.IPNet{IP: net.IPv4(100, 1, 1, 1), Mask: net.IPv4Mask(255, 255, 255, 255)})
+	ip := GetValidLocalIP(addrs)
+	assert.Equal(t, "100.1.1.1", ip)
+}
+
 func Test_GetLocalIP(t *testing.T) {
 	ip := GetLocalIP()
 	assert.NotNil(t, ip)
@@ -61,11 +91,33 @@ func Test_GetLocalIP(t *testing.T) {
 }
 
 func Test_GetIP(t *testing.T) {
-	ip := GetIP("")
-	assert.NotNil(t, ip)
-	assert.NotZero(t, len(ip))
-	ip = GetIP("127.0.0")
-	assert.Equal(t, ip, "127.0.0")
+	t.Run("empty_fallback_auto", func(t *testing.T) {
+		ip := GetIP("")
+		assert.NotNil(t, ip)
+		assert.NotZero(t, len(ip))
+	})
+
+	t.Run("valid_ip", func(t *testing.T) {
+		assert.NotPanics(t, func() {
+			ip := GetIP("8.8.8.8")
+			assert.Equal(t, "8.8.8.8", ip)
+		})
+	})
+
+	t.Run("invalid_ip", func(t *testing.T) {
+		assert.NotPanics(t, func() {
+			ip := GetIP("null")
+			assert.Equal(t, "null", ip)
+		}, "non ip format, could be hostname or service name")
+
+		assert.Panics(t, func() {
+			GetIP("0.0.0.0")
+		}, "input is unspecified ip address, panicking")
+
+		assert.Panics(t, func() {
+			GetIP("224.0.0.1")
+		}, "input is multicast ip address, panicking")
+	})
 }
 
 func Test_ParseIndexParamsMap(t *testing.T) {
@@ -142,6 +194,20 @@ func TestGetAttrByKeyFromRepeatedKV(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestGetCollectionIDFromVChannel(t *testing.T) {
+	vChannel1 := "06b84fe16780ed1-rootcoord-dm_3_449684528748778322v0"
+	collectionID := GetCollectionIDFromVChannel(vChannel1)
+	assert.Equal(t, int64(449684528748778322), collectionID)
+
+	invailedVChannel := "06b84fe16780ed1-rootcoord-dm_3_v0"
+	collectionID = GetCollectionIDFromVChannel(invailedVChannel)
+	assert.Equal(t, int64(-1), collectionID)
+
+	invailedVChannel = "06b84fe16780ed1-rootcoord-dm_3_-1v0"
+	collectionID = GetCollectionIDFromVChannel(invailedVChannel)
+	assert.Equal(t, int64(-1), collectionID)
+}
+
 func TestCheckCtxValid(t *testing.T) {
 	bgCtx := context.Background()
 	timeout := 20 * time.Millisecond
@@ -174,11 +240,17 @@ func TestCheckPortAvailable(t *testing.T) {
 }
 
 func Test_ToPhysicalChannel(t *testing.T) {
-	assert.Equal(t, "abc", ToPhysicalChannel("abc_"))
-	assert.Equal(t, "abc", ToPhysicalChannel("abc_123"))
-	assert.Equal(t, "abc", ToPhysicalChannel("abc_defgsg"))
-	assert.Equal(t, "abc__", ToPhysicalChannel("abc___defgsg"))
+	assert.Equal(t, "abc_", ToPhysicalChannel("abc_"))
+	assert.Equal(t, "abc_123", ToPhysicalChannel("abc_123"))
+	assert.Equal(t, "abc_defgsg", ToPhysicalChannel("abc_defgsg"))
+	assert.Equal(t, "abc_123", ToPhysicalChannel("abc_123_456v0"))
+	assert.Equal(t, "abc___defgsg", ToPhysicalChannel("abc___defgsg"))
 	assert.Equal(t, "abcdef", ToPhysicalChannel("abcdef"))
+	channel := "by-dev-rootcoord-dml_3_449883080965365748v0"
+	for i := 0; i < 10; i++ {
+		channel = ToPhysicalChannel(channel)
+		assert.Equal(t, "by-dev-rootcoord-dml_3", channel)
+	}
 }
 
 func Test_ConvertChannelName(t *testing.T) {
@@ -340,6 +412,34 @@ func TestGetNumRowsOfBinaryVectorField(t *testing.T) {
 	}
 }
 
+func TestGetNumRowsOfInt8VectorField(t *testing.T) {
+	cases := []struct {
+		iDatas   []byte
+		dim      int64
+		want     uint64
+		errIsNil bool
+	}{
+		{[]byte{}, -1, 0, false},   // dim <= 0
+		{[]byte{}, 0, 0, false},    // dim <= 0
+		{[]byte{1}, 128, 0, false}, // length % dim != 0
+		{[]byte{}, 128, 0, true},
+		{[]byte{1, 2}, 2, 1, true},
+		{[]byte{1, 2, 3, 4}, 2, 2, true},
+	}
+
+	for _, test := range cases {
+		got, err := GetNumRowsOfInt8VectorField(test.iDatas, test.dim)
+		if test.errIsNil {
+			assert.Equal(t, nil, err)
+			if got != test.want {
+				t.Errorf("GetNumRowsOfInt8VectorField(%v, %v) = %v, %v", test.iDatas, test.dim, test.want, nil)
+			}
+		} else {
+			assert.NotEqual(t, nil, err)
+		}
+	}
+}
+
 func Test_ReadBinary(t *testing.T) {
 	// TODO: test big endian.
 	// low byte in high address, high byte in low address.
@@ -494,8 +594,9 @@ func TestMapToJSON(t *testing.T) {
 	s := `{"M": 30,"efConstruction": 360,"index_type": "HNSW", "metric_type": "IP"}`
 	m, err := JSONToMap(s)
 	assert.NoError(t, err)
-	j := MapToJSON(m)
-	got, err := JSONToMap(string(j))
+	j, err := MapToJSON(m)
+	assert.NoError(t, err)
+	got, err := JSONToMap(j)
 	assert.NoError(t, err)
 	assert.True(t, reflect.DeepEqual(m, got))
 }
@@ -523,6 +624,7 @@ func (s *NumRowsWithSchemaSuite) SetupSuite() {
 			{FieldID: 112, Name: "float16_vector", DataType: schemapb.DataType_Float16Vector, TypeParams: []*commonpb.KeyValuePair{{Key: "dim", Value: "8"}}},
 			{FieldID: 113, Name: "bfloat16_vector", DataType: schemapb.DataType_BFloat16Vector, TypeParams: []*commonpb.KeyValuePair{{Key: "dim", Value: "8"}}},
 			{FieldID: 114, Name: "sparse_vector", DataType: schemapb.DataType_SparseFloatVector, TypeParams: []*commonpb.KeyValuePair{{Key: "dim", Value: "8"}}},
+			{FieldID: 115, Name: "int8_vector", DataType: schemapb.DataType_Int8Vector, TypeParams: []*commonpb.KeyValuePair{{Key: "dim", Value: "8"}}},
 			{FieldID: 999, Name: "unknown", DataType: schemapb.DataType_None},
 		},
 	}
@@ -704,6 +806,19 @@ func (s *NumRowsWithSchemaSuite) TestNormalCases() {
 			},
 			expect: 6,
 		},
+		{
+			tag: "int8_vector",
+			input: &schemapb.FieldData{
+				FieldName: "int8_vector",
+				Field: &schemapb.FieldData_Vectors{
+					Vectors: &schemapb.VectorField{
+						Dim:  8,
+						Data: &schemapb.VectorField_Int8Vector{Int8Vector: make([]byte, 7*8)},
+					},
+				},
+			},
+			expect: 7,
+		},
 	}
 	for _, tc := range cases {
 		s.Run(tc.tag, func() {
@@ -782,6 +897,18 @@ func (s *NumRowsWithSchemaSuite) TestErrorCases() {
 					},
 				},
 			},
+			{
+				tag: "int8_vector",
+				input: &schemapb.FieldData{
+					FieldName: "int8_vector",
+					Field: &schemapb.FieldData_Vectors{
+						Vectors: &schemapb.VectorField{
+							Dim:  13,
+							Data: &schemapb.VectorField_Int8Vector{Int8Vector: make([]byte, 8*5)},
+						},
+					},
+				},
+			},
 		}
 
 		for _, tc := range cases {
@@ -795,4 +922,72 @@ func (s *NumRowsWithSchemaSuite) TestErrorCases() {
 
 func TestNumRowsWithSchema(t *testing.T) {
 	suite.Run(t, new(NumRowsWithSchemaSuite))
+}
+
+func TestChannelConvert(t *testing.T) {
+	t.Run("is physical channel", func(t *testing.T) {
+		{
+			channel := "by-dev-replicate-msg"
+			ok := IsPhysicalChannel(channel)
+			assert.True(t, ok)
+		}
+
+		{
+			channel := "by-dev-rootcoord-dml_2"
+			ok := IsPhysicalChannel(channel)
+			assert.True(t, ok)
+		}
+
+		{
+			channel := "by-dev-rootcoord-dml_2_1001v0"
+			ok := IsPhysicalChannel(channel)
+			assert.False(t, ok)
+		}
+	})
+
+	t.Run("to physical channel", func(t *testing.T) {
+		{
+			channel := "by-dev-rootcoord-dml_2_1001v0"
+			physicalChannel := ToPhysicalChannel(channel)
+			assert.Equal(t, "by-dev-rootcoord-dml_2", physicalChannel)
+		}
+
+		{
+			channel := "by-dev-rootcoord-dml_2"
+			physicalChannel := ToPhysicalChannel(channel)
+			assert.Equal(t, "by-dev-rootcoord-dml_2", physicalChannel)
+		}
+
+		{
+			channel := "by-dev-replicate-msg"
+			physicalChannel := ToPhysicalChannel(channel)
+			assert.Equal(t, "by-dev-replicate-msg", physicalChannel)
+		}
+	})
+
+	t.Run("get virtual channel", func(t *testing.T) {
+		channel := GetVirtualChannel("by-dev-rootcoord-dml_2", 1001, 0)
+		assert.Equal(t, "by-dev-rootcoord-dml_2_1001v0", channel)
+	})
+}
+
+func TestString2KeyValuePair(t *testing.T) {
+	t.Run("normal", func(t *testing.T) {
+		kvs, err := String2KeyValuePair("{\"key\": \"value\"}")
+		assert.NoError(t, err)
+		assert.Len(t, kvs, 1)
+		assert.Equal(t, "key", kvs[0].Key)
+		assert.Equal(t, "value", kvs[0].Value)
+	})
+
+	t.Run("err", func(t *testing.T) {
+		_, err := String2KeyValuePair("{aa}")
+		assert.Error(t, err)
+	})
+
+	t.Run("empty", func(t *testing.T) {
+		kvs, err := String2KeyValuePair("{}")
+		assert.NoError(t, err)
+		assert.Len(t, kvs, 0)
+	})
 }

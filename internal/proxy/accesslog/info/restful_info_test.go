@@ -27,8 +27,8 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 type RestfulAccessInfoSuite struct {
@@ -129,6 +129,10 @@ func (s *RestfulAccessInfoSuite) TestErrorMsg() {
 	s.info.params.Keys[ContextReturnMessage] = merr.ErrChannelLack.Error()
 	result := Get(s.info, "$error_msg")
 	s.Equal(merr.ErrChannelLack.Error(), result[0])
+
+	s.info.params.Keys[ContextReturnMessage] = "test error. stack: 1:\n 2:\n 3:\n"
+	result = Get(s.info, "$error_msg")
+	s.Equal("test error. stack: 1:\\n 2:\\n 3:\\n", result[0])
 }
 
 func (s *RestfulAccessInfoSuite) TestDbName() {

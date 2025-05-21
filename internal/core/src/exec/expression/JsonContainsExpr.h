@@ -22,6 +22,7 @@
 #include "common/Types.h"
 #include "common/Vector.h"
 #include "exec/expression/Expr.h"
+#include "exec/expression/Element.h"
 #include "segcore/SegmentInterface.h"
 
 namespace milvus {
@@ -35,53 +36,94 @@ class PhyJsonContainsFilterExpr : public SegmentExpr {
         const std::string& name,
         const segcore::SegmentInternalInterface* segment,
         int64_t active_count,
-        int64_t batch_size)
+        int64_t batch_size,
+        int32_t consistency_level)
         : SegmentExpr(std::move(input),
                       name,
                       segment,
                       expr->column_.field_id_,
+                      expr->column_.nested_path_,
+                      expr->vals_.empty()
+                          ? DataType::NONE
+                          : FromValCase(expr->vals_[0].val_case()),
                       active_count,
-                      batch_size),
+                      batch_size,
+                      consistency_level),
           expr_(expr) {
     }
 
     void
     Eval(EvalCtx& context, VectorPtr& result) override;
 
+    std::string
+    ToString() const {
+        return fmt::format("{}", expr_->ToString());
+    }
+
+    bool
+    IsSource() const override {
+        return true;
+    }
+
+    std::optional<milvus::expr::ColumnInfo>
+    GetColumnInfo() const override {
+        return expr_->column_;
+    }
+
  private:
     VectorPtr
-    EvalJsonContainsForDataSegment();
+    EvalJsonContainsForDataSegment(EvalCtx& context);
 
     template <typename ExprValueType>
     VectorPtr
-    ExecJsonContains();
+    ExecJsonContains(EvalCtx& context);
 
     template <typename ExprValueType>
     VectorPtr
-    ExecArrayContains();
+    ExecJsonContainsByKeyIndex();
 
     template <typename ExprValueType>
     VectorPtr
-    ExecJsonContainsAll();
+    ExecArrayContains(EvalCtx& context);
 
     template <typename ExprValueType>
     VectorPtr
-    ExecArrayContainsAll();
+    ExecJsonContainsAll(EvalCtx& context);
+
+    template <typename ExprValueType>
+    VectorPtr
+    ExecJsonContainsAllByKeyIndex();
+
+    template <typename ExprValueType>
+    VectorPtr
+    ExecArrayContainsAll(EvalCtx& context);
 
     VectorPtr
-    ExecJsonContainsArray();
+    ExecJsonContainsArray(EvalCtx& context);
 
     VectorPtr
-    ExecJsonContainsAllArray();
+    ExecJsonContainsArrayByKeyIndex();
 
     VectorPtr
-    ExecJsonContainsAllWithDiffType();
+    ExecJsonContainsAllArray(EvalCtx& context);
 
     VectorPtr
-    ExecJsonContainsWithDiffType();
+    ExecJsonContainsAllArrayByKeyIndex();
 
     VectorPtr
-    EvalArrayContainsForIndexSegment();
+    ExecJsonContainsAllWithDiffType(EvalCtx& context);
+
+    VectorPtr
+    ExecJsonContainsAllWithDiffTypeByKeyIndex();
+
+    VectorPtr
+    ExecJsonContainsWithDiffType(EvalCtx& context);
+
+    VectorPtr
+    ExecJsonContainsWithDiffTypeByKeyIndex();
+
+    VectorPtr
+    EvalArrayContainsForIndexSegment(DataType data_type);
 
     template <typename ExprValueType>
     VectorPtr
@@ -89,6 +131,8 @@ class PhyJsonContainsFilterExpr : public SegmentExpr {
 
  private:
     std::shared_ptr<const milvus::expr::JsonContainsExpr> expr_;
+    bool arg_inited_{false};
+    std::shared_ptr<MultiElement> arg_set_;
 };
 }  //namespace exec
 }  // namespace milvus

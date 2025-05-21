@@ -26,8 +26,8 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
-	"github.com/milvus-io/milvus/pkg/common"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
 )
 
 type UtilsSuite struct {
@@ -83,7 +83,9 @@ func (s *UtilsSuite) TestPackLoadSegmentRequest() {
 	s.Equal(task.ReplicaID(), req.ReplicaID)
 	s.Equal(action.Node(), req.GetDstNodeID())
 	for _, field := range req.GetSchema().GetFields() {
-		s.False(common.IsMmapEnabled(field.GetTypeParams()...))
+		mmapEnable, ok := common.IsMmapDataEnabled(field.GetTypeParams()...)
+		s.False(mmapEnable)
+		s.True(ok)
 	}
 }
 
@@ -136,7 +138,9 @@ func (s *UtilsSuite) TestPackLoadSegmentRequestMmap() {
 	s.Equal(task.ReplicaID(), req.ReplicaID)
 	s.Equal(action.Node(), req.GetDstNodeID())
 	for _, field := range req.GetSchema().GetFields() {
-		s.True(common.IsMmapEnabled(field.GetTypeParams()...))
+		mmapEnable, ok := common.IsMmapDataEnabled(field.GetTypeParams()...)
+		s.True(mmapEnable)
+		s.True(ok)
 	}
 }
 

@@ -24,20 +24,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/stretchr/testify/suite"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	grpcdatacoord "github.com/milvus-io/milvus/internal/distributed/datacoord"
-	grpcquerycoord "github.com/milvus-io/milvus/internal/distributed/querycoord"
-	grpcrootcoord "github.com/milvus-io/milvus/internal/distributed/rootcoord"
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/metric"
+	"github.com/milvus-io/milvus/internal/util/testutil"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/metric"
 	"github.com/milvus-io/milvus/tests/integration"
 )
 
@@ -236,32 +234,17 @@ func (s *CoordSwitchSuite) setupData() {
 }
 
 func (s *CoordSwitchSuite) switchCoord() float64 {
-	var err error
 	c := s.Cluster
 	start := time.Now()
 	log.Info("=========================Stopping Coordinators========================")
-	c.RootCoord.Stop()
-	c.DataCoord.Stop()
-	c.QueryCoord.Stop()
+	c.StopMixCoord()
 	log.Info("=========================Coordinators stopped=========================", zap.Duration("elapsed", time.Since(start)))
 	start = time.Now()
 
-	c.RootCoord, err = grpcrootcoord.NewServer(context.TODO(), c.GetFactory())
-	s.NoError(err)
-	c.DataCoord = grpcdatacoord.NewServer(context.TODO(), c.GetFactory())
-	c.QueryCoord, err = grpcquerycoord.NewServer(context.TODO(), c.GetFactory())
-	s.NoError(err)
-	log.Info("=========================Coordinators recreated=========================")
+	testutil.ResetEnvironment()
 
-	err = c.RootCoord.Run()
-	s.NoError(err)
+	c.StartMixCoord()
 	log.Info("=========================RootCoord restarted=========================")
-	err = c.DataCoord.Run()
-	s.NoError(err)
-	log.Info("=========================DataCoord restarted=========================")
-	err = c.QueryCoord.Run()
-	s.NoError(err)
-	log.Info("=========================QueryCoord restarted=========================")
 
 	for i := 0; i < 1000; i++ {
 		time.Sleep(time.Second)

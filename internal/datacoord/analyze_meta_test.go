@@ -25,7 +25,8 @@ import (
 	"github.com/stretchr/testify/suite"
 
 	"github.com/milvus-io/milvus/internal/metastore/mocks"
-	"github.com/milvus-io/milvus/internal/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/workerpb"
 )
 
 type AnalyzeMetaSuite struct {
@@ -135,25 +136,25 @@ func (s *AnalyzeMetaSuite) Test_AnalyzeMeta() {
 	})
 
 	s.Run("DropAnalyzeTask", func() {
-		err := am.DropAnalyzeTask(7)
+		err := am.DropAnalyzeTask(ctx, 7)
 		s.NoError(err)
 		s.Equal(6, len(am.GetAllTasks()))
 	})
 
 	s.Run("UpdateVersion", func() {
-		err := am.UpdateVersion(1)
+		err := am.UpdateVersion(1, 1)
 		s.NoError(err)
 		s.Equal(int64(1), am.GetTask(1).Version)
 	})
 
 	s.Run("BuildingTask", func() {
-		err := am.BuildingTask(1, 1)
+		err := am.BuildingTask(1)
 		s.NoError(err)
 		s.Equal(indexpb.JobState_JobStateInProgress, am.GetTask(1).State)
 	})
 
 	s.Run("FinishTask", func() {
-		err := am.FinishTask(1, &indexpb.AnalyzeResult{
+		err := am.FinishTask(1, &workerpb.AnalyzeResult{
 			TaskID: 1,
 			State:  indexpb.JobState_JobStateFinished,
 		})
@@ -211,25 +212,25 @@ func (s *AnalyzeMetaSuite) Test_failCase() {
 	})
 
 	s.Run("DropAnalyzeTask", func() {
-		err := am.DropAnalyzeTask(1)
+		err := am.DropAnalyzeTask(ctx, 1)
 		s.Error(err)
 		s.NotNil(am.GetTask(1))
 	})
 
 	s.Run("UpdateVersion", func() {
-		err := am.UpdateVersion(777)
+		err := am.UpdateVersion(777, 1)
 		s.Error(err)
 
-		err = am.UpdateVersion(1)
+		err = am.UpdateVersion(1, 1)
 		s.Error(err)
 		s.Equal(int64(0), am.GetTask(1).Version)
 	})
 
 	s.Run("BuildingTask", func() {
-		err := am.BuildingTask(777, 1)
+		err := am.BuildingTask(777)
 		s.Error(err)
 
-		err = am.BuildingTask(1, 1)
+		err = am.BuildingTask(1)
 		s.Error(err)
 		s.Equal(int64(0), am.GetTask(1).NodeID)
 		s.Equal(indexpb.JobState_JobStateInit, am.GetTask(1).State)
@@ -239,7 +240,7 @@ func (s *AnalyzeMetaSuite) Test_failCase() {
 		err := am.FinishTask(777, nil)
 		s.Error(err)
 
-		err = am.FinishTask(1, &indexpb.AnalyzeResult{
+		err = am.FinishTask(1, &workerpb.AnalyzeResult{
 			TaskID: 1,
 			State:  indexpb.JobState_JobStateFinished,
 		})

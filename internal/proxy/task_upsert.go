@@ -1,18 +1,18 @@
-// // Licensed to the LF AI & Data foundation under one
-// // or more contributor license agreements. See the NOTICE file
-// // distributed with this work for additional information
-// // regarding copyright ownership. The ASF licenses this file
-// // to you under the Apache License, Version 2.0 (the
-// // "License"); you may not use this file except in compliance
-// // with the License. You may obtain a copy of the License at
-// //
-// //	http://www.apache.org/licenses/LICENSE-2.0
-// //
-// // Unless required by applicable law or agreed to in writing, software
-// // distributed under the License is distributed on an "AS IS" BASIS,
-// // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// // See the License for the specific language governing permissions and
-// // limitations under the License.
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 package proxy
 
 import (
@@ -29,15 +29,16 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/allocator"
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/metrics"
-	"github.com/milvus-io/milvus/pkg/mq/msgstream"
-	"github.com/milvus-io/milvus/pkg/util/commonpbutil"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/timerecord"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/internal/util/function"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/metrics"
+	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/v2/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/timerecord"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 type upsertTask struct {
@@ -63,6 +64,10 @@ type upsertTask struct {
 	schema           *schemaInfo
 	partitionKeyMode bool
 	partitionKeys    *schemapb.FieldData
+	// automatic generate pk as new pk wehen autoID == true
+	// delete task need use the oldIDs
+	oldIDs          *schemapb.IDs
+	schemaTimestamp uint64
 }
 
 // TraceCtx returns upsertTask context
@@ -134,16 +139,37 @@ func (it *upsertTask) getChannels() []pChan {
 }
 
 func (it *upsertTask) OnEnqueue() error {
+	if it.req.Base == nil {
+		it.req.Base = commonpbutil.NewMsgBase()
+	}
+	it.req.Base.MsgType = commonpb.MsgType_Upsert
+	it.req.Base.SourceID = paramtable.GetNodeID()
 	return nil
 }
 
 func (it *upsertTask) insertPreExecute(ctx context.Context) error {
+	ctx, sp := otel.Tracer(typeutil.ProxyRole).Start(ctx, "Proxy-Upsert-insertPreExecute")
+	defer sp.End()
 	collectionName := it.upsertMsg.InsertMsg.CollectionName
 	if err := validateCollectionName(collectionName); err != nil {
-		log.Error("valid collection name failed", zap.String("collectionName", collectionName), zap.Error(err))
+		log.Ctx(ctx).Error("valid collection name failed", zap.String("collectionName", collectionName), zap.Error(err))
 		return err
 	}
 
+	// Calculate embedding fields
+	if function.HasNonBM25Functions(it.schema.CollectionSchema.Functions, []int64{}) {
+		ctx, sp := otel.Tracer(typeutil.ProxyRole).Start(ctx, "Proxy-Proxy-Upsert-insertPreExecute-call-function-udf")
+		defer sp.End()
+		exec, err := function.NewFunctionExecutor(it.schema.CollectionSchema)
+		if err != nil {
+			return err
+		}
+		sp.AddEvent("Create-function-udf")
+		if err := exec.ProcessInsert(ctx, it.upsertMsg.InsertMsg); err != nil {
+			return err
+		}
+		sp.AddEvent("Call-function-udf")
+	}
 	rowNums := uint32(it.upsertMsg.InsertMsg.NRows())
 	// set upsertTask.insertRequest.rowIDs
 	tr := timerecord.NewTimeRecorder("applyPK")
@@ -179,22 +205,30 @@ func (it *upsertTask) insertPreExecute(ctx context.Context) error {
 		}
 	}
 
-	// check primaryFieldData whether autoID is true or not
-	// only allow support autoID == false
+	// use the passed pk as new pk when autoID == false
+	// automatic generate pk as new pk wehen autoID == true
 	var err error
-	it.result.IDs, err = checkPrimaryFieldData(it.schema.CollectionSchema, it.result, it.upsertMsg.InsertMsg, false)
+	it.result.IDs, it.oldIDs, err = checkUpsertPrimaryFieldData(it.schema.CollectionSchema, it.upsertMsg.InsertMsg)
 	log := log.Ctx(ctx).With(zap.String("collectionName", it.upsertMsg.InsertMsg.CollectionName))
 	if err != nil {
 		log.Warn("check primary field data and hash primary key failed when upsert",
 			zap.Error(err))
+		return merr.WrapErrAsInputErrorWhen(err, merr.ErrParameterInvalid)
+	}
+
+	// check varchar/text with analyzer was utf-8 format
+	err = checkInputUtf8Compatiable(it.schema.CollectionSchema, it.upsertMsg.InsertMsg)
+	if err != nil {
+		log.Warn("check varchar/text format failed", zap.Error(err))
 		return err
 	}
+
 	// set field ID to insert field data
-	err = fillFieldIDBySchema(it.upsertMsg.InsertMsg.GetFieldsData(), it.schema.CollectionSchema)
+	err = fillFieldPropertiesBySchema(it.upsertMsg.InsertMsg.GetFieldsData(), it.schema.CollectionSchema)
 	if err != nil {
 		log.Warn("insert set fieldID to fieldData failed when upsert",
 			zap.Error(err))
-		return err
+		return merr.WrapErrAsInputErrorWhen(err, merr.ErrParameterInvalid)
 	}
 
 	if it.partitionKeyMode {
@@ -215,7 +249,7 @@ func (it *upsertTask) insertPreExecute(ctx context.Context) error {
 	}
 
 	if err := newValidateUtil(withNANCheck(), withOverflowCheck(), withMaxLenCheck()).
-		Validate(it.upsertMsg.InsertMsg.GetFieldsData(), it.schema.CollectionSchema, it.upsertMsg.InsertMsg.NRows()); err != nil {
+		Validate(it.upsertMsg.InsertMsg.GetFieldsData(), it.schema.schemaHelper, it.upsertMsg.InsertMsg.NRows()); err != nil {
 		return err
 	}
 
@@ -284,6 +318,33 @@ func (it *upsertTask) PreExecute(ctx context.Context) error {
 		Timestamp: it.EndTs(),
 	}
 
+	replicateID, err := GetReplicateID(ctx, it.req.GetDbName(), collectionName)
+	if err != nil {
+		log.Warn("get replicate info failed", zap.String("collectionName", collectionName), zap.Error(err))
+		return merr.WrapErrAsInputErrorWhen(err, merr.ErrCollectionNotFound, merr.ErrDatabaseNotFound)
+	}
+	if replicateID != "" {
+		return merr.WrapErrCollectionReplicateMode("upsert")
+	}
+
+	collID, err := globalMetaCache.GetCollectionID(context.Background(), it.req.GetDbName(), collectionName)
+	if err != nil {
+		log.Warn("fail to get collection id", zap.Error(err))
+		return err
+	}
+	colInfo, err := globalMetaCache.GetCollectionInfo(ctx, it.req.GetDbName(), collectionName, collID)
+	if err != nil {
+		log.Warn("fail to get collection info", zap.Error(err))
+		return err
+	}
+	if it.schemaTimestamp != 0 {
+		if it.schemaTimestamp != colInfo.updateTimestamp {
+			err := merr.WrapErrCollectionSchemaMisMatch(collectionName)
+			log.Info("collection schema mismatch", zap.String("collectionName", collectionName), zap.Error(err))
+			return err
+		}
+	}
+
 	schema, err := globalMetaCache.GetCollectionSchema(ctx, it.req.GetDbName(), collectionName)
 	if err != nil {
 		log.Warn("Failed to get collection schema",
@@ -309,14 +370,18 @@ func (it *upsertTask) PreExecute(ctx context.Context) error {
 		// insert to _default partition
 		partitionTag := it.req.GetPartitionName()
 		if len(partitionTag) <= 0 {
-			partitionTag = Params.CommonCfg.DefaultPartitionName.GetValue()
-			it.req.PartitionName = partitionTag
+			pinfo, err := globalMetaCache.GetPartitionInfo(ctx, it.req.GetDbName(), collectionName, "")
+			if err != nil {
+				log.Warn("get partition info failed", zap.String("collectionName", collectionName), zap.Error(err))
+				return err
+			}
+			it.req.PartitionName = pinfo.name
 		}
 	}
 
 	it.upsertMsg = &msgstream.UpsertMsg{
 		InsertMsg: &msgstream.InsertMsg{
-			InsertRequest: msgpb.InsertRequest{
+			InsertRequest: &msgpb.InsertRequest{
 				Base: commonpbutil.NewMsgBase(
 					commonpbutil.WithMsgType(commonpb.MsgType_Insert),
 					commonpbutil.WithSourceID(paramtable.GetNodeID()),
@@ -330,7 +395,7 @@ func (it *upsertTask) PreExecute(ctx context.Context) error {
 			},
 		},
 		DeleteMsg: &msgstream.DeleteMsg{
-			DeleteRequest: msgpb.DeleteRequest{
+			DeleteRequest: &msgpb.DeleteRequest{
 				Base: commonpbutil.NewMsgBase(
 					commonpbutil.WithMsgType(commonpb.MsgType_Delete),
 					commonpbutil.WithSourceID(paramtable.GetNodeID()),
@@ -377,11 +442,13 @@ func (it *upsertTask) insertExecute(ctx context.Context, msgPack *msgstream.MsgP
 		return err
 	}
 	it.upsertMsg.InsertMsg.CollectionID = collID
+	it.upsertMsg.InsertMsg.BeginTimestamp = it.BeginTs()
+	it.upsertMsg.InsertMsg.EndTimestamp = it.EndTs()
 	log := log.Ctx(ctx).With(
 		zap.Int64("collectionID", collID))
 	getCacheDur := tr.RecordSpan()
 
-	_, err = it.chMgr.getOrCreateDmlStream(collID)
+	_, err = it.chMgr.getOrCreateDmlStream(ctx, collID)
 	if err != nil {
 		return err
 	}
@@ -440,7 +507,7 @@ func (it *upsertTask) deleteExecute(ctx context.Context, msgPack *msgstream.MsgP
 		it.result.Status = merr.Status(err)
 		return err
 	}
-	it.upsertMsg.DeleteMsg.PrimaryKeys = it.result.IDs
+	it.upsertMsg.DeleteMsg.PrimaryKeys = it.oldIDs
 	it.upsertMsg.DeleteMsg.HashValues = typeutil.HashPK2Channels(it.upsertMsg.DeleteMsg.PrimaryKeys, channelNames)
 
 	// repack delete msg by dmChannel
@@ -456,9 +523,9 @@ func (it *upsertTask) deleteExecute(ctx context.Context, msgPack *msgstream.MsgP
 		if !ok {
 			msgid, err := it.idAllocator.AllocOne()
 			if err != nil {
-				errors.Wrap(err, "failed to allocate MsgID for delete of upsert")
+				return errors.Wrap(err, "failed to allocate MsgID for delete of upsert")
 			}
-			sliceRequest := msgpb.DeleteRequest{
+			sliceRequest := &msgpb.DeleteRequest{
 				Base: commonpbutil.NewMsgBase(
 					commonpbutil.WithMsgType(commonpb.MsgType_Delete),
 					commonpbutil.WithTimeStamp(ts),
@@ -514,7 +581,7 @@ func (it *upsertTask) Execute(ctx context.Context) (err error) {
 	log := log.Ctx(ctx).With(zap.String("collectionName", it.req.CollectionName))
 
 	tr := timerecord.NewTimeRecorder(fmt.Sprintf("proxy execute upsert %d", it.ID()))
-	stream, err := it.chMgr.getOrCreateDmlStream(it.collectionID)
+	stream, err := it.chMgr.getOrCreateDmlStream(ctx, it.collectionID)
 	if err != nil {
 		return err
 	}
@@ -535,7 +602,7 @@ func (it *upsertTask) Execute(ctx context.Context) (err error) {
 	}
 
 	tr.RecordSpan()
-	err = stream.Produce(msgPack)
+	err = stream.Produce(ctx, msgPack)
 	if err != nil {
 		it.result.Status = merr.Status(err)
 		return err

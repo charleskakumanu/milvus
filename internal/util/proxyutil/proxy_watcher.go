@@ -18,7 +18,6 @@ package proxyutil
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"path"
 	"sync"
@@ -30,11 +29,12 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/milvus-io/milvus/internal/json"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/lifetime"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/lifetime"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 type ProxyWatcherInterface interface {
@@ -166,7 +166,7 @@ func (p *ProxyWatcher) handlePutEvent(e *clientv3.Event) error {
 	if err != nil {
 		return err
 	}
-	log.Debug("received proxy put event with session", zap.Any("session", session))
+	log.Ctx(context.TODO()).Debug("received proxy put event with session", zap.Any("session", session))
 	for _, f := range p.addSessionsFunc {
 		f(session)
 	}
@@ -178,7 +178,7 @@ func (p *ProxyWatcher) handleDeleteEvent(e *clientv3.Event) error {
 	if err != nil {
 		return err
 	}
-	log.Debug("received proxy delete event with session", zap.Any("session", session))
+	log.Ctx(context.TODO()).Debug("received proxy delete event with session", zap.Any("session", session))
 	for _, f := range p.delSessionsFunc {
 		f(session)
 	}

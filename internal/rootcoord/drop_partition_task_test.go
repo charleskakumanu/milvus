@@ -28,7 +28,7 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus/internal/metastore/model"
 	mockrootcoord "github.com/milvus-io/milvus/internal/rootcoord/mocks"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
 )
 
 func Test_dropPartitionTask_Prepare(t *testing.T) {
@@ -174,15 +174,15 @@ func Test_dropPartitionTask_Execute(t *testing.T) {
 			return nil
 		})
 
-		gc := newMockGarbageCollector()
+		gc := mockrootcoord.NewGarbageCollector(t)
 		deletePartitionCalled := false
 		deletePartitionChan := make(chan struct{}, 1)
-		gc.GcPartitionDataFunc = func(ctx context.Context, pChannels []string, coll *model.Partition) (Timestamp, error) {
+		gc.EXPECT().GcPartitionData(mock.Anything, mock.Anything, mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, pChannels, vchannel []string, coll *model.Partition) (Timestamp, error) {
 			deletePartitionChan <- struct{}{}
 			deletePartitionCalled = true
 			time.Sleep(confirmGCInterval)
 			return 0, nil
-		}
+		})
 
 		broker := newMockBroker()
 		broker.GCConfirmFunc = func(ctx context.Context, collectionID, partitionID UniqueID) bool {

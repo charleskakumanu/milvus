@@ -34,8 +34,43 @@
 #include "simdjson/dom/element.h"
 #include "simdjson/error.h"
 #include "simdjson/padded_string.h"
+#include "rapidjson/document.h"
+#include "rapidjson/error/en.h"
+#include "rapidjson/writer.h"
+#include "rapidjson/stringbuffer.h"
 
 namespace milvus {
+// function to extract specific keys and convert them to json
+// rapidjson is suitable for extract and reconstruct serialization
+// instead of simdjson which not suitable for serialization
+inline std::string
+ExtractSubJson(const std::string& json, const std::vector<std::string>& keys) {
+    rapidjson::Document doc;
+    doc.Parse(json.c_str());
+    if (doc.HasParseError()) {
+        PanicInfo(ErrorCode::UnexpectedError,
+                  "json parse failed, error:{}",
+                  rapidjson::GetParseError_En(doc.GetParseError()));
+    }
+
+    rapidjson::Document result_doc;
+    result_doc.SetObject();
+    rapidjson::Document::AllocatorType& allocator = result_doc.GetAllocator();
+
+    for (const auto& key : keys) {
+        if (doc.HasMember(key.c_str())) {
+            result_doc.AddMember(rapidjson::Value(key.c_str(), allocator),
+                                 doc[key.c_str()],
+                                 allocator);
+        }
+    }
+
+    rapidjson::StringBuffer buffer;
+    rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+    result_doc.Accept(writer);
+    return buffer.GetString();
+}
+
 using document = simdjson::ondemand::document;
 template <typename T>
 using value_result = simdjson::simdjson_result<T>;
@@ -98,6 +133,9 @@ class Json {
 
     value_result<document>
     doc() const {
+        if (data_.size() == 0) {
+            return {};
+        }
         thread_local simdjson::ondemand::parser parser;
 
         // it's always safe to add the padding,
@@ -111,8 +149,30 @@ class Json {
         return doc;
     }
 
+    value_result<document>
+    doc(uint16_t offset, uint16_t length) const {
+        thread_local simdjson::ondemand::parser parser;
+
+        // it's always safe to add the padding,
+        // as we have allocated the memory with this padding
+        auto doc = parser.iterate(
+            data_.data() + offset, length, length + simdjson::SIMDJSON_PADDING);
+        AssertInfo(doc.error() == simdjson::SUCCESS,
+                   "failed to parse the json {} offset {}, length {}: {}, "
+                   "total_json:{}",
+                   std::string(data_.data() + offset, length),
+                   offset,
+                   length,
+                   simdjson::error_message(doc.error()),
+                   data_);
+        return doc;
+    }
+
     value_result<simdjson::dom::element>
     dom_doc() const {
+        if (data_.size() == 0) {
+            return {};
+        }
         thread_local simdjson::dom::parser parser;
 
         // it's always safe to add the padding,
@@ -125,9 +185,25 @@ class Json {
         return doc;
     }
 
+    value_result<simdjson::dom::element>
+    dom_doc(uint16_t offset, uint16_t length) const {
+        thread_local simdjson::dom::parser parser;
+
+        // it's always safe to add the padding,
+        // as we have allocated the memory with this padding
+        auto doc = parser.parse(data_.data() + offset, length);
+        AssertInfo(doc.error() == simdjson::SUCCESS,
+                   "failed to parse the json {}: {}",
+                   std::string(data_.data() + offset, length),
+                   simdjson::error_message(doc.error()));
+        return doc;
+    }
+
     bool
     exist(std::string_view pointer) const {
-        return doc().at_pointer(pointer).error() == simdjson::SUCCESS;
+        auto doc = this->doc();
+        auto res = doc.at_pointer(pointer);
+        return res.error() == simdjson::SUCCESS && !res.is_null();
     }
 
     // construct JSON pointer with provided path
@@ -162,6 +238,22 @@ class Json {
         }
 
         return doc().at_pointer(pointer).get<T>();
+    }
+
+    template <typename T>
+    value_result<T>
+    at(uint16_t offset, uint16_t length) const {
+        return doc(offset, length).get<T>();
+    }
+
+    std::string_view
+    at_string(uint16_t offset, uint16_t length) const {
+        return std::string_view(data_.data() + offset, length);
+    }
+
+    value_result<simdjson::dom::array>
+    array_at(uint16_t offset, uint16_t length) const {
+        return dom_doc(offset, length).get_array();
     }
 
     // get dom array by JSON pointer,

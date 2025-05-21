@@ -14,8 +14,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #pragma once
+
+#include "common/Utils.h"
+#include "common/Span.h"
 #include "mmap/ChunkData.h"
 #include "storage/MmapManager.h"
+
 namespace milvus {
 template <typename Type>
 class ChunkVectorBase {
@@ -27,13 +31,16 @@ class ChunkVectorBase {
     copy_to_chunk(int64_t chunk_id,
                   int64_t offest,
                   const Type* data,
-                  int64_t length) = 0;
+                  int64_t length,
+                  const std::optional<CheckDataValid>& check_data_valid) = 0;
     virtual void*
     get_chunk_data(int64_t index) = 0;
     virtual int64_t
     get_chunk_size(int64_t index) = 0;
-    virtual Type
-    get_element(int64_t chunk_id, int64_t chunk_offset) = 0;
+    virtual int64_t
+    get_element_size() = 0;
+    virtual int64_t
+    get_element_offset(int64_t index) = 0;
     virtual ChunkViewType<Type>
     view_element(int64_t chunk_id, int64_t chunk_offset) = 0;
     int64_t
@@ -44,6 +51,9 @@ class ChunkVectorBase {
     clear() = 0;
     virtual SpanBase
     get_span(int64_t chunk_id) = 0;
+
+    virtual bool
+    is_mmap() const = 0;
 
  protected:
     std::atomic<int64_t> counter_ = 0;
@@ -78,10 +88,12 @@ class ThreadSafeChunkVector : public ChunkVectorBase<Type> {
     }
 
     void
-    copy_to_chunk(int64_t chunk_id,
-                  int64_t offset,
-                  const Type* data,
-                  int64_t length) override {
+    copy_to_chunk(
+        int64_t chunk_id,
+        int64_t offset,
+        const Type* data,
+        int64_t length,
+        const std::optional<CheckDataValid>& check_data_valid) override {
         std::unique_lock<std::shared_mutex> lck(mutex_);
         AssertInfo(chunk_id < this->counter_,
                    fmt::format("index out of range, index={}, counter_={}",
@@ -98,31 +110,14 @@ class ThreadSafeChunkVector : public ChunkVectorBase<Type> {
                     vec_[chunk_id].size()));
             std::copy_n(data, length, ptr + offset);
         } else {
-            vec_[chunk_id].set(data, offset, length);
-        }
-    }
-
-    Type
-    get_element(int64_t chunk_id, int64_t chunk_offset) override {
-        std::shared_lock<std::shared_mutex> lck(mutex_);
-        auto chunk = vec_[chunk_id];
-        AssertInfo(
-            chunk_id < this->counter_ && chunk_offset < chunk.size(),
-            fmt::format("index out of range, index={}, chunk_offset={}, cap={}",
-                        chunk_id,
-                        chunk_offset,
-                        chunk.size()));
-        if constexpr (IsMmap) {
-            return chunk.get(chunk_offset);
-        } else {
-            return chunk[chunk_offset];
+            vec_[chunk_id].set(data, offset, length, check_data_valid);
         }
     }
 
     ChunkViewType<Type>
     view_element(int64_t chunk_id, int64_t chunk_offset) override {
         std::shared_lock<std::shared_mutex> lck(mutex_);
-        auto chunk = vec_[chunk_id];
+        auto& chunk = vec_[chunk_id];
         if constexpr (IsMmap) {
             return chunk.view(chunk_offset);
         } else if constexpr (std::is_same_v<std::string, Type>) {
@@ -131,9 +126,10 @@ class ThreadSafeChunkVector : public ChunkVectorBase<Type> {
         } else if constexpr (std::is_same_v<Array, Type>) {
             auto& src = chunk[chunk_offset];
             return ArrayView(const_cast<char*>(src.data()),
+                             src.length(),
                              src.byte_size(),
                              src.get_element_type(),
-                             src.get_offsets_in_copy());
+                             src.get_offsets_data());
         } else {
             return chunk[chunk_offset];
         }
@@ -166,6 +162,25 @@ class ThreadSafeChunkVector : public ChunkVectorBase<Type> {
         vec_.clear();
     }
 
+    int64_t
+    get_element_size() override {
+        std::shared_lock<std::shared_mutex> lck(mutex_);
+        if constexpr (IsMmap && std::is_same_v<std::string, Type>) {
+            return sizeof(ChunkViewType<Type>);
+        }
+        return sizeof(Type);
+    }
+
+    int64_t
+    get_element_offset(int64_t index) override {
+        std::shared_lock<std::shared_mutex> lck(mutex_);
+        int64_t offset = 0;
+        for (int i = 0; i < index; i++) {
+            offset += vec_[i].size();
+        }
+        return offset;
+    }
+
     SpanBase
     get_span(int64_t chunk_id) override {
         std::shared_lock<std::shared_mutex> lck(mutex_);
@@ -178,6 +193,11 @@ class ThreadSafeChunkVector : public ChunkVectorBase<Type> {
                             get_chunk_size(chunk_id),
                             sizeof(Type));
         }
+    }
+
+    bool
+    is_mmap() const override {
+        return mmap_descriptor_ != nullptr;
     }
 
  private:
@@ -206,7 +226,6 @@ SelectChunkVectorPtr(storage::MmapChunkDescriptorPtr& mmap_descriptor) {
             return std::make_unique<ThreadSafeChunkVector<Type>>();
         }
     } else {
-        // todo: sparse float vector support mmap
         return std::make_unique<ThreadSafeChunkVector<Type>>();
     }
 }

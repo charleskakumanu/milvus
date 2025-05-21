@@ -28,28 +28,27 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
 	"github.com/milvus-io/milvus/internal/util/dependency"
-	"github.com/milvus-io/milvus/pkg/mq/common"
-	"github.com/milvus-io/milvus/pkg/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/v2/mq/common"
+	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
 )
 
 func generateMsgPack() msgstream.MsgPack {
 	msgPack := msgstream.MsgPack{}
 
-	timeTickResult := msgpb.TimeTickMsg{
-		Base: &commonpb.MsgBase{
-			MsgType:   commonpb.MsgType_TimeTick,
-			MsgID:     0,
-			Timestamp: math.MaxUint64,
-			SourceID:  0,
-		},
-	}
 	timeTickMsg := &msgstream.TimeTickMsg{
 		BaseMsg: msgstream.BaseMsg{
 			BeginTimestamp: uint64(time.Now().Unix()),
 			EndTimestamp:   uint64(time.Now().Unix() + 1),
 			HashValues:     []uint32{0},
 		},
-		TimeTickMsg: timeTickResult,
+		TimeTickMsg: &msgpb.TimeTickMsg{
+			Base: &commonpb.MsgBase{
+				MsgType:   commonpb.MsgType_TimeTick,
+				MsgID:     0,
+				Timestamp: math.MaxUint64,
+				SourceID:  0,
+			},
+		},
 	}
 	msgPack.Msgs = append(msgPack.Msgs, timeTickMsg)
 
@@ -64,7 +63,7 @@ func generateInsertMsgPack() msgstream.MsgPack {
 			EndTimestamp:   uint64(time.Now().Unix() + 1),
 			HashValues:     []uint32{0},
 		},
-		InsertRequest: msgpb.InsertRequest{
+		InsertRequest: &msgpb.InsertRequest{
 			Base: &commonpb.MsgBase{MsgType: commonpb.MsgType_Insert},
 		},
 	}
@@ -81,16 +80,17 @@ func TestNodeManager_Start(t *testing.T) {
 	msgStream.AsConsumer(context.TODO(), channels, "sub", common.SubscriptionPositionEarliest)
 
 	produceStream, _ := factory.NewMsgStream(context.TODO())
-	produceStream.AsProducer(channels)
+	produceStream.AsProducer(context.TODO(), channels)
 
 	msgPack := generateMsgPack()
-	produceStream.Produce(&msgPack)
+	produceStream.Produce(context.TODO(), &msgPack)
 	time.Sleep(time.Millisecond * 2)
 	msgPack = generateMsgPack()
-	produceStream.Produce(&msgPack)
+	produceStream.Produce(context.TODO(), &msgPack)
 
 	nodeName := "input_node"
-	inputNode := NewInputNode(msgStream.Chan(), nodeName, 100, 100, "", 0, 0, "")
+	dispatcher := msgstream.NewSimpleMsgDispatcher(msgStream, func(pm msgstream.ConsumeMsg) bool { return true })
+	inputNode := NewInputNode(dispatcher.Chan(), nodeName, 100, 100, "", 0, 0, "")
 
 	ddNode := BaseNode{}
 
@@ -106,11 +106,7 @@ func TestNodeManager_Start(t *testing.T) {
 
 	node0.inputChannel = make(chan []Msg)
 
-	nodeCtxManager := &nodeCtxManager{
-		inputNodeCtx: node0,
-		closeWg:      &sync.WaitGroup{},
-	}
-
+	nodeCtxManager := NewNodeCtxManager(node0, &sync.WaitGroup{})
 	assert.NotPanics(t, func() {
 		nodeCtxManager.Start()
 	})

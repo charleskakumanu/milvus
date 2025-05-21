@@ -17,6 +17,7 @@
 package meta
 
 import (
+	"context"
 	"fmt"
 	"sync"
 
@@ -24,35 +25,64 @@ import (
 	"github.com/samber/lo"
 	"go.uber.org/zap"
 
+	"github.com/milvus-io/milvus/internal/json"
 	"github.com/milvus-io/milvus/internal/metastore"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/metrics"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/util"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 type ReplicaManager struct {
 	rwmutex sync.RWMutex
 
-	idAllocator        func() (int64, error)
-	replicas           map[typeutil.UniqueID]*Replica
-	collIDToReplicaIDs map[typeutil.UniqueID]typeutil.UniqueSet
-	catalog            metastore.QueryCoordCatalog
+	idAllocator   func() (int64, error)
+	replicas      map[typeutil.UniqueID]*Replica
+	coll2Replicas map[typeutil.UniqueID]*collectionReplicas // typeutil.UniqueSet
+	catalog       metastore.QueryCoordCatalog
+}
+
+// collectionReplicas maintains collection secondary index mapping
+type collectionReplicas struct {
+	id2replicas map[typeutil.UniqueID]*Replica
+	replicas    []*Replica
+}
+
+func (crs *collectionReplicas) removeReplicas(replicaIDs ...int64) (empty bool) {
+	for _, replicaID := range replicaIDs {
+		delete(crs.id2replicas, replicaID)
+	}
+	crs.replicas = lo.Values(crs.id2replicas)
+	return len(crs.replicas) == 0
+}
+
+func (crs *collectionReplicas) putReplica(replica *Replica) {
+	crs.id2replicas[replica.GetID()] = replica
+	crs.replicas = lo.Values(crs.id2replicas)
+}
+
+func newCollectionReplicas() *collectionReplicas {
+	return &collectionReplicas{
+		id2replicas: make(map[typeutil.UniqueID]*Replica),
+	}
 }
 
 func NewReplicaManager(idAllocator func() (int64, error), catalog metastore.QueryCoordCatalog) *ReplicaManager {
 	return &ReplicaManager{
-		idAllocator:        idAllocator,
-		replicas:           make(map[int64]*Replica),
-		collIDToReplicaIDs: make(map[int64]typeutil.UniqueSet),
-		catalog:            catalog,
+		idAllocator:   idAllocator,
+		replicas:      make(map[int64]*Replica),
+		coll2Replicas: make(map[int64]*collectionReplicas),
+		catalog:       catalog,
 	}
 }
 
 // Recover recovers the replicas for given collections from meta store
-func (m *ReplicaManager) Recover(collections []int64) error {
-	replicas, err := m.catalog.GetReplicas()
+func (m *ReplicaManager) Recover(ctx context.Context, collections []int64) error {
+	replicas, err := m.catalog.GetReplicas(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to recover replicas, err=%w", err)
 	}
@@ -71,7 +101,7 @@ func (m *ReplicaManager) Recover(collections []int64) error {
 				zap.Int64s("nodes", replica.GetNodes()),
 			)
 		} else {
-			err := m.catalog.ReleaseReplica(replica.GetCollectionID(), replica.GetID())
+			err := m.catalog.ReleaseReplica(ctx, replica.GetCollectionID(), replica.GetID())
 			if err != nil {
 				return err
 			}
@@ -87,7 +117,7 @@ func (m *ReplicaManager) Recover(collections []int64) error {
 
 // Get returns the replica by id.
 // Replica should be read-only, do not modify it.
-func (m *ReplicaManager) Get(id typeutil.UniqueID) *Replica {
+func (m *ReplicaManager) Get(ctx context.Context, id typeutil.UniqueID) *Replica {
 	m.rwmutex.RLock()
 	defer m.rwmutex.RUnlock()
 
@@ -95,12 +125,9 @@ func (m *ReplicaManager) Get(id typeutil.UniqueID) *Replica {
 }
 
 // Spawn spawns N replicas at resource group for given collection in ReplicaManager.
-func (m *ReplicaManager) Spawn(collection int64, replicaNumInRG map[string]int, channels []string) ([]*Replica, error) {
+func (m *ReplicaManager) Spawn(ctx context.Context, collection int64, replicaNumInRG map[string]int, channels []string) ([]*Replica, error) {
 	m.rwmutex.Lock()
 	defer m.rwmutex.Unlock()
-	if m.collIDToReplicaIDs[collection] != nil {
-		return nil, fmt.Errorf("replicas of collection %d is already spawned", collection)
-	}
 
 	balancePolicy := paramtable.Get().QueryCoordCfg.Balancer.GetValue()
 	enableChannelExclusiveMode := balancePolicy == ChannelLevelScoreBalancerName
@@ -127,7 +154,7 @@ func (m *ReplicaManager) Spawn(collection int64, replicaNumInRG map[string]int, 
 			}))
 		}
 	}
-	if err := m.put(replicas...); err != nil {
+	if err := m.put(ctx, replicas...); err != nil {
 		return nil, err
 	}
 	return replicas, nil
@@ -135,14 +162,14 @@ func (m *ReplicaManager) Spawn(collection int64, replicaNumInRG map[string]int, 
 
 // Deprecated: Warning, break the consistency of ReplicaManager,
 // never use it in non-test code, use Spawn instead.
-func (m *ReplicaManager) Put(replicas ...*Replica) error {
+func (m *ReplicaManager) Put(ctx context.Context, replicas ...*Replica) error {
 	m.rwmutex.Lock()
 	defer m.rwmutex.Unlock()
 
-	return m.put(replicas...)
+	return m.put(ctx, replicas...)
 }
 
-func (m *ReplicaManager) put(replicas ...*Replica) error {
+func (m *ReplicaManager) put(ctx context.Context, replicas ...*Replica) error {
 	if len(replicas) == 0 {
 		return nil
 	}
@@ -151,7 +178,7 @@ func (m *ReplicaManager) put(replicas ...*Replica) error {
 	for _, replica := range replicas {
 		replicaPBs = append(replicaPBs, replica.replicaPB)
 	}
-	if err := m.catalog.SaveReplica(replicaPBs...); err != nil {
+	if err := m.catalog.SaveReplica(ctx, replicaPBs...); err != nil {
 		return err
 	}
 
@@ -162,19 +189,25 @@ func (m *ReplicaManager) put(replicas ...*Replica) error {
 // putReplicaInMemory puts replicas into in-memory map and collIDToReplicaIDs.
 func (m *ReplicaManager) putReplicaInMemory(replicas ...*Replica) {
 	for _, replica := range replicas {
+		if oldReplica, ok := m.replicas[replica.GetID()]; ok {
+			metrics.QueryCoordResourceGroupReplicaTotal.WithLabelValues(oldReplica.GetResourceGroup()).Dec()
+			metrics.QueryCoordReplicaRONodeTotal.Add(-float64(oldReplica.RONodesCount()))
+		}
 		// update in-memory replicas.
 		m.replicas[replica.GetID()] = replica
+		metrics.QueryCoordResourceGroupReplicaTotal.WithLabelValues(replica.GetResourceGroup()).Inc()
+		metrics.QueryCoordReplicaRONodeTotal.Add(float64(replica.RONodesCount()))
 
 		// update collIDToReplicaIDs.
-		if m.collIDToReplicaIDs[replica.GetCollectionID()] == nil {
-			m.collIDToReplicaIDs[replica.GetCollectionID()] = typeutil.NewUniqueSet()
+		if m.coll2Replicas[replica.GetCollectionID()] == nil {
+			m.coll2Replicas[replica.GetCollectionID()] = newCollectionReplicas()
 		}
-		m.collIDToReplicaIDs[replica.GetCollectionID()].Insert(replica.GetID())
+		m.coll2Replicas[replica.GetCollectionID()].putReplica(replica)
 	}
 }
 
 // TransferReplica transfers N replicas from srcRGName to dstRGName.
-func (m *ReplicaManager) TransferReplica(collectionID typeutil.UniqueID, srcRGName string, dstRGName string, replicaNum int) error {
+func (m *ReplicaManager) TransferReplica(ctx context.Context, collectionID typeutil.UniqueID, srcRGName string, dstRGName string, replicaNum int) error {
 	if srcRGName == dstRGName {
 		return merr.WrapErrParameterInvalidMsg("source resource group and target resource group should not be the same, resource group: %s", srcRGName)
 	}
@@ -199,13 +232,28 @@ func (m *ReplicaManager) TransferReplica(collectionID typeutil.UniqueID, srcRGNa
 		mutableReplica.SetResourceGroup(dstRGName)
 		replicas = append(replicas, mutableReplica.IntoReplica())
 	}
-	return m.put(replicas...)
+	return m.put(ctx, replicas...)
+}
+
+func (m *ReplicaManager) MoveReplica(ctx context.Context, dstRGName string, toMove []*Replica) error {
+	m.rwmutex.Lock()
+	defer m.rwmutex.Unlock()
+	replicas := make([]*Replica, 0, len(toMove))
+	replicaIDs := make([]int64, 0)
+	for _, replica := range toMove {
+		mutableReplica := replica.CopyForWrite()
+		mutableReplica.SetResourceGroup(dstRGName)
+		replicas = append(replicas, mutableReplica.IntoReplica())
+		replicaIDs = append(replicaIDs, replica.GetID())
+	}
+	log.Info("move replicas to resource group", zap.String("dstRGName", dstRGName), zap.Int64s("replicas", replicaIDs))
+	return m.put(ctx, replicas...)
 }
 
 // getSrcReplicasAndCheckIfTransferable checks if the collection can be transfer from srcRGName to dstRGName.
 func (m *ReplicaManager) getSrcReplicasAndCheckIfTransferable(collectionID typeutil.UniqueID, srcRGName string, replicaNum int) ([]*Replica, error) {
 	// Check if collection is loaded.
-	if m.collIDToReplicaIDs[collectionID] == nil {
+	if m.coll2Replicas[collectionID] == nil {
 		return nil, merr.WrapErrParameterInvalid(
 			"Collection not loaded",
 			fmt.Sprintf("collectionID %d", collectionID),
@@ -228,42 +276,78 @@ func (m *ReplicaManager) getSrcReplicasAndCheckIfTransferable(collectionID typeu
 
 // RemoveCollection removes replicas of given collection,
 // returns error if failed to remove replica from KV
-func (m *ReplicaManager) RemoveCollection(collectionID typeutil.UniqueID) error {
+func (m *ReplicaManager) RemoveCollection(ctx context.Context, collectionID typeutil.UniqueID) error {
 	m.rwmutex.Lock()
 	defer m.rwmutex.Unlock()
 
-	err := m.catalog.ReleaseReplicas(collectionID)
+	err := m.catalog.ReleaseReplicas(ctx, collectionID)
 	if err != nil {
 		return err
 	}
-	// Remove all replica of collection and remove collection from collIDToReplicaIDs.
-	for replicaID := range m.collIDToReplicaIDs[collectionID] {
-		delete(m.replicas, replicaID)
+
+	if collReplicas, ok := m.coll2Replicas[collectionID]; ok {
+		// Remove all replica of collection and remove collection from collIDToReplicaIDs.
+		for _, replica := range collReplicas.replicas {
+			metrics.QueryCoordResourceGroupReplicaTotal.WithLabelValues(replica.GetResourceGroup()).Dec()
+			metrics.QueryCoordReplicaRONodeTotal.Add(-float64(replica.RONodesCount()))
+			delete(m.replicas, replica.GetID())
+		}
+		delete(m.coll2Replicas, collectionID)
 	}
-	delete(m.collIDToReplicaIDs, collectionID)
 	return nil
 }
 
-func (m *ReplicaManager) GetByCollection(collectionID typeutil.UniqueID) []*Replica {
-	m.rwmutex.RLock()
-	defer m.rwmutex.RUnlock()
+func (m *ReplicaManager) RemoveReplicas(ctx context.Context, collectionID typeutil.UniqueID, replicas ...typeutil.UniqueID) error {
+	m.rwmutex.Lock()
+	defer m.rwmutex.Unlock()
 
-	replicas := make([]*Replica, 0)
-	if m.collIDToReplicaIDs[collectionID] != nil {
-		for replicaID := range m.collIDToReplicaIDs[collectionID] {
-			replicas = append(replicas, m.replicas[replicaID])
-		}
-	}
-	return replicas
+	log.Info("release replicas", zap.Int64("collectionID", collectionID), zap.Int64s("replicas", replicas))
+
+	return m.removeReplicas(ctx, collectionID, replicas...)
 }
 
-func (m *ReplicaManager) GetByCollectionAndNode(collectionID, nodeID typeutil.UniqueID) *Replica {
+func (m *ReplicaManager) removeReplicas(ctx context.Context, collectionID typeutil.UniqueID, replicas ...typeutil.UniqueID) error {
+	err := m.catalog.ReleaseReplica(ctx, collectionID, replicas...)
+	if err != nil {
+		return err
+	}
+
+	for _, replicaID := range replicas {
+		if replica, ok := m.replicas[replicaID]; ok {
+			metrics.QueryCoordResourceGroupReplicaTotal.WithLabelValues(replica.GetResourceGroup()).Dec()
+			metrics.QueryCoordReplicaRONodeTotal.Add(float64(-replica.RONodesCount()))
+			delete(m.replicas, replicaID)
+		}
+	}
+
+	if m.coll2Replicas[collectionID].removeReplicas(replicas...) {
+		delete(m.coll2Replicas, collectionID)
+	}
+
+	return nil
+}
+
+func (m *ReplicaManager) GetByCollection(ctx context.Context, collectionID typeutil.UniqueID) []*Replica {
+	m.rwmutex.RLock()
+	defer m.rwmutex.RUnlock()
+	return m.getByCollection(collectionID)
+}
+
+func (m *ReplicaManager) getByCollection(collectionID typeutil.UniqueID) []*Replica {
+	collReplicas, ok := m.coll2Replicas[collectionID]
+	if !ok {
+		return nil
+	}
+
+	return collReplicas.replicas
+}
+
+func (m *ReplicaManager) GetByCollectionAndNode(ctx context.Context, collectionID, nodeID typeutil.UniqueID) *Replica {
 	m.rwmutex.RLock()
 	defer m.rwmutex.RUnlock()
 
-	if m.collIDToReplicaIDs[collectionID] != nil {
-		for replicaID := range m.collIDToReplicaIDs[collectionID] {
-			replica := m.replicas[replicaID]
+	if m.coll2Replicas[collectionID] != nil {
+		for _, replica := range m.coll2Replicas[collectionID].replicas {
 			if replica.Contains(nodeID) {
 				return replica
 			}
@@ -273,7 +357,7 @@ func (m *ReplicaManager) GetByCollectionAndNode(collectionID, nodeID typeutil.Un
 	return nil
 }
 
-func (m *ReplicaManager) GetByNode(nodeID typeutil.UniqueID) []*Replica {
+func (m *ReplicaManager) GetByNode(ctx context.Context, nodeID typeutil.UniqueID) []*Replica {
 	m.rwmutex.RLock()
 	defer m.rwmutex.RUnlock()
 
@@ -288,22 +372,17 @@ func (m *ReplicaManager) GetByNode(nodeID typeutil.UniqueID) []*Replica {
 }
 
 func (m *ReplicaManager) getByCollectionAndRG(collectionID int64, rgName string) []*Replica {
-	replicaIDs, ok := m.collIDToReplicaIDs[collectionID]
+	collReplicas, ok := m.coll2Replicas[collectionID]
 	if !ok {
-		return make([]*Replica, 0)
+		return nil
 	}
 
-	ret := make([]*Replica, 0)
-	replicaIDs.Range(func(replicaID typeutil.UniqueID) bool {
-		if m.replicas[replicaID].GetResourceGroup() == rgName {
-			ret = append(ret, m.replicas[replicaID])
-		}
-		return true
+	return lo.Filter(collReplicas.replicas, func(replica *Replica, _ int) bool {
+		return replica.GetResourceGroup() == rgName
 	})
-	return ret
 }
 
-func (m *ReplicaManager) GetByResourceGroup(rgName string) []*Replica {
+func (m *ReplicaManager) GetByResourceGroup(ctx context.Context, rgName string) []*Replica {
 	m.rwmutex.RLock()
 	defer m.rwmutex.RUnlock()
 
@@ -322,7 +401,7 @@ func (m *ReplicaManager) GetByResourceGroup(rgName string) []*Replica {
 // 1. Move the rw nodes to ro nodes if they are not in related resource group.
 // 2. Add new incoming nodes into the replica if they are not in-used by other replicas of same collection.
 // 3. replicas in same resource group will shared the nodes in resource group fairly.
-func (m *ReplicaManager) RecoverNodesInCollection(collectionID typeutil.UniqueID, rgs map[string]typeutil.UniqueSet) error {
+func (m *ReplicaManager) RecoverNodesInCollection(ctx context.Context, collectionID typeutil.UniqueID, rgs map[string]typeutil.UniqueSet) error {
 	if err := m.validateResourceGroups(rgs); err != nil {
 		return err
 	}
@@ -363,7 +442,7 @@ func (m *ReplicaManager) RecoverNodesInCollection(collectionID typeutil.UniqueID
 			modifiedReplicas = append(modifiedReplicas, mutableReplica.IntoReplica())
 		})
 	})
-	return m.put(modifiedReplicas...)
+	return m.put(ctx, modifiedReplicas...)
 }
 
 // validateResourceGroups checks if the resource groups are valid.
@@ -384,17 +463,16 @@ func (m *ReplicaManager) validateResourceGroups(rgs map[string]typeutil.UniqueSe
 // getCollectionAssignmentHelper checks if the collection is recoverable and group replicas by resource group.
 func (m *ReplicaManager) getCollectionAssignmentHelper(collectionID typeutil.UniqueID, rgs map[string]typeutil.UniqueSet) (*collectionAssignmentHelper, error) {
 	// check if the collection is exist.
-	replicaIDs, ok := m.collIDToReplicaIDs[collectionID]
+	collReplicas, ok := m.coll2Replicas[collectionID]
 	if !ok {
 		return nil, errors.Errorf("collection %d not loaded", collectionID)
 	}
 
 	rgToReplicas := make(map[string][]*Replica)
-	for replicaID := range replicaIDs {
-		replica := m.replicas[replicaID]
+	for _, replica := range collReplicas.replicas {
 		rgName := replica.GetResourceGroup()
 		if _, ok := rgs[rgName]; !ok {
-			return nil, errors.Errorf("lost resource group info, collectionID: %d, replicaID: %d, resourceGroup: %s", collectionID, replicaID, rgName)
+			return nil, errors.Errorf("lost resource group info, collectionID: %d, replicaID: %d, resourceGroup: %s", collectionID, replica.GetID(), rgName)
 		}
 		if _, ok := rgToReplicas[rgName]; !ok {
 			rgToReplicas[rgName] = make([]*Replica, 0)
@@ -405,7 +483,7 @@ func (m *ReplicaManager) getCollectionAssignmentHelper(collectionID typeutil.Uni
 }
 
 // RemoveNode removes the node from all replicas of given collection.
-func (m *ReplicaManager) RemoveNode(replicaID typeutil.UniqueID, nodes ...typeutil.UniqueID) error {
+func (m *ReplicaManager) RemoveNode(ctx context.Context, replicaID typeutil.UniqueID, nodes ...typeutil.UniqueID) error {
 	m.rwmutex.Lock()
 	defer m.rwmutex.Unlock()
 
@@ -416,11 +494,111 @@ func (m *ReplicaManager) RemoveNode(replicaID typeutil.UniqueID, nodes ...typeut
 
 	mutableReplica := replica.CopyForWrite()
 	mutableReplica.RemoveNode(nodes...) // ro -> unused
-	return m.put(mutableReplica.IntoReplica())
+	return m.put(ctx, mutableReplica.IntoReplica())
 }
 
-func (m *ReplicaManager) GetResourceGroupByCollection(collection typeutil.UniqueID) typeutil.Set[string] {
-	replicas := m.GetByCollection(collection)
+// RemoveSQNode removes the sq node from all replicas of given collection.
+func (m *ReplicaManager) RemoveSQNode(ctx context.Context, replicaID typeutil.UniqueID, nodes ...typeutil.UniqueID) error {
+	m.rwmutex.Lock()
+	defer m.rwmutex.Unlock()
+
+	replica, ok := m.replicas[replicaID]
+	if !ok {
+		return merr.WrapErrReplicaNotFound(replicaID)
+	}
+
+	mutableReplica := replica.CopyForWrite()
+	mutableReplica.RemoveSQNode(nodes...) // ro -> unused
+	return m.put(ctx, mutableReplica.IntoReplica())
+}
+
+func (m *ReplicaManager) GetResourceGroupByCollection(ctx context.Context, collection typeutil.UniqueID) typeutil.Set[string] {
+	replicas := m.GetByCollection(ctx, collection)
 	ret := typeutil.NewSet(lo.Map(replicas, func(r *Replica, _ int) string { return r.GetResourceGroup() })...)
 	return ret
+}
+
+// GetReplicasJSON returns a JSON representation of all replicas managed by the ReplicaManager.
+// It locks the ReplicaManager for reading, converts the replicas to their protobuf representation,
+// marshals them into a JSON string, and returns the result.
+// If an error occurs during marshaling, it logs a warning and returns an empty string.
+func (m *ReplicaManager) GetReplicasJSON(ctx context.Context, meta *Meta) string {
+	m.rwmutex.RLock()
+	defer m.rwmutex.RUnlock()
+
+	replicas := lo.MapToSlice(m.replicas, func(i typeutil.UniqueID, r *Replica) *metricsinfo.Replica {
+		channelTowRWNodes := make(map[string][]int64)
+		for k, v := range r.replicaPB.GetChannelNodeInfos() {
+			channelTowRWNodes[k] = v.GetRwNodes()
+		}
+
+		collectionInfo := meta.GetCollection(ctx, r.GetCollectionID())
+		dbID := util.InvalidDBID
+		if collectionInfo == nil {
+			log.Ctx(ctx).Warn("failed to get collection info", zap.Int64("collectionID", r.GetCollectionID()))
+		} else {
+			dbID = collectionInfo.GetDbID()
+		}
+
+		return &metricsinfo.Replica{
+			ID:               r.GetID(),
+			CollectionID:     r.GetCollectionID(),
+			DatabaseID:       dbID,
+			RWNodes:          r.GetNodes(),
+			ResourceGroup:    r.GetResourceGroup(),
+			RONodes:          r.GetRONodes(),
+			ChannelToRWNodes: channelTowRWNodes,
+		}
+	})
+	ret, err := json.Marshal(replicas)
+	if err != nil {
+		log.Warn("failed to marshal replicas", zap.Error(err))
+		return ""
+	}
+	return string(ret)
+}
+
+// RecoverSQNodesInCollection recovers all sq nodes in collection with latest node list.
+// Promise a node will be only assigned to one replica in same collection at same time.
+// 1. Move the rw nodes to ro nodes if current replica use too much sqn.
+// 2. Add new incoming nodes into the replica if they are not ro node of other replicas in same collection.
+// 3. replicas will shared the nodes in resource group fairly.
+func (m *ReplicaManager) RecoverSQNodesInCollection(ctx context.Context, collectionID int64, sqnNodeIDs typeutil.UniqueSet) error {
+	m.rwmutex.Lock()
+	defer m.rwmutex.Unlock()
+
+	collReplicas, ok := m.coll2Replicas[collectionID]
+	if !ok {
+		return errors.Errorf("collection %d not loaded", collectionID)
+	}
+
+	helper := newReplicaSQNAssignmentHelper(collReplicas.replicas, sqnNodeIDs)
+	helper.updateExpectedNodeCountForReplicas(len(sqnNodeIDs))
+
+	modifiedReplicas := make([]*Replica, 0)
+	// recover node by given sqn node list.
+	helper.RangeOverReplicas(func(assignment *replicaAssignmentInfo) {
+		roNodes := assignment.GetNewRONodes()
+		recoverableNodes, incomingNodeCount := assignment.GetRecoverNodesAndIncomingNodeCount()
+		// There may be not enough incoming nodes for current replica,
+		// Even we filtering the nodes that are used by other replica of same collection in other resource group,
+		// current replica's expected node may be still used by other replica of same collection in same resource group.
+		incomingNode := helper.AllocateIncomingNodes(incomingNodeCount)
+		if len(roNodes) == 0 && len(recoverableNodes) == 0 && len(incomingNode) == 0 {
+			// nothing to do.
+			return
+		}
+		mutableReplica := m.replicas[assignment.GetReplicaID()].CopyForWrite()
+		mutableReplica.AddROSQNode(roNodes...)          // rw -> ro
+		mutableReplica.AddRWSQNode(recoverableNodes...) // ro -> rw
+		mutableReplica.AddRWSQNode(incomingNode...)     // unused -> rw
+		log.Info(
+			"new replica recovery streaming query node found",
+			zap.Int64("replicaID", assignment.GetReplicaID()),
+			zap.Int64s("newRONodes", roNodes),
+			zap.Int64s("roToRWNodes", recoverableNodes),
+			zap.Int64s("newIncomingNodes", incomingNode))
+		modifiedReplicas = append(modifiedReplicas, mutableReplica.IntoReplica())
+	})
+	return m.put(ctx, modifiedReplicas...)
 }

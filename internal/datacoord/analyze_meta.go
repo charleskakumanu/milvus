@@ -21,13 +21,14 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/golang/protobuf/proto"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus/internal/metastore"
-	"github.com/milvus-io/milvus/internal/proto/indexpb"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/timerecord"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/workerpb"
+	"github.com/milvus-io/milvus/pkg/v2/util/timerecord"
 )
 
 type analyzeMeta struct {
@@ -95,12 +96,12 @@ func (m *analyzeMeta) AddAnalyzeTask(task *indexpb.AnalyzeTask) error {
 	return m.saveTask(task)
 }
 
-func (m *analyzeMeta) DropAnalyzeTask(taskID int64) error {
+func (m *analyzeMeta) DropAnalyzeTask(ctx context.Context, taskID int64) error {
 	m.Lock()
 	defer m.Unlock()
 
 	log.Info("drop analyze task", zap.Int64("taskID", taskID))
-	if err := m.catalog.DropAnalyzeTask(m.ctx, taskID); err != nil {
+	if err := m.catalog.DropAnalyzeTask(ctx, taskID); err != nil {
 		log.Warn("drop analyze task by catalog failed", zap.Int64("taskID", taskID),
 			zap.Error(err))
 		return err
@@ -110,7 +111,7 @@ func (m *analyzeMeta) DropAnalyzeTask(taskID int64) error {
 	return nil
 }
 
-func (m *analyzeMeta) UpdateVersion(taskID int64) error {
+func (m *analyzeMeta) UpdateVersion(taskID int64, nodeID int64) error {
 	m.Lock()
 	defer m.Unlock()
 
@@ -121,11 +122,13 @@ func (m *analyzeMeta) UpdateVersion(taskID int64) error {
 
 	cloneT := proto.Clone(t).(*indexpb.AnalyzeTask)
 	cloneT.Version++
-	log.Info("update task version", zap.Int64("taskID", taskID), zap.Int64("newVersion", cloneT.Version))
+	cloneT.NodeID = nodeID
+	log.Info("update task version", zap.Int64("taskID", taskID), zap.Int64("newVersion", cloneT.Version),
+		zap.Int64("nodeID", nodeID))
 	return m.saveTask(cloneT)
 }
 
-func (m *analyzeMeta) BuildingTask(taskID, nodeID int64) error {
+func (m *analyzeMeta) BuildingTask(taskID int64) error {
 	m.Lock()
 	defer m.Unlock()
 
@@ -135,14 +138,31 @@ func (m *analyzeMeta) BuildingTask(taskID, nodeID int64) error {
 	}
 
 	cloneT := proto.Clone(t).(*indexpb.AnalyzeTask)
-	cloneT.NodeID = nodeID
 	cloneT.State = indexpb.JobState_JobStateInProgress
-	log.Info("task will be building", zap.Int64("taskID", taskID), zap.Int64("nodeID", nodeID))
+	log.Info("task will be building", zap.Int64("taskID", taskID))
 
 	return m.saveTask(cloneT)
 }
 
-func (m *analyzeMeta) FinishTask(taskID int64, result *indexpb.AnalyzeResult) error {
+func (m *analyzeMeta) UpdateState(taskID int64, state indexpb.JobState, failReason string) error {
+	m.Lock()
+	defer m.Unlock()
+
+	t, ok := m.tasks[taskID]
+	if !ok {
+		return fmt.Errorf("there is no task with taskID: %d", taskID)
+	}
+
+	cloneT := proto.Clone(t).(*indexpb.AnalyzeTask)
+	cloneT.State = state
+	cloneT.FailReason = failReason
+	log.Info("update analyze task state", zap.Int64("taskID", taskID), zap.String("state", state.String()),
+		zap.String("failReason", failReason))
+
+	return m.saveTask(cloneT)
+}
+
+func (m *analyzeMeta) FinishTask(taskID int64, result *workerpb.AnalyzeResult) error {
 	m.Lock()
 	defer m.Unlock()
 

@@ -11,18 +11,15 @@
 
 #include <gtest/gtest.h>
 
-#include <iostream>
+#include <optional>
 #include <random>
 #include <string>
 #include <vector>
 #include "common/EasyAssert.h"
-#include "storage/prometheus_client.h"
 #include "storage/LocalChunkManagerSingleton.h"
 #include "storage/RemoteChunkManagerSingleton.h"
+#include "storage/Util.h"
 #include "storage/storage_c.h"
-
-#define private public
-#include "storage/ChunkCache.h"
 
 using namespace std;
 using namespace milvus;
@@ -39,21 +36,24 @@ get_azure_storage_config() {
         "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/"
         "K1SZFPTOtr/KBHBeksoGMGw==";
 
-    return CStorageConfig{endpoint,
-                          bucketName.c_str(),
-                          accessKey,
-                          accessValue,
-                          rootPath.c_str(),
-                          "remote",
-                          "azure",
-                          "",
-                          "error",
-                          "",
-                          false,
-                          "",
-                          false,
-                          false,
-                          30000};
+    return CStorageConfig{
+        endpoint,
+        bucketName.c_str(),
+        accessKey,
+        accessValue,
+        rootPath.c_str(),
+        "remote",
+        "azure",
+        "",
+        "error",
+        "",
+        false,
+        "",
+        false,
+        false,
+        30000,
+        "",
+    };
 }
 
 class StorageTest : public testing::Test {
@@ -94,65 +94,137 @@ TEST_F(StorageTest, GetLocalUsedSize) {
 
 TEST_F(StorageTest, InitRemoteChunkManagerSingleton) {
     CStorageConfig storageConfig = get_azure_storage_config();
-    InitRemoteChunkManagerSingleton(storageConfig);
+    auto status = InitRemoteChunkManagerSingleton(storageConfig);
+    EXPECT_STREQ(status.error_msg, "");
+    EXPECT_EQ(status.error_code, Success);
     auto rcm =
         RemoteChunkManagerSingleton::GetInstance().GetRemoteChunkManager();
     EXPECT_EQ(rcm->GetRootPath(), "/tmp/milvus/remote_data");
-}
-
-TEST_F(StorageTest, InitChunkCacheSingleton) {
 }
 
 TEST_F(StorageTest, CleanRemoteChunkManagerSingleton) {
     CleanRemoteChunkManagerSingleton();
 }
 
-vector<string>
-split(const string& str,
-      const string& delim) {  //将分割后的子字符串存储在vector中
-    vector<string> res;
-    if ("" == str)
-        return res;
-
-    string strs = str + delim;
-    size_t pos;
-    size_t size = strs.size();
-
-    for (int i = 0; i < size; ++i) {
-        pos = strs.find(delim, i);
-        if (pos < size) {
-            string s = strs.substr(i, pos - i);
-            res.push_back(s);
-            i = pos + delim.size() - 1;
-        }
+class StorageUtilTest : public testing::Test {
+ public:
+    StorageUtilTest() = default;
+    ~StorageUtilTest() {
     }
-    return res;
+    void
+    SetUp() override {
+    }
+};
+
+TEST_F(StorageUtilTest, CreateArrowScalarFromDefaultValue) {
+    {
+        FieldMeta field_without_defval(
+            FieldName("f"), FieldId(100), DataType::INT64, false, std::nullopt);
+        ASSERT_ANY_THROW(
+            CreateArrowScalarFromDefaultValue(field_without_defval));
+    }
+    {
+        DefaultValueType default_value;
+        default_value.set_int_data(10);
+        FieldMeta int_field(FieldName("f"),
+                            FieldId(100),
+                            DataType::INT32,
+                            false,
+                            default_value);
+        auto scalar = CreateArrowScalarFromDefaultValue(int_field);
+        ASSERT_TRUE(scalar->Equals(*arrow::MakeScalar(int32_t(10))));
+    }
+    {
+        DefaultValueType default_value;
+        default_value.set_long_data(10);
+        FieldMeta long_field(FieldName("f"),
+                             FieldId(100),
+                             DataType::INT64,
+                             false,
+                             default_value);
+        auto scalar = CreateArrowScalarFromDefaultValue(long_field);
+        ASSERT_TRUE(scalar->Equals(*arrow::MakeScalar(int64_t(10))));
+    }
+    {
+        DefaultValueType default_value;
+        default_value.set_float_data(1.0f);
+        FieldMeta float_field(FieldName("f"),
+                              FieldId(100),
+                              DataType::FLOAT,
+                              false,
+                              default_value);
+        auto scalar = CreateArrowScalarFromDefaultValue(float_field);
+        ASSERT_TRUE(scalar->ApproxEquals(*arrow::MakeScalar(1.0f)));
+    }
+    {
+        DefaultValueType default_value;
+        default_value.set_double_data(1.0f);
+        FieldMeta double_field(FieldName("f"),
+                               FieldId(100),
+                               DataType::DOUBLE,
+                               false,
+                               default_value);
+        auto scalar = CreateArrowScalarFromDefaultValue(double_field);
+        ASSERT_TRUE(scalar->ApproxEquals(arrow::DoubleScalar(1.0f)));
+    }
+    {
+        DefaultValueType default_value;
+        default_value.set_bool_data(true);
+        FieldMeta bool_field(
+            FieldName("f"), FieldId(100), DataType::BOOL, false, default_value);
+        auto scalar = CreateArrowScalarFromDefaultValue(bool_field);
+        ASSERT_TRUE(scalar->Equals(*arrow::MakeScalar(true)));
+    }
+    {
+        DefaultValueType default_value;
+        default_value.set_string_data("bar");
+        FieldMeta varchar_field(FieldName("f"),
+                                FieldId(100),
+                                DataType::VARCHAR,
+                                false,
+                                default_value);
+        auto scalar = CreateArrowScalarFromDefaultValue(varchar_field);
+        ASSERT_TRUE(scalar->Equals(*arrow::MakeScalar("bar")));
+    }
+    {
+        FieldMeta unsupport_field(
+            FieldName("f"), FieldId(100), DataType::JSON, false, std::nullopt);
+        ASSERT_ANY_THROW(CreateArrowScalarFromDefaultValue(unsupport_field));
+    }
 }
 
-TEST_F(StorageTest, GetStorageMetrics) {
-    auto metricsChars = GetStorageMetrics();
-    string helpPrefix = "# HELP ";
-    string familyName = "";
-    char* p;
-    const char* delim = "\n";
-    p = strtok(metricsChars, delim);
-    while (p) {
-        char* currentLine = p;
-        p = strtok(NULL, delim);
-        if (strncmp(currentLine, "# HELP ", 7) == 0) {
-            familyName = "";
-            continue;
-        } else if (strncmp(currentLine, "# TYPE ", 7) == 0) {
-            std::vector<string> res = split(currentLine, " ");
-            EXPECT_EQ(4, res.size());
-            familyName = res[2];
-            EXPECT_EQ(true,
-                      res[3] == "gauge" || res[3] == "counter" ||
-                          res[3] == "histogram");
-            continue;
-        }
-        EXPECT_EQ(true, familyName.length() > 0);
-        EXPECT_EQ(
-            0, strncmp(currentLine, familyName.c_str(), familyName.length()));
+TEST_F(StorageUtilTest, TestInitArrowFileSystem) {
+    // Test local storage configuration
+    {
+        StorageConfig local_config;
+        local_config.storage_type = "local";
+        local_config.root_path = "/tmp/milvus/local_data";
+
+        auto fs = InitArrowFileSystem(local_config);
+        ASSERT_NE(fs, nullptr);
+    }
+
+    // Test remote storage configuration (Azure)
+    {
+        StorageConfig remote_config;
+        remote_config.storage_type = "remote";
+        remote_config.cloud_provider = "azure";
+        remote_config.address = "core.windows.net";
+        remote_config.bucket_name = "test-bucket";
+        remote_config.access_key_id = "test-access-key";
+        remote_config.access_key_value = "test-access-value";
+        remote_config.root_path = "/tmp/milvus/remote_data";
+        remote_config.iam_endpoint = "";
+        remote_config.log_level = "error";
+        remote_config.region = "";
+        remote_config.useSSL = false;
+        remote_config.sslCACert = "";
+        remote_config.useIAM = false;
+        remote_config.useVirtualHost = false;
+        remote_config.requestTimeoutMs = 30000;
+        remote_config.gcp_credential_json = "";
+
+        auto fs = InitArrowFileSystem(remote_config);
+        ASSERT_NE(fs, nullptr);
     }
 }

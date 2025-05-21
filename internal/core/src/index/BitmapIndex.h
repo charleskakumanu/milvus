@@ -21,14 +21,19 @@
 #include <string>
 #include <roaring/roaring.hh>
 
+#include "common/RegexQuery.h"
 #include "index/ScalarIndex.h"
 #include "storage/FileManager.h"
 #include "storage/DiskFileManagerImpl.h"
 #include "storage/MemFileManagerImpl.h"
-#include "storage/space.h"
 
 namespace milvus {
 namespace index {
+
+struct BitmapInfo {
+    size_t offset_;
+    size_t size_;
+};
 
 enum class BitmapIndexBuildMode {
     ROARING,
@@ -46,11 +51,11 @@ class BitmapIndex : public ScalarIndex<T> {
         const storage::FileManagerContext& file_manager_context =
             storage::FileManagerContext());
 
-    explicit BitmapIndex(
-        const storage::FileManagerContext& file_manager_context,
-        std::shared_ptr<milvus_storage::Space> space);
-
-    ~BitmapIndex() override = default;
+    ~BitmapIndex() {
+        if (is_mmap_) {
+            UnmapIndexData();
+        }
+    }
 
     BinarySet
     Serialize(const Config& config) override;
@@ -60,9 +65,6 @@ class BitmapIndex : public ScalarIndex<T> {
 
     void
     Load(milvus::tracer::TraceContext ctx, const Config& config = {}) override;
-
-    void
-    LoadV2(const Config& config = {}) override;
 
     int64_t
     Count() override {
@@ -75,7 +77,7 @@ class BitmapIndex : public ScalarIndex<T> {
     }
 
     void
-    Build(size_t n, const T* values) override;
+    Build(size_t n, const T* values, const bool* valid_data = nullptr) override;
 
     void
     Build(const Config& config = {}) override;
@@ -83,14 +85,17 @@ class BitmapIndex : public ScalarIndex<T> {
     void
     BuildWithFieldData(const std::vector<FieldDataPtr>& datas) override;
 
-    void
-    BuildV2(const Config& config = {}) override;
-
     const TargetBitmap
     In(size_t n, const T* values) override;
 
     const TargetBitmap
     NotIn(size_t n, const T* values) override;
+
+    const TargetBitmap
+    IsNull() override;
+
+    const TargetBitmap
+    IsNotNull() override;
 
     const TargetBitmap
     Range(T value, OpType op) override;
@@ -101,7 +106,7 @@ class BitmapIndex : public ScalarIndex<T> {
           T upper_bound_value,
           bool ub_inclusive) override;
 
-    T
+    std::optional<T>
     Reverse_Lookup(size_t offset) const override;
 
     int64_t
@@ -109,14 +114,14 @@ class BitmapIndex : public ScalarIndex<T> {
         return Count();
     }
 
-    BinarySet
+    IndexStatsPtr
     Upload(const Config& config = {}) override;
-
-    BinarySet
-    UploadV2(const Config& config = {}) override;
 
     const bool
     HasRawData() const override {
+        if (schema_.data_type() == proto::schema::DataType::Array) {
+            return false;
+        }
         return true;
     }
 
@@ -124,9 +129,52 @@ class BitmapIndex : public ScalarIndex<T> {
     LoadWithoutAssemble(const BinarySet& binary_set,
                         const Config& config) override;
 
+    const TargetBitmap
+    Query(const DatasetPtr& dataset) override;
+
+    bool
+    SupportPatternMatch() const override {
+        return SupportRegexQuery();
+    }
+
+    const TargetBitmap
+    PatternMatch(const std::string& pattern, proto::plan::OpType op) override {
+        switch (op) {
+            case proto::plan::OpType::PrefixMatch:
+            case proto::plan::OpType::PostfixMatch:
+            case proto::plan::OpType::InnerMatch: {
+                auto dataset = std::make_unique<Dataset>();
+                dataset->Set(milvus::index::OPERATOR_TYPE, op);
+                dataset->Set(milvus::index::MATCH_VALUE, pattern);
+                return Query(std::move(dataset));
+            }
+            case proto::plan::OpType::Match: {
+                PatternMatchTranslator translator;
+                auto regex_pattern = translator(pattern);
+                return RegexQuery(regex_pattern);
+            }
+            default:
+                PanicInfo(ErrorCode::OpTypeInvalid,
+                          "not supported op type: {} for index PatterMatch",
+                          op);
+        }
+    }
+
+    bool
+    SupportRegexQuery() const override {
+        return std::is_same_v<T, std::string>;
+    }
+
+    const TargetBitmap
+    RegexQuery(const std::string& regex_pattern) override;
+
  public:
     int64_t
     Cardinality() {
+        if (is_mmap_) {
+            return bitmap_info_map_.size();
+        }
+
         if (build_mode_ == BitmapIndexBuildMode::ROARING) {
             return data_.size();
         } else {
@@ -153,11 +201,20 @@ class BitmapIndex : public ScalarIndex<T> {
     std::pair<size_t, size_t>
     DeserializeIndexMeta(const uint8_t* data_ptr, size_t data_size);
 
+    T
+    ParseKey(const uint8_t** ptr);
+
     void
     DeserializeIndexData(const uint8_t* data_ptr, size_t index_length);
 
     void
-    ChooseIndexBuildMode();
+    BuildOffsetCache();
+
+    T
+    Reverse_Lookup_InCache(size_t idx) const;
+
+    void
+    ChooseIndexLoadMode(int64_t index_length);
 
     bool
     ShouldSkip(const T lower_value, const T upper_value, const OpType op);
@@ -172,6 +229,9 @@ class BitmapIndex : public ScalarIndex<T> {
     RangeForBitset(T value, OpType op);
 
     TargetBitmap
+    RangeForMmap(T value, OpType op);
+
+    TargetBitmap
     RangeForRoaring(T lower_bound_value,
                     bool lb_inclusive,
                     T upper_bound_value,
@@ -183,16 +243,43 @@ class BitmapIndex : public ScalarIndex<T> {
                    T upper_bound_value,
                    bool ub_inclusive);
 
+    TargetBitmap
+    RangeForMmap(T lower_bound_value,
+                 bool lb_inclusive,
+                 T upper_bound_value,
+                 bool ub_inclusive);
+
+    void
+    MMapIndexData(const std::string& filepath,
+                  const uint8_t* data,
+                  size_t data_size,
+                  size_t index_length);
+
+    void
+    UnmapIndexData();
+
  public:
     bool is_built_{false};
-    Config config_;
     BitmapIndexBuildMode build_mode_;
     std::map<T, roaring::Roaring> data_;
     std::map<T, TargetBitmap> bitsets_;
+    bool is_mmap_{false};
+    char* mmap_data_;
+    int64_t mmap_size_;
+    std::map<T, roaring::Roaring> bitmap_info_map_;
     size_t total_num_rows_{0};
     proto::schema::FieldSchema schema_;
+    bool use_offset_cache_{false};
+    std::vector<typename std::map<T, roaring::Roaring>::iterator>
+        data_offsets_cache_;
+    std::vector<typename std::map<T, TargetBitmap>::iterator>
+        bitsets_offsets_cache_;
+    std::vector<typename std::map<T, roaring::Roaring>::iterator>
+        mmap_offsets_cache_;
     std::shared_ptr<storage::MemFileManagerImpl> file_manager_;
-    std::shared_ptr<milvus_storage::Space> space_;
+
+    // generate valid_bitset to speed up NotIn and IsNull and IsNotNull operate
+    TargetBitmap valid_bitset_;
 };
 
 }  // namespace index

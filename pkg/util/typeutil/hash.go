@@ -19,6 +19,7 @@ package typeutil
 import (
 	"fmt"
 	"hash/crc32"
+	"math"
 	"strconv"
 	"strings"
 	"unsafe"
@@ -27,7 +28,7 @@ import (
 	"github.com/spaolacci/murmur3"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/pkg/common"
+	"github.com/milvus-io/milvus/pkg/v2/common"
 )
 
 const substringLengthForCRC = 100
@@ -73,6 +74,16 @@ func HashString2Uint32(v string) uint32 {
 	}
 
 	return crc32.ChecksumIEEE([]byte(subString))
+}
+
+// HashString2LessUint32 hashing a string to uint32 but less than uint32 max
+func HashString2LessUint32(v string) uint32 {
+	subString := v
+	if len(v) > substringLengthForCRC {
+		subString = v[:substringLengthForCRC]
+	}
+
+	return crc32.ChecksumIEEE([]byte(subString)) % math.MaxUint32
 }
 
 // HashPK2Channels hash primary keys to channels

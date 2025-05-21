@@ -1,13 +1,18 @@
-// Copyright (C) 2019-2020 Zilliz. All rights reserved.
-//
-// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
 // with the License. You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed under the License
-// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
-// or implied. See the License for the specific language governing permissions and limitations under the License.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package paramtable
 
@@ -17,7 +22,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 func TestGrpcServerParams(t *testing.T) {
@@ -62,8 +67,7 @@ func TestGrpcServerParams(t *testing.T) {
 	base.Save("grpc.serverMaxSendSize", "a")
 	assert.Equal(t, serverConfig.ServerMaxSendSize.GetAsInt(), DefaultServerMaxSendSize)
 
-	base.Save(serverConfig.GracefulStopTimeout.Key, "1")
-	assert.Equal(t, serverConfig.GracefulStopTimeout.GetAsInt(), 1)
+	assert.Equal(t, serverConfig.GracefulStopTimeout.GetAsInt(), 3)
 }
 
 func TestGrpcClientParams(t *testing.T) {
@@ -172,4 +176,22 @@ func TestGrpcClientParams(t *testing.T) {
 	assert.Equal(t, clientConfig.ServerPemPath.GetValue(), "/pem")
 	assert.Equal(t, clientConfig.ServerKeyPath.GetValue(), "/key")
 	assert.Equal(t, clientConfig.CaPemPath.GetValue(), "/ca")
+}
+
+func TestInternalTLSParams(t *testing.T) {
+	base := ComponentParam{}
+	base.Init(NewBaseTable(SkipRemote(true)))
+	var internalTLSCfg InternalTLSConfig
+	internalTLSCfg.Init(base.baseTable)
+
+	base.Save("common.security.internalTlsEnabled", "true")
+	base.Save("internaltls.serverPemPath", "/pem")
+	base.Save("internaltls.serverKeyPath", "/key")
+	base.Save("internaltls.caPemPath", "/ca")
+	base.Save("internaltls.sni", "localhost")
+	assert.Equal(t, internalTLSCfg.InternalTLSEnabled.GetAsBool(), true)
+	assert.Equal(t, internalTLSCfg.InternalTLSServerPemPath.GetValue(), "/pem")
+	assert.Equal(t, internalTLSCfg.InternalTLSServerKeyPath.GetValue(), "/key")
+	assert.Equal(t, internalTLSCfg.InternalTLSCaPemPath.GetValue(), "/ca")
+	assert.Equal(t, internalTLSCfg.InternalTLSSNI.GetValue(), "localhost")
 }

@@ -18,7 +18,8 @@
 #include "common/SystemProperty.h"
 #include "common/Tracer.h"
 #include "common/Types.h"
-#include "query/generated/ExecPlanNodeVisitor.h"
+#include "monitor/prometheus_client.h"
+#include "query/ExecPlanNodeVisitor.h"
 
 namespace milvus::segcore {
 
@@ -56,10 +57,24 @@ SegmentInternalInterface::FillTargetEntry(const query::Plan* plan,
     AssertInfo(results.seg_offsets_.size() == size,
                "Size of result distances is not equal to size of ids");
 
+    std::unique_ptr<DataArray> field_data;
     // fill other entries except primary key by result_offset
     for (auto field_id : plan->target_entries_) {
-        auto field_data =
-            bulk_subscript(field_id, results.seg_offsets_.data(), size);
+        auto& field_meta = plan->schema_[field_id];
+        if (plan->schema_.get_dynamic_field_id().has_value() &&
+            plan->schema_.get_dynamic_field_id().value() == field_id &&
+            !plan->target_dynamic_fields_.empty()) {
+            auto& target_dynamic_fields = plan->target_dynamic_fields_;
+            field_data = bulk_subscript(field_id,
+                                        results.seg_offsets_.data(),
+                                        size,
+                                        target_dynamic_fields);
+        } else if (!is_field_exist(field_id)) {
+            field_data = bulk_subscript_not_exist_field(field_meta, size);
+        } else {
+            field_data =
+                bulk_subscript(field_id, results.seg_offsets_.data(), size);
+        }
         results.output_fields_data_[field_id] = std::move(field_data);
     }
 }
@@ -68,11 +83,13 @@ std::unique_ptr<SearchResult>
 SegmentInternalInterface::Search(
     const query::Plan* plan,
     const query::PlaceholderGroup* placeholder_group,
-    Timestamp timestamp) const {
+    Timestamp timestamp,
+    int32_t consistency_level) const {
     std::shared_lock lck(mutex_);
     milvus::tracer::AddEvent("obtained_segment_lock_mutex");
     check_search(plan);
-    query::ExecPlanNodeVisitor visitor(*this, timestamp, placeholder_group);
+    query::ExecPlanNodeVisitor visitor(
+        *this, timestamp, placeholder_group, consistency_level);
     auto results = std::make_unique<SearchResult>();
     *results = visitor.get_moved_result(*plan->plan_node_);
     results->segment_ = (void*)this;
@@ -84,11 +101,12 @@ SegmentInternalInterface::Retrieve(tracer::TraceContext* trace_ctx,
                                    const query::RetrievePlan* plan,
                                    Timestamp timestamp,
                                    int64_t limit_size,
-                                   bool ignore_non_pk) const {
+                                   bool ignore_non_pk,
+                                   int32_t consistency_level) const {
     std::shared_lock lck(mutex_);
-    tracer::AutoSpan span("Retrieve", trace_ctx, false);
+    tracer::AutoSpan span("Retrieve", tracer::GetRootSpan());
     auto results = std::make_unique<proto::segcore::RetrieveResults>();
-    query::ExecPlanNodeVisitor visitor(*this, timestamp);
+    query::ExecPlanNodeVisitor visitor(*this, timestamp, consistency_level);
     auto retrieve_results = visitor.get_retrieve_result(*plan->plan_node_);
     retrieve_results.segment_ = (void*)this;
     results->set_has_more_result(retrieve_results.has_more_result);
@@ -114,6 +132,9 @@ SegmentInternalInterface::Retrieve(tracer::TraceContext* trace_ctx,
 
     results->mutable_offset()->Add(retrieve_results.result_offsets_.begin(),
                                    retrieve_results.result_offsets_.end());
+
+    std::chrono::high_resolution_clock::time_point get_target_entry_start =
+        std::chrono::high_resolution_clock::now();
     FillTargetEntry(trace_ctx,
                     plan,
                     results,
@@ -121,6 +142,13 @@ SegmentInternalInterface::Retrieve(tracer::TraceContext* trace_ctx,
                     retrieve_results.result_offsets_.size(),
                     ignore_non_pk,
                     true);
+    std::chrono::high_resolution_clock::time_point get_target_entry_end =
+        std::chrono::high_resolution_clock::now();
+    double get_entry_cost = std::chrono::duration<double, std::micro>(
+                                get_target_entry_end - get_target_entry_start)
+                                .count();
+    monitor::internal_core_retrieve_get_target_entry_latency.Observe(
+        get_entry_cost / 1000);
     return results;
 }
 
@@ -133,7 +161,7 @@ SegmentInternalInterface::FillTargetEntry(
     int64_t size,
     bool ignore_non_pk,
     bool fill_ids) const {
-    tracer::AutoSpan span("FillTargetEntry", trace_ctx, false);
+    tracer::AutoSpan span("FillTargetEntry", tracer::GetRootSpan());
 
     auto fields_data = results->mutable_fields_data();
     auto ids = results->mutable_ids();
@@ -167,9 +195,22 @@ SegmentInternalInterface::FillTargetEntry(
             continue;
         }
 
+        if (plan->schema_.get_dynamic_field_id().has_value() &&
+            plan->schema_.get_dynamic_field_id().value() == field_id &&
+            !plan->target_dynamic_fields_.empty()) {
+            auto& target_dynamic_fields = plan->target_dynamic_fields_;
+            auto col =
+                bulk_subscript(field_id, offsets, size, target_dynamic_fields);
+            fields_data->AddAllocated(col.release());
+            continue;
+        }
+        std::unique_ptr<DataArray> col;
         auto& field_meta = plan->schema_[field_id];
-
-        auto col = bulk_subscript(field_id, offsets, size);
+        if (!is_field_exist(field_id)) {
+            col = std::move(bulk_subscript_not_exist_field(field_meta, size));
+        } else {
+            col = bulk_subscript(field_id, offsets, size);
+        }
         if (field_meta.get_data_type() == DataType::ARRAY) {
             col->mutable_scalars()->mutable_array_data()->set_element_type(
                 proto::schema::DataType(field_meta.get_element_type()));
@@ -219,9 +260,18 @@ SegmentInternalInterface::Retrieve(tracer::TraceContext* trace_ctx,
                                    const int64_t* offsets,
                                    int64_t size) const {
     std::shared_lock lck(mutex_);
-    tracer::AutoSpan span("RetrieveByOffsets", trace_ctx, false);
+    tracer::AutoSpan span("RetrieveByOffsets", tracer::GetRootSpan());
     auto results = std::make_unique<proto::segcore::RetrieveResults>();
+    std::chrono::high_resolution_clock::time_point get_target_entry_start =
+        std::chrono::high_resolution_clock::now();
     FillTargetEntry(trace_ctx, Plan, results, offsets, size, false, false);
+    std::chrono::high_resolution_clock::time_point get_target_entry_end =
+        std::chrono::high_resolution_clock::now();
+    double get_entry_cost = std::chrono::duration<double, std::micro>(
+                                get_target_entry_end - get_target_entry_start)
+                                .count();
+    monitor::internal_core_retrieve_get_target_entry_latency.Observe(
+        get_entry_cost / 1000);
     return results;
 }
 
@@ -236,8 +286,17 @@ SegmentInternalInterface::get_real_count() const {
 #endif
     auto plan = std::make_unique<query::RetrievePlan>(get_schema());
     plan->plan_node_ = std::make_unique<query::RetrievePlanNode>();
+    milvus::plan::PlanNodePtr plannode;
+    std::vector<milvus::plan::PlanNodePtr> sources;
+    plannode = std::make_shared<milvus::plan::MvccNode>(
+        milvus::plan::GetNextPlanNodeId());
+    sources = std::vector<milvus::plan::PlanNodePtr>{plannode};
+    plannode = std::make_shared<milvus::plan::CountNode>(
+        milvus::plan::GetNextPlanNodeId(), sources);
+    plan->plan_node_->plannodes_ = plannode;
     plan->plan_node_->is_count_ = true;
-    auto res = Retrieve(nullptr, plan.get(), MAX_TIMESTAMP, INT64_MAX, false);
+    auto res =
+        Retrieve(nullptr, plan.get(), MAX_TIMESTAMP, INT64_MAX, false, 0);
     AssertInfo(res->fields_data().size() == 1,
                "count result should only have one column");
     AssertInfo(res->fields_data()[0].has_scalars(),
@@ -352,21 +411,123 @@ SegmentInternalInterface::GetSkipIndex() const {
     return skip_index_;
 }
 
-void
-SegmentInternalInterface::LoadPrimitiveSkipIndex(milvus::FieldId field_id,
-                                                 int64_t chunk_id,
-                                                 milvus::DataType data_type,
-                                                 const void* chunk_data,
-                                                 int64_t count) {
-    skip_index_.LoadPrimitive(field_id, chunk_id, data_type, chunk_data, count);
+index::TextMatchIndex*
+SegmentInternalInterface::GetTextIndex(FieldId field_id) const {
+    std::shared_lock lock(mutex_);
+    auto iter = text_indexes_.find(field_id);
+    if (iter == text_indexes_.end()) {
+        throw SegcoreError(
+            ErrorCode::TextIndexNotFound,
+            fmt::format("text index not found for field {}", field_id.get()));
+    }
+    return iter->second.get();
 }
 
-void
-SegmentInternalInterface::LoadStringSkipIndex(
-    milvus::FieldId field_id,
-    int64_t chunk_id,
-    const milvus::VariableColumn<std::string>& var_column) {
-    skip_index_.LoadString(field_id, chunk_id, var_column);
+std::unique_ptr<DataArray>
+SegmentInternalInterface::bulk_subscript_not_exist_field(
+    const milvus::FieldMeta& field_meta, int64_t count) const {
+    auto data_type = field_meta.get_data_type();
+    if (IsVectorDataType(data_type)) {
+        PanicInfo(DataTypeInvalid,
+                  fmt::format("unsupported added field type {}",
+                              field_meta.get_data_type()));
+    }
+    auto result = CreateScalarDataArray(count, field_meta);
+    if (field_meta.default_value().has_value()) {
+        auto res = result->mutable_valid_data()->mutable_data();
+        for (int64_t i = 0; i < count; ++i) {
+            res[i] = true;
+        }
+        switch (field_meta.get_data_type()) {
+            case DataType::BOOL: {
+                auto data_ptr = result->mutable_scalars()
+                                    ->mutable_bool_data()
+                                    ->mutable_data()
+                                    ->mutable_data();
+
+                for (int64_t i = 0; i < count; ++i) {
+                    data_ptr[i] = field_meta.default_value()->bool_data();
+                }
+                break;
+            }
+            case DataType::INT8:
+            case DataType::INT16:
+            case DataType::INT32: {
+                auto data_ptr = result->mutable_scalars()
+                                    ->mutable_int_data()
+                                    ->mutable_data()
+                                    ->mutable_data();
+
+                for (int64_t i = 0; i < count; ++i) {
+                    data_ptr[i] = field_meta.default_value()->int_data();
+                }
+                break;
+            }
+            case DataType::INT64: {
+                auto data_ptr = result->mutable_scalars()
+                                    ->mutable_long_data()
+                                    ->mutable_data()
+                                    ->mutable_data();
+
+                for (int64_t i = 0; i < count; ++i) {
+                    data_ptr[i] = field_meta.default_value()->long_data();
+                }
+                break;
+            }
+            case DataType::FLOAT: {
+                auto data_ptr = result->mutable_scalars()
+                                    ->mutable_float_data()
+                                    ->mutable_data()
+                                    ->mutable_data();
+
+                for (int64_t i = 0; i < count; ++i) {
+                    data_ptr[i] = field_meta.default_value()->float_data();
+                }
+                break;
+            }
+            case DataType::DOUBLE: {
+                auto data_ptr = result->mutable_scalars()
+                                    ->mutable_double_data()
+                                    ->mutable_data()
+                                    ->mutable_data();
+
+                for (int64_t i = 0; i < count; ++i) {
+                    data_ptr[i] = field_meta.default_value()->double_data();
+                }
+                break;
+            }
+            case DataType::VARCHAR: {
+                auto data_ptr = result->mutable_scalars()
+                                    ->mutable_string_data()
+                                    ->mutable_data();
+
+                for (int64_t i = 0; i < count; ++i) {
+                    data_ptr->at(i) = field_meta.default_value()->string_data();
+                }
+                break;
+            }
+            default: {
+                PanicInfo(DataTypeInvalid,
+                          fmt::format("unsupported default value type {}",
+                                      field_meta.get_data_type()));
+            }
+        }
+        return result;
+    };
+    for (int64_t i = 0; i < count; ++i) {
+        auto res = result->mutable_valid_data()->mutable_data();
+        res[i] = false;
+    }
+    return result;
 }
 
+index::JsonKeyStatsInvertedIndex*
+SegmentInternalInterface::GetJsonKeyIndex(FieldId field_id) const {
+    std::shared_lock lock(mutex_);
+    auto iter = json_indexes_.find(field_id);
+    if (iter == json_indexes_.end()) {
+        return nullptr;
+    }
+    return iter->second.get();
+}
 }  // namespace milvus::segcore

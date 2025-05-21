@@ -22,12 +22,14 @@ import (
 	"strconv"
 	"unsafe"
 
+	"github.com/cockroachdb/errors"
+
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/util/hardware"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/hardware"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 const (
@@ -54,6 +56,7 @@ var configableIndexParams = typeutil.NewSet[string]()
 
 func init() {
 	configableIndexParams.Insert(common.MmapEnabledKey)
+	configableIndexParams.Insert(common.IndexOffsetCacheEnabledKey)
 }
 
 func IsConfigableIndexParam(key string) bool {
@@ -176,11 +179,11 @@ func FillDiskIndexParams(params *paramtable.ComponentParam, indexParams map[stri
 		var ok bool
 		maxDegree, ok = indexParams[MaxDegreeKey]
 		if !ok {
-			return fmt.Errorf("index param max_degree not exist")
+			return errors.New("index param max_degree not exist")
 		}
 		searchListSize, ok = indexParams[SearchListSizeKey]
 		if !ok {
-			return fmt.Errorf("index param search_list_size not exist")
+			return errors.New("index param search_list_size not exist")
 		}
 		extraParams, err := NewBigDataExtraParamsFromJSON(params.AutoIndexConfig.ExtraParams.GetValue())
 		if err != nil {
@@ -223,13 +226,13 @@ func UpdateDiskIndexBuildParams(params *paramtable.ComponentParam, indexParams [
 	if params.AutoIndexConfig.Enable.GetAsBool() {
 		extraParams, err := NewBigDataExtraParamsFromJSON(params.AutoIndexConfig.ExtraParams.GetValue())
 		if err != nil {
-			return indexParams, fmt.Errorf("index param search_cache_budget_gb_ratio not exist in AutoIndex Config")
+			return indexParams, errors.New("index param search_cache_budget_gb_ratio not exist in AutoIndex Config")
 		}
 		searchCacheBudgetGBRatio = fmt.Sprintf("%f", extraParams.SearchCacheBudgetGBRatio)
 	} else {
 		paramVal, err := strconv.ParseFloat(params.CommonCfg.SearchCacheBudgetGBRatio.GetValue(), 64)
 		if err != nil {
-			return indexParams, fmt.Errorf("index param search_cache_budget_gb_ratio not exist in Config")
+			return indexParams, errors.New("index param search_cache_budget_gb_ratio not exist in Config")
 		}
 		searchCacheBudgetGBRatio = fmt.Sprintf("%f", paramVal)
 	}
@@ -268,7 +271,7 @@ func UpdateDiskIndexBuildParams(params *paramtable.ComponentParam, indexParams [
 func SetDiskIndexBuildParams(indexParams map[string]string, fieldDataSize int64) error {
 	pqCodeBudgetGBRatioStr, ok := indexParams[PQCodeBudgetRatioKey]
 	if !ok {
-		return fmt.Errorf("index param pqCodeBudgetGBRatio not exist")
+		return errors.New("index param pqCodeBudgetGBRatio not exist")
 	}
 	pqCodeBudgetGBRatio, err := strconv.ParseFloat(pqCodeBudgetGBRatioStr, 64)
 	if err != nil {
@@ -276,7 +279,7 @@ func SetDiskIndexBuildParams(indexParams map[string]string, fieldDataSize int64)
 	}
 	buildNumThreadsRatioStr, ok := indexParams[NumBuildThreadRatioKey]
 	if !ok {
-		return fmt.Errorf("index param buildNumThreadsRatio not exist")
+		return errors.New("index param buildNumThreadsRatio not exist")
 	}
 	buildNumThreadsRatio, err := strconv.ParseFloat(buildNumThreadsRatioStr, 64)
 	if err != nil {
@@ -298,13 +301,21 @@ func SetDiskIndexBuildParams(indexParams map[string]string, fieldDataSize int64)
 	return nil
 }
 
+func SetBitmapIndexLoadParams(params *paramtable.ComponentParam, indexParams map[string]string) {
+	_, exist := indexParams[common.IndexOffsetCacheEnabledKey]
+	if exist {
+		return
+	}
+	indexParams[common.IndexOffsetCacheEnabledKey] = params.QueryNodeCfg.IndexOffsetCacheEnabled.GetValue()
+}
+
 // SetDiskIndexLoadParams set disk index load params with ratio params on queryNode
 // QueryNode cal load params with ratio params ans cpu count...
 func SetDiskIndexLoadParams(params *paramtable.ComponentParam, indexParams map[string]string, numRows int64) error {
 	dimStr, ok := indexParams[common.DimKey]
 	if !ok {
 		// type param dim has been put into index params before build index
-		return fmt.Errorf("type param dim not exist")
+		return errors.New("type param dim not exist")
 	}
 	dim, err := strconv.ParseInt(dimStr, 10, 64)
 	if err != nil {

@@ -42,9 +42,9 @@ class VectorIndex : public IndexBase {
 
  public:
     void
-    BuildWithRawData(size_t n,
-                     const void* values,
-                     const Config& config = {}) override {
+    BuildWithRawDataForUT(size_t n,
+                          const void* values,
+                          const Config& config = {}) override {
         PanicInfo(Unsupported,
                   "vector index don't support build index with raw data");
     };
@@ -60,8 +60,7 @@ class VectorIndex : public IndexBase {
           const BitsetView& bitset,
           SearchResult& search_result) const = 0;
 
-    virtual knowhere::expected<
-        std::vector<std::shared_ptr<knowhere::IndexNode::iterator>>>
+    virtual knowhere::expected<std::vector<knowhere::IndexNode::IteratorPtr>>
     VectorIterators(const DatasetPtr dataset,
                     const knowhere::Json& json,
                     const BitsetView& bitset) const {
@@ -116,6 +115,12 @@ class VectorIndex : public IndexBase {
             err_msg);
     }
 
+    virtual bool
+    IsMmapSupported() const {
+        return knowhere::IndexFactory::Instance().FeatureCheck(
+            index_type_, knowhere::feature::MMAP);
+    }
+
     knowhere::Json
     PrepareSearchParams(const SearchInfo& search_info) const {
         knowhere::Json search_cfg = search_info.search_params_;
@@ -127,9 +132,9 @@ class VectorIndex : public IndexBase {
         if (search_info.trace_ctx_.traceID != nullptr &&
             search_info.trace_ctx_.spanID != nullptr) {
             search_cfg[knowhere::meta::TRACE_ID] =
-                tracer::GetTraceIDAsVector(&search_info.trace_ctx_);
+                tracer::GetTraceIDAsHexStr(&search_info.trace_ctx_);
             search_cfg[knowhere::meta::SPAN_ID] =
-                tracer::GetSpanIDAsVector(&search_info.trace_ctx_);
+                tracer::GetSpanIDAsHexStr(&search_info.trace_ctx_);
             search_cfg[knowhere::meta::TRACE_FLAGS] =
                 search_info.trace_ctx_.traceFlags;
         }

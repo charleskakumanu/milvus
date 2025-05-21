@@ -19,9 +19,10 @@ package index
 import "strconv"
 
 const (
-	ivfNlistKey = `nlist`
-	ivfPQMKey   = `m`
-	ivfPQNbits  = `nbits`
+	ivfNlistKey  = `nlist`
+	ivfPQMKey    = `m`
+	ivfPQNbits   = `nbits`
+	ivfNprobeKey = `nprobe`
 )
 
 var _ Index = ivfFlatIndex{}
@@ -50,6 +51,8 @@ func NewIvfFlatIndex(metricType MetricType, nlist int) Index {
 		nlist: nlist,
 	}
 }
+
+var _ Index = ivfPQIndex{}
 
 type ivfPQIndex struct {
 	baseIndex
@@ -82,6 +85,8 @@ func NewIvfPQIndex(metricType MetricType, nlist int, m int, nbits int) Index {
 	}
 }
 
+var _ Index = ivfSQ8Index{}
+
 type ivfSQ8Index struct {
 	baseIndex
 
@@ -97,12 +102,59 @@ func (idx ivfSQ8Index) Params() map[string]string {
 }
 
 func NewIvfSQ8Index(metricType MetricType, nlist int) Index {
-	return ivfPQIndex{
+	return ivfSQ8Index{
 		baseIndex: baseIndex{
 			metricType: metricType,
 			indexType:  IvfSQ8,
 		},
 
 		nlist: nlist,
+	}
+}
+
+var _ Index = binIvfFlat{}
+
+type binIvfFlat struct {
+	baseIndex
+
+	nlist int
+}
+
+func (idx binIvfFlat) Params() map[string]string {
+	return map[string]string{
+		MetricTypeKey: string(idx.metricType),
+		IndexTypeKey:  string(BinIvfFlat),
+		ivfNlistKey:   strconv.Itoa(idx.nlist),
+	}
+}
+
+func NewBinIvfFlatIndex(metricType MetricType, nlist int) Index {
+	return binIvfFlat{
+		baseIndex: baseIndex{
+			metricType: metricType,
+			indexType:  BinIvfFlat,
+		},
+
+		nlist: nlist,
+	}
+}
+
+type ivfAnnParam struct {
+	baseAnnParam
+	nprobe int
+}
+
+func (ap ivfAnnParam) Params() map[string]any {
+	result := ap.baseAnnParam.Params()
+	result[ivfNprobeKey] = ap.nprobe
+	return result
+}
+
+func NewIvfAnnParam(nprobe int) ivfAnnParam {
+	return ivfAnnParam{
+		baseAnnParam: baseAnnParam{
+			params: make(map[string]any),
+		},
+		nprobe: nprobe,
 	}
 }

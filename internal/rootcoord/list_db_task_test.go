@@ -30,9 +30,9 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus/internal/metastore/model"
 	mockrootcoord "github.com/milvus-io/milvus/internal/rootcoord/mocks"
-	"github.com/milvus-io/milvus/pkg/util"
-	"github.com/milvus-io/milvus/pkg/util/crypto"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util"
+	"github.com/milvus-io/milvus/pkg/v2/util/crypto"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 func Test_ListDBTask(t *testing.T) {
@@ -58,7 +58,7 @@ func Test_ListDBTask(t *testing.T) {
 	})
 
 	t.Run("ok", func(t *testing.T) {
-		ret := []*model.Database{model.NewDefaultDatabase()}
+		ret := []*model.Database{model.NewDefaultDatabase(nil)}
 		meta := mockrootcoord.NewIMetaTable(t)
 		meta.On("ListDatabases",
 			mock.Anything,
@@ -89,7 +89,7 @@ func Test_ListDBTask(t *testing.T) {
 	t.Run("list db with auth", func(t *testing.T) {
 		Params.Save(Params.CommonCfg.AuthorizationEnabled.Key, "true")
 		defer Params.Reset(Params.CommonCfg.AuthorizationEnabled.Key)
-		ret := []*model.Database{model.NewDefaultDatabase()}
+		ret := []*model.Database{model.NewDefaultDatabase(nil)}
 		meta := mockrootcoord.NewIMetaTable(t)
 
 		core := newTestCore(withMeta(meta))
@@ -131,8 +131,30 @@ func Test_ListDBTask(t *testing.T) {
 		}
 
 		{
+			// proxy node with root user, root user should bind role
+			Params.Save(Params.CommonCfg.RootShouldBindRole.Key, "true")
+			meta.EXPECT().SelectUser(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+				Return([]*milvuspb.UserResult{
+					{
+						User: &milvuspb.UserEntity{
+							Name: "root",
+						},
+						Roles: []*milvuspb.RoleEntity{},
+					},
+				}, nil).Once()
+
+			ctx := GetContext(context.Background(), "root:root")
+			task := getTask()
+			err := task.Execute(ctx)
+			assert.NoError(t, err)
+			assert.Equal(t, 0, len(task.Resp.GetDbNames()))
+			assert.Equal(t, commonpb.ErrorCode_Success, task.Resp.GetStatus().GetErrorCode())
+			Params.Reset(Params.CommonCfg.RootShouldBindRole.Key)
+		}
+
+		{
 			// select role fail
-			meta.EXPECT().SelectUser(mock.Anything, mock.Anything, mock.Anything).
+			meta.EXPECT().SelectUser(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 				Return(nil, errors.New("mock select user error")).Once()
 			ctx := GetContext(context.Background(), "foo:root")
 			task := getTask()
@@ -142,7 +164,7 @@ func Test_ListDBTask(t *testing.T) {
 
 		{
 			// select role, empty result
-			meta.EXPECT().SelectUser(mock.Anything, mock.Anything, mock.Anything).
+			meta.EXPECT().SelectUser(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 				Return([]*milvuspb.UserResult{}, nil).Once()
 			ctx := GetContext(context.Background(), "foo:root")
 			task := getTask()
@@ -153,7 +175,7 @@ func Test_ListDBTask(t *testing.T) {
 
 		{
 			// select role, the user is added to admin role
-			meta.EXPECT().SelectUser(mock.Anything, mock.Anything, mock.Anything).
+			meta.EXPECT().SelectUser(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 				Return([]*milvuspb.UserResult{
 					{
 						User: &milvuspb.UserEntity{
@@ -176,7 +198,7 @@ func Test_ListDBTask(t *testing.T) {
 
 		{
 			// select grant fail
-			meta.EXPECT().SelectUser(mock.Anything, mock.Anything, mock.Anything).
+			meta.EXPECT().SelectUser(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 				Return([]*milvuspb.UserResult{
 					{
 						User: &milvuspb.UserEntity{
@@ -189,7 +211,7 @@ func Test_ListDBTask(t *testing.T) {
 						},
 					},
 				}, nil).Once()
-			meta.EXPECT().SelectGrant(mock.Anything, mock.Anything).
+			meta.EXPECT().SelectGrant(mock.Anything, mock.Anything, mock.Anything).
 				Return(nil, errors.New("mock select grant error")).Once()
 			ctx := GetContext(context.Background(), "foo:root")
 			task := getTask()
@@ -199,7 +221,7 @@ func Test_ListDBTask(t *testing.T) {
 
 		{
 			// normal user
-			meta.EXPECT().SelectUser(mock.Anything, mock.Anything, mock.Anything).
+			meta.EXPECT().SelectUser(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 				Return([]*milvuspb.UserResult{
 					{
 						User: &milvuspb.UserEntity{
@@ -220,7 +242,7 @@ func Test_ListDBTask(t *testing.T) {
 					Name: "default",
 				},
 			}, nil).Once()
-			meta.EXPECT().SelectGrant(mock.Anything, mock.Anything).
+			meta.EXPECT().SelectGrant(mock.Anything, mock.Anything, mock.Anything).
 				Return([]*milvuspb.GrantEntity{
 					{
 						DbName: "fooDB",
@@ -235,8 +257,30 @@ func Test_ListDBTask(t *testing.T) {
 		}
 
 		{
+			// normal user and public role
+			meta.EXPECT().SelectUser(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+				Return([]*milvuspb.UserResult{
+					{
+						User: &milvuspb.UserEntity{
+							Name: "foo",
+						},
+						Roles: []*milvuspb.RoleEntity{
+							{
+								Name: "public",
+							},
+						},
+					},
+				}, nil).Once()
+			ctx := GetContext(context.Background(), "foo:root")
+			task := getTask()
+			err := task.Execute(ctx)
+			assert.NoError(t, err)
+			assert.Equal(t, 0, len(task.Resp.GetDbNames()))
+		}
+
+		{
 			// normal user with any db privilege
-			meta.EXPECT().SelectUser(mock.Anything, mock.Anything, mock.Anything).
+			meta.EXPECT().SelectUser(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 				Return([]*milvuspb.UserResult{
 					{
 						User: &milvuspb.UserEntity{
@@ -257,7 +301,7 @@ func Test_ListDBTask(t *testing.T) {
 					Name: "default",
 				},
 			}, nil).Once()
-			meta.EXPECT().SelectGrant(mock.Anything, mock.Anything).
+			meta.EXPECT().SelectGrant(mock.Anything, mock.Anything, mock.Anything).
 				Return([]*milvuspb.GrantEntity{
 					{
 						DbName: "*",

@@ -21,16 +21,19 @@
 #include <memory>
 
 #include "common/Consts.h"
+#include "boost/filesystem/path.hpp"
 #include "knowhere/file_manager.h"
 #include "log/Log.h"
 #include "storage/ChunkManager.h"
 #include "storage/Types.h"
-#include "storage/space.h"
 
 namespace milvus::storage {
 
 struct FileManagerContext {
     FileManagerContext() : chunkManagerPtr(nullptr) {
+    }
+    FileManagerContext(const ChunkManagerPtr& chunkManagerPtr)
+        : chunkManagerPtr(chunkManagerPtr) {
     }
     FileManagerContext(const FieldDataMeta& fieldDataMeta,
                        const IndexMeta& indexMeta,
@@ -40,24 +43,20 @@ struct FileManagerContext {
           chunkManagerPtr(chunkManagerPtr) {
     }
 
-    FileManagerContext(const FieldDataMeta& fieldDataMeta,
-                       const IndexMeta& indexMeta,
-                       const ChunkManagerPtr& chunkManagerPtr,
-                       std::shared_ptr<milvus_storage::Space> space)
-        : fieldDataMeta(fieldDataMeta),
-          indexMeta(indexMeta),
-          chunkManagerPtr(chunkManagerPtr),
-          space_(space) {
-    }
     bool
     Valid() const {
         return chunkManagerPtr != nullptr;
     }
 
+    void
+    set_for_loading_index(bool value) {
+        for_loading_index = value;
+    }
+
     FieldDataMeta fieldDataMeta;
     IndexMeta indexMeta;
     ChunkManagerPtr chunkManagerPtr;
-    std::shared_ptr<milvus_storage::Space> space_;
+    bool for_loading_index{false};
 };
 
 #define FILEMANAGER_TRY try {
@@ -137,11 +136,14 @@ class FileManagerImpl : public knowhere::FileManager {
 
     virtual std::string
     GetRemoteIndexObjectPrefix() const {
-        return rcm_->GetRootPath() + "/" + std::string(INDEX_ROOT_PATH) + "/" +
-               std::to_string(index_meta_.build_id) + "/" +
-               std::to_string(index_meta_.index_version) + "/" +
-               std::to_string(field_meta_.partition_id) + "/" +
-               std::to_string(field_meta_.segment_id);
+        boost::filesystem::path prefix = rcm_->GetRootPath();
+        boost::filesystem::path path = std::string(INDEX_ROOT_PATH);
+        boost::filesystem::path path1 =
+            std::to_string(index_meta_.build_id) + "/" +
+            std::to_string(index_meta_.index_version) + "/" +
+            std::to_string(field_meta_.partition_id) + "/" +
+            std::to_string(field_meta_.segment_id);
+        return (prefix / path / path1).string();
     }
 
     virtual std::string
@@ -151,6 +153,20 @@ class FileManagerImpl : public knowhere::FileManager {
                std::to_string(index_meta_.index_version) + "/" +
                std::to_string(field_meta_.partition_id) + "/" +
                std::to_string(field_meta_.segment_id);
+    }
+
+    virtual std::string
+    GetRemoteTextLogPrefix() const {
+        boost::filesystem::path prefix = rcm_->GetRootPath();
+        boost::filesystem::path path = std::string(TEXT_LOG_ROOT_PATH);
+        boost::filesystem::path path1 =
+            std::to_string(index_meta_.build_id) + "/" +
+            std::to_string(index_meta_.index_version) + "/" +
+            std::to_string(field_meta_.collection_id) + "/" +
+            std::to_string(field_meta_.partition_id) + "/" +
+            std::to_string(field_meta_.segment_id) + "/" +
+            std::to_string(field_meta_.field_id);
+        return (prefix / path / path1).string();
     }
 
  protected:

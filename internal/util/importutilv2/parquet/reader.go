@@ -21,23 +21,24 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/apache/arrow/go/v12/arrow/memory"
-	"github.com/apache/arrow/go/v12/parquet"
-	"github.com/apache/arrow/go/v12/parquet/file"
-	"github.com/apache/arrow/go/v12/parquet/pqarrow"
+	"github.com/apache/arrow/go/v17/arrow/memory"
+	"github.com/apache/arrow/go/v17/parquet"
+	"github.com/apache/arrow/go/v17/parquet/file"
+	"github.com/apache/arrow/go/v17/parquet/pqarrow"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/util/importutilv2/common"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 )
 
 type reader struct {
 	ctx    context.Context
 	cm     storage.ChunkManager
+	cmr    storage.FileReader
 	schema *schemapb.CollectionSchema
 
 	path string
@@ -74,13 +75,14 @@ func NewReader(ctx context.Context, cm storage.ChunkManager, schema *schemapb.Co
 	if err != nil {
 		return nil, err
 	}
-	count, err := estimateReadCountPerBatch(bufferSize, schema)
+	count, err := common.EstimateReadCountPerBatch(bufferSize, schema)
 	if err != nil {
 		return nil, err
 	}
 	return &reader{
 		ctx:        ctx,
 		cm:         cm,
+		cmr:        cmReader,
 		schema:     schema,
 		fileSize:   atomic.NewInt64(0),
 		path:       path,
@@ -99,14 +101,14 @@ func (r *reader) Read() (*storage.InsertData, error) {
 OUTER:
 	for {
 		for fieldID, cr := range r.frs {
-			data, err := cr.Next(r.count)
+			data, validData, err := cr.Next(r.count)
 			if err != nil {
 				return nil, err
 			}
 			if data == nil {
 				break OUTER
 			}
-			err = insertData.Data[fieldID].AppendRows(data)
+			err = insertData.Data[fieldID].AppendRows(data, validData)
 			if err != nil {
 				return nil, err
 			}
@@ -140,11 +142,11 @@ func (r *reader) Size() (int64, error) {
 }
 
 func (r *reader) Close() {
-	for _, cr := range r.frs {
-		cr.Close()
-	}
 	err := r.r.Close()
 	if err != nil {
 		log.Warn("close parquet reader failed", zap.Error(err))
+	}
+	if r.cmr != nil {
+		r.cmr.Close()
 	}
 }

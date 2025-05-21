@@ -35,6 +35,7 @@ const milvus::FieldId TimestampFieldID = milvus::FieldId(1);
 // fill followed extra info to binlog file
 const char ORIGIN_SIZE_KEY[] = "original_size";
 const char INDEX_BUILD_ID_KEY[] = "indexBuildID";
+const char NULLABLE[] = "nullable";
 
 const char INDEX_ROOT_PATH[] = "index_files";
 const char RAWDATA_ROOT_PATH[] = "raw_datas";
@@ -44,6 +45,11 @@ const char OFFSET_MAPPING_NAME[] = "offset_mapping";
 const char NUM_CLUSTERS[] = "num_clusters";
 const char KMEANS_CLUSTER[] = "KMEANS";
 const char VEC_OPT_FIELDS[] = "opt_fields";
+const char PAGE_RETAIN_ORDER[] = "page_retain_order";
+const char TEXT_LOG_ROOT_PATH[] = "text_log";
+const char ITERATIVE_FILTER[] = "iterative_filter";
+const char HINTS[] = "hints";
+const char JSON_KEY_INDEX_LOG_ROOT_PATH[] = "json_key_index_log";
 
 const char DEFAULT_PLANNODE_ID[] = "0";
 const char DEAFULT_QUERY_ID[] = "0";
@@ -67,4 +73,29 @@ const int64_t DEFAULT_MAX_OUTPUT_SIZE = 67108864;  // bytes, 64MB
 
 const int64_t DEFAULT_CHUNK_MANAGER_REQUEST_TIMEOUT_MS = 10000;
 
-const int64_t DEFAULT_BITMAP_INDEX_CARDINALITY_BOUND = 500;
+const int64_t DEFAULT_BITMAP_INDEX_BUILD_MODE_BOUND = 500;
+
+const int64_t DEFAULT_HYBRID_INDEX_BITMAP_CARDINALITY_LIMIT = 100;
+
+const size_t MARISA_NULL_KEY_ID = -1;
+
+const std::string JSON_CAST_TYPE = "json_cast_type";
+const std::string JSON_PATH = "json_path";
+const bool DEFAULT_OPTIMIZE_EXPR_ENABLED = true;
+const int64_t DEFAULT_CONVERT_OR_TO_IN_NUMERIC_LIMIT = 150;
+const int64_t DEFAULT_JSON_INDEX_MEMORY_BUDGET = 16777216;  // bytes, 16MB
+const bool DEFAULT_GROWING_JSON_KEY_STATS_ENABLED = false;
+const int64_t DEFAULT_JSON_KEY_STATS_COMMIT_INTERVAL = 200;
+const bool DEFAULT_CONFIG_PARAM_TYPE_CHECK_ENABLED = true;
+
+// index config related
+const std::string SEGMENT_INSERT_FILES_KEY = "segment_insert_files";
+const std::string INSERT_FILES_KEY = "insert_files";
+const std::string PARTITION_KEY_ISOLATION_KEY = "partition_key_isolation";
+const std::string STORAGE_VERSION_KEY = "storage_version";
+const std::string DIM_KEY = "dim";
+const std::string DATA_TYPE_KEY = "data_type";
+
+// storage version
+const int64_t STORAGE_V1 = 1;
+const int64_t STORAGE_V2 = 2;

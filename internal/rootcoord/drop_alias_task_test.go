@@ -20,13 +20,14 @@ import (
 	"context"
 	"testing"
 
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	mockrootcoord "github.com/milvus-io/milvus/internal/rootcoord/mocks"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
 )
 
 func Test_dropAliasTask_Prepare(t *testing.T) {
@@ -49,8 +50,10 @@ func Test_dropAliasTask_Prepare(t *testing.T) {
 
 func Test_dropAliasTask_Execute(t *testing.T) {
 	t.Run("failed to expire cache", func(t *testing.T) {
-		core := newTestCore(withInvalidProxyManager())
+		mockMeta := mockrootcoord.NewIMetaTable(t)
+		mockMeta.EXPECT().GetCollectionID(mock.Anything, mock.Anything, mock.Anything).Return(111)
 		alias := funcutil.GenRandomStr()
+		core := newTestCore(withInvalidProxyManager(), withMeta(mockMeta))
 		task := &dropAliasTask{
 			baseTask: newBaseTask(context.Background(), core),
 			Req: &milvuspb.DropAliasRequest{
@@ -63,7 +66,11 @@ func Test_dropAliasTask_Execute(t *testing.T) {
 	})
 
 	t.Run("failed to drop alias", func(t *testing.T) {
-		core := newTestCore(withValidProxyManager(), withInvalidMeta())
+		mockMeta := mockrootcoord.NewIMetaTable(t)
+		mockMeta.EXPECT().GetCollectionID(mock.Anything, mock.Anything, mock.Anything).Return(111)
+		mockMeta.EXPECT().DropAlias(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+			Return(errors.New("failed to alter alias"))
+		core := newTestCore(withValidProxyManager(), withMeta(mockMeta))
 		alias := funcutil.GenRandomStr()
 		task := &dropAliasTask{
 			baseTask: newBaseTask(context.Background(), core),
@@ -77,15 +84,12 @@ func Test_dropAliasTask_Execute(t *testing.T) {
 	})
 
 	t.Run("normal case", func(t *testing.T) {
-		meta := mockrootcoord.NewIMetaTable(t)
-		meta.On("DropAlias",
-			mock.Anything,
-			mock.Anything,
-			mock.Anything,
-			mock.Anything,
-		).Return(nil)
+		mockMeta := mockrootcoord.NewIMetaTable(t)
+		mockMeta.EXPECT().GetCollectionID(mock.Anything, mock.Anything, mock.Anything).Return(111)
+		mockMeta.EXPECT().DropAlias(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+			Return(nil)
 
-		core := newTestCore(withValidProxyManager(), withMeta(meta))
+		core := newTestCore(withValidProxyManager(), withMeta(mockMeta))
 		alias := funcutil.GenRandomStr()
 		task := &dropAliasTask{
 			baseTask: newBaseTask(context.Background(), core),

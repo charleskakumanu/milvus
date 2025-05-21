@@ -18,15 +18,12 @@ package grpcdatanode
 
 import (
 	"context"
-	"fmt"
-	"net"
 	"strconv"
 	"sync"
 	"time"
 
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	clientv3 "go.etcd.io/etcd/client/v3"
-	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
@@ -35,24 +32,25 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	dn "github.com/milvus-io/milvus/internal/datanode"
-	dcc "github.com/milvus-io/milvus/internal/distributed/datacoord/client"
-	rcc "github.com/milvus-io/milvus/internal/distributed/rootcoord/client"
+	mix "github.com/milvus-io/milvus/internal/distributed/mixcoord/client"
 	"github.com/milvus-io/milvus/internal/distributed/utils"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/componentutil"
 	"github.com/milvus-io/milvus/internal/util/dependency"
 	_ "github.com/milvus-io/milvus/internal/util/grpcclient"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/tracer"
-	"github.com/milvus-io/milvus/pkg/util/etcd"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/util/interceptor"
-	"github.com/milvus-io/milvus/pkg/util/logutil"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/retry"
+	"github.com/milvus-io/milvus/internal/util/streamingutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/workerpb"
+	"github.com/milvus-io/milvus/pkg/v2/tracer"
+	"github.com/milvus-io/milvus/pkg/v2/util/etcd"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/interceptor"
+	"github.com/milvus-io/milvus/pkg/v2/util/logutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/netutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 type Server struct {
@@ -60,6 +58,7 @@ type Server struct {
 	grpcWG      sync.WaitGroup
 	grpcErrChan chan error
 	grpcServer  *grpc.Server
+	listener    *netutil.NetListener
 	ctx         context.Context
 	cancel      context.CancelFunc
 	etcdCli     *clientv3.Client
@@ -67,11 +66,7 @@ type Server struct {
 
 	serverID atomic.Int64
 
-	rootCoord types.RootCoord
-	dataCoord types.DataCoord
-
-	newRootCoordClient func() (types.RootCoordClient, error)
-	newDataCoordClient func() (types.DataCoordClient, error)
+	mixCoordClient func() (types.MixCoordClient, error)
 }
 
 // NewServer new DataNode grpc server
@@ -82,11 +77,8 @@ func NewServer(ctx context.Context, factory dependency.Factory) (*Server, error)
 		cancel:      cancel,
 		factory:     factory,
 		grpcErrChan: make(chan error),
-		newRootCoordClient: func() (types.RootCoordClient, error) {
-			return rcc.NewClient(ctx1)
-		},
-		newDataCoordClient: func() (types.DataCoordClient, error) {
-			return dcc.NewClient(ctx1)
+		mixCoordClient: func() (types.MixCoordClient, error) {
+			return mix.NewClient(ctx1)
 		},
 	}
 
@@ -95,17 +87,33 @@ func NewServer(ctx context.Context, factory dependency.Factory) (*Server, error)
 	return s, nil
 }
 
+func (s *Server) Prepare() error {
+	listener, err := netutil.NewListener(
+		netutil.OptIP(paramtable.Get().DataNodeGrpcServerCfg.IP),
+		netutil.OptHighPriorityToUsePort(paramtable.Get().DataNodeGrpcServerCfg.Port.GetAsInt()),
+	)
+	if err != nil {
+		log.Ctx(s.ctx).Warn("DataNode fail to create net listener", zap.Error(err))
+		return err
+	}
+	log.Ctx(s.ctx).Info("DataNode listen on", zap.String("address", listener.Addr().String()), zap.Int("port", listener.Port()))
+	s.listener = listener
+	paramtable.Get().Save(
+		paramtable.Get().DataNodeGrpcServerCfg.Port.Key,
+		strconv.FormatInt(int64(listener.Port()), 10))
+	return nil
+}
+
 func (s *Server) startGrpc() error {
-	Params := &paramtable.Get().DataNodeGrpcServerCfg
 	s.grpcWG.Add(1)
-	go s.startGrpcLoop(Params.Port.GetAsInt())
+	go s.startGrpcLoop()
 	// wait for grpc server loop start
 	err := <-s.grpcErrChan
 	return err
 }
 
 // startGrpcLoop starts the grep loop of datanode component.
-func (s *Server) startGrpcLoop(grpcPort int) {
+func (s *Server) startGrpcLoop() {
 	defer s.grpcWG.Done()
 	Params := &paramtable.Get().DataNodeGrpcServerCfg
 	kaep := keepalive.EnforcementPolicy{
@@ -117,28 +125,13 @@ func (s *Server) startGrpcLoop(grpcPort int) {
 		Time:    60 * time.Second, // Ping the client if it is idle for 60 seconds to ensure the connection is still active
 		Timeout: 10 * time.Second, // Wait 10 second for the ping ack before assuming the connection is dead
 	}
-	var lis net.Listener
 
-	err := retry.Do(s.ctx, func() error {
-		addr := ":" + strconv.Itoa(grpcPort)
-		var err error
-		lis, err = net.Listen("tcp", addr)
-		return err
-	}, retry.Attempts(10))
-	if err != nil {
-		log.Error("DataNode GrpcServer:failed to listen", zap.Error(err))
-		s.grpcErrChan <- err
-		return
-	}
-
-	opts := tracer.GetInterceptorOpts()
-	s.grpcServer = grpc.NewServer(
+	grpcOpts := []grpc.ServerOption{
 		grpc.KeepaliveEnforcementPolicy(kaep),
 		grpc.KeepaliveParams(kasp),
 		grpc.MaxRecvMsgSize(Params.ServerMaxRecvSize.GetAsInt()),
 		grpc.MaxSendMsgSize(Params.ServerMaxSendSize.GetAsInt()),
 		grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
-			otelgrpc.UnaryServerInterceptor(opts...),
 			logutil.UnaryTraceLoggerInterceptor,
 			interceptor.ClusterValidationUnaryServerInterceptor(),
 			interceptor.ServerIDValidationUnaryServerInterceptor(func() int64 {
@@ -149,7 +142,6 @@ func (s *Server) startGrpcLoop(grpcPort int) {
 			}),
 		)),
 		grpc.StreamInterceptor(grpc_middleware.ChainStreamServer(
-			otelgrpc.StreamServerInterceptor(opts...),
 			logutil.StreamTraceLoggerInterceptor,
 			interceptor.ClusterValidationStreamServerInterceptor(),
 			interceptor.ServerIDValidationStreamServerInterceptor(func() int64 {
@@ -158,15 +150,21 @@ func (s *Server) startGrpcLoop(grpcPort int) {
 				}
 				return s.serverID.Load()
 			}),
-		)))
+		)),
+		grpc.StatsHandler(tracer.GetDynamicOtelGrpcServerStatsHandler()),
+	}
+
+	grpcOpts = append(grpcOpts, utils.EnableInternalTLS("DataNode"))
+	s.grpcServer = grpc.NewServer(grpcOpts...)
 	datapb.RegisterDataNodeServer(s.grpcServer, s)
+	workerpb.RegisterIndexNodeServer(s.grpcServer, s)
 
 	ctx, cancel := context.WithCancel(s.ctx)
 	defer cancel()
 
 	go funcutil.CheckGrpcReady(ctx, s.grpcErrChan)
-	if err := s.grpcServer.Serve(lis); err != nil {
-		log.Warn("DataNode failed to start gRPC")
+	if err := s.grpcServer.Serve(s.listener); err != nil {
+		log.Ctx(s.ctx).Warn("DataNode failed to start gRPC")
 		s.grpcErrChan <- err
 	}
 }
@@ -175,12 +173,8 @@ func (s *Server) SetEtcdClient(client *clientv3.Client) {
 	s.datanode.SetEtcdClient(client)
 }
 
-func (s *Server) SetRootCoordInterface(ms types.RootCoordClient) error {
-	return s.datanode.SetRootCoordClient(ms)
-}
-
-func (s *Server) SetDataCoordInterface(ds types.DataCoordClient) error {
-	return s.datanode.SetDataCoordClient(ds)
+func (s *Server) SetMixCoordInterface(ms types.MixCoordClient) error {
+	return s.datanode.SetMixCoordClient(ms)
 }
 
 // Run initializes and starts Datanode's grpc service.
@@ -189,19 +183,21 @@ func (s *Server) Run() error {
 		// errors are propagated upstream as panic.
 		return err
 	}
-	log.Info("DataNode gRPC services successfully initialized")
+	log.Ctx(s.ctx).Info("DataNode gRPC services successfully initialized")
 	if err := s.start(); err != nil {
 		// errors are propagated upstream as panic.
 		return err
 	}
-	log.Info("DataNode gRPC services successfully started")
+	log.Ctx(s.ctx).Info("DataNode gRPC services successfully started")
 	return nil
 }
 
 // Stop stops Datanode's grpc service.
 func (s *Server) Stop() (err error) {
-	Params := &paramtable.Get().DataNodeGrpcServerCfg
-	logger := log.With(zap.String("address", Params.GetAddress()))
+	logger := log.Ctx(s.ctx)
+	if s.listener != nil {
+		logger = logger.With(zap.String("address", s.listener.Address()))
+	}
 	logger.Info("datanode stopping")
 	defer func() {
 		logger.Info("datanode stopped", zap.Error(err))
@@ -218,22 +214,21 @@ func (s *Server) Stop() (err error) {
 	logger.Info("internal server[datanode] start to stop")
 	err = s.datanode.Stop()
 	if err != nil {
-		log.Error("failed to close datanode", zap.Error(err))
+		logger.Error("failed to close datanode", zap.Error(err))
 		return err
 	}
 	s.cancel()
+
+	if s.listener != nil {
+		s.listener.Close()
+	}
 	return nil
 }
 
 // init initializes Datanode's grpc service.
 func (s *Server) init() error {
 	etcdConfig := &paramtable.Get().EtcdCfg
-	Params := &paramtable.Get().DataNodeGrpcServerCfg
-	ctx := context.Background()
-	if !funcutil.CheckPortAvailable(Params.Port.GetAsInt()) {
-		paramtable.Get().Save(Params.Port.Key, fmt.Sprintf("%d", funcutil.GetAvailablePort()))
-		log.Warn("DataNode found available port during init", zap.Int("port", Params.Port.GetAsInt()))
-	}
+	log := log.Ctx(s.ctx)
 
 	etcdCli, err := etcd.CreateEtcdClient(
 		etcdConfig.UseEmbedEtcd.GetAsBool(),
@@ -252,50 +247,32 @@ func (s *Server) init() error {
 	}
 	s.etcdCli = etcdCli
 	s.SetEtcdClient(s.etcdCli)
-	s.datanode.SetAddress(Params.GetAddress())
-	log.Info("DataNode address", zap.String("address", Params.IP+":"+strconv.Itoa(Params.Port.GetAsInt())))
-	log.Info("DataNode serverID", zap.Int64("serverID", s.serverID.Load()))
+	s.datanode.SetAddress(s.listener.Address())
+	log.Info("DataNode address", zap.String("address", s.listener.Address()))
 
 	err = s.startGrpc()
 	if err != nil {
 		return err
 	}
 
-	// --- RootCoord Client ---
-	if s.newRootCoordClient != nil {
-		log.Info("initializing RootCoord client for DataNode")
-		rootCoordClient, err := s.newRootCoordClient()
-		if err != nil {
-			log.Error("failed to create new RootCoord client", zap.Error(err))
-			panic(err)
-		}
+	if !streamingutil.IsStreamingServiceEnabled() {
+		// --- MixCoord Client ---
+		if s.mixCoordClient != nil {
+			log.Info("initializing MixCoord client for DataNode")
+			mixCoordClient, err := s.mixCoordClient()
+			if err != nil {
+				log.Error("failed to create new MixCoord client", zap.Error(err))
+				panic(err)
+			}
 
-		if err = componentutil.WaitForComponentHealthy(ctx, rootCoordClient, "RootCoord", 1000000, time.Millisecond*200); err != nil {
-			log.Error("failed to wait for RootCoord client to be ready", zap.Error(err))
-			panic(err)
-		}
-		log.Info("RootCoord client is ready for DataNode")
-		if err = s.SetRootCoordInterface(rootCoordClient); err != nil {
-			panic(err)
-		}
-	}
-
-	// --- DataCoord Client ---
-	if s.newDataCoordClient != nil {
-		log.Debug("starting DataCoord client for DataNode")
-		dataCoordClient, err := s.newDataCoordClient()
-		if err != nil {
-			log.Error("failed to create new DataCoord client", zap.Error(err))
-			panic(err)
-		}
-
-		if err = componentutil.WaitForComponentInitOrHealthy(ctx, dataCoordClient, "DataCoord", 1000000, time.Millisecond*200); err != nil {
-			log.Error("failed to wait for DataCoord client to be ready", zap.Error(err))
-			panic(err)
-		}
-		log.Info("DataCoord client is ready for DataNode")
-		if err = s.SetDataCoordInterface(dataCoordClient); err != nil {
-			panic(err)
+			if err = componentutil.WaitForComponentHealthy(s.ctx, mixCoordClient, "MixCoord", 1000000, time.Millisecond*200); err != nil {
+				log.Error("failed to wait for MixCoord client to be ready", zap.Error(err))
+				panic(err)
+			}
+			log.Info("MixCoord client is ready for DataNode")
+			if err = s.SetMixCoordInterface(mixCoordClient); err != nil {
+				panic(err)
+			}
 		}
 	}
 
@@ -316,7 +293,7 @@ func (s *Server) start() error {
 	}
 	err := s.datanode.Register()
 	if err != nil {
-		log.Debug("failed to register to Etcd", zap.Error(err))
+		log.Ctx(s.ctx).Debug("failed to register to Etcd", zap.Error(err))
 		return err
 	}
 	return nil
@@ -409,4 +386,48 @@ func (s *Server) QuerySlot(ctx context.Context, req *datapb.QuerySlotRequest) (*
 
 func (s *Server) DropCompactionPlan(ctx context.Context, req *datapb.DropCompactionPlanRequest) (*commonpb.Status, error) {
 	return s.datanode.DropCompactionPlan(ctx, req)
+}
+
+// CreateJob sends the create index request to DataNode.
+func (s *Server) CreateJob(ctx context.Context, req *workerpb.CreateJobRequest) (*commonpb.Status, error) {
+	return s.datanode.CreateJob(ctx, req)
+}
+
+// QueryJobs queries index jobs statues
+func (s *Server) QueryJobs(ctx context.Context, req *workerpb.QueryJobsRequest) (*workerpb.QueryJobsResponse, error) {
+	return s.datanode.QueryJobs(ctx, req)
+}
+
+// DropJobs drops index build jobs
+func (s *Server) DropJobs(ctx context.Context, req *workerpb.DropJobsRequest) (*commonpb.Status, error) {
+	return s.datanode.DropJobs(ctx, req)
+}
+
+// GetJobStats gets job's statistics
+func (s *Server) GetJobStats(ctx context.Context, req *workerpb.GetJobStatsRequest) (*workerpb.GetJobStatsResponse, error) {
+	return s.datanode.GetJobStats(ctx, req)
+}
+
+func (s *Server) CreateJobV2(ctx context.Context, request *workerpb.CreateJobV2Request) (*commonpb.Status, error) {
+	return s.datanode.CreateJobV2(ctx, request)
+}
+
+func (s *Server) QueryJobsV2(ctx context.Context, request *workerpb.QueryJobsV2Request) (*workerpb.QueryJobsV2Response, error) {
+	return s.datanode.QueryJobsV2(ctx, request)
+}
+
+func (s *Server) DropJobsV2(ctx context.Context, request *workerpb.DropJobsV2Request) (*commonpb.Status, error) {
+	return s.datanode.DropJobsV2(ctx, request)
+}
+
+func (s *Server) CreateTask(ctx context.Context, request *workerpb.CreateTaskRequest) (*commonpb.Status, error) {
+	return s.datanode.CreateTask(ctx, request)
+}
+
+func (s *Server) QueryTask(ctx context.Context, request *workerpb.QueryTaskRequest) (*workerpb.QueryTaskResponse, error) {
+	return s.datanode.QueryTask(ctx, request)
+}
+
+func (s *Server) DropTask(ctx context.Context, request *workerpb.DropTaskRequest) (*commonpb.Status, error) {
+	return s.datanode.DropTask(ctx, request)
 }

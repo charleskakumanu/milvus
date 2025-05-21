@@ -19,27 +19,28 @@ package storage
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
 	"unsafe"
 
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/util/tsoutil"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
-	"github.com/milvus-io/milvus/pkg/util/uniquegenerator"
+	"github.com/milvus-io/milvus/internal/json"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/tsoutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/uniquegenerator"
 )
 
 /* #nosec G103 */
 func TestInsertBinlog(t *testing.T) {
 	w := NewInsertBinlogWriter(schemapb.DataType_Int64, 10, 20, 30, 40, false)
 
-	e1, err := w.NextInsertEventWriter(false)
+	e1, err := w.NextInsertEventWriter()
 	assert.NoError(t, err)
 	err = e1.AddDataToPayload([]int64{1, 2, 3}, nil)
 	assert.NoError(t, err)
@@ -49,7 +50,7 @@ func TestInsertBinlog(t *testing.T) {
 	assert.NoError(t, err)
 	e1.SetEventTimestamp(100, 200)
 
-	e2, err := w.NextInsertEventWriter(false)
+	e2, err := w.NextInsertEventWriter()
 	assert.NoError(t, err)
 	err = e2.AddDataToPayload([]int64{7, 8, 9}, nil)
 	assert.NoError(t, err)
@@ -122,11 +123,6 @@ func TestInsertBinlog(t *testing.T) {
 	fieldID := UnsafeReadInt64(buf, pos)
 	assert.Equal(t, fieldID, int64(40))
 	pos += int(unsafe.Sizeof(fieldID))
-
-	// descriptor data fix, nullable
-	nullable := UnsafeReadBool(buf, pos)
-	assert.Equal(t, nullable, false)
-	pos += int(unsafe.Sizeof(nullable))
 
 	// descriptor data fix, start time stamp
 	startts := UnsafeReadInt64(buf, pos)
@@ -379,11 +375,6 @@ func TestDeleteBinlog(t *testing.T) {
 	assert.Equal(t, fieldID, int64(-1))
 	pos += int(unsafe.Sizeof(fieldID))
 
-	// descriptor data fix, nullable
-	nullable := UnsafeReadBool(buf, pos)
-	assert.Equal(t, nullable, false)
-	pos += int(unsafe.Sizeof(nullable))
-
 	// descriptor data fix, start time stamp
 	startts := UnsafeReadInt64(buf, pos)
 	assert.Equal(t, startts, int64(1000))
@@ -548,517 +539,6 @@ func TestDeleteBinlog(t *testing.T) {
 }
 
 /* #nosec G103 */
-func TestDDLBinlog1(t *testing.T) {
-	w := NewDDLBinlogWriter(schemapb.DataType_Int64, 50)
-
-	e1, err := w.NextCreateCollectionEventWriter()
-	assert.NoError(t, err)
-	err = e1.AddDataToPayload([]int64{1, 2, 3}, nil)
-	assert.NoError(t, err)
-	err = e1.AddDataToPayload([]int32{4, 5, 6}, nil)
-	assert.Error(t, err)
-	err = e1.AddDataToPayload([]int64{4, 5, 6}, nil)
-	assert.NoError(t, err)
-	e1.SetEventTimestamp(100, 200)
-
-	e2, err := w.NextDropCollectionEventWriter()
-	assert.NoError(t, err)
-	err = e2.AddDataToPayload([]int64{7, 8, 9}, nil)
-	assert.NoError(t, err)
-	err = e2.AddDataToPayload([]bool{true, false, true}, nil)
-	assert.Error(t, err)
-	err = e2.AddDataToPayload([]int64{10, 11, 12}, nil)
-	assert.NoError(t, err)
-	e2.SetEventTimestamp(300, 400)
-
-	w.SetEventTimeStamp(1000, 2000)
-
-	w.baseBinlogWriter.descriptorEventData.AddExtra("test", "testExtra")
-	sizeTotal := 2000000
-	w.baseBinlogWriter.descriptorEventData.AddExtra(originalSizeKey, fmt.Sprintf("%v", sizeTotal))
-
-	_, err = w.GetBuffer()
-	assert.Error(t, err)
-	err = w.Finish()
-	assert.NoError(t, err)
-	buf, err := w.GetBuffer()
-	assert.NoError(t, err)
-
-	w.Close()
-
-	// magic number
-	magicNum := UnsafeReadInt32(buf, 0)
-	assert.Equal(t, magicNum, MagicNumber)
-	pos := int(unsafe.Sizeof(MagicNumber))
-
-	// descriptor header, timestamp
-	ts := UnsafeReadInt64(buf, pos)
-	assert.Greater(t, ts, int64(0))
-	curts := time.Now().UnixNano() / int64(time.Millisecond)
-	curts = int64(tsoutil.ComposeTS(curts, 0))
-	diffts := curts - ts
-	maxdiff := int64(tsoutil.ComposeTS(1000, 0))
-	assert.LessOrEqual(t, diffts, maxdiff)
-	pos += int(unsafe.Sizeof(ts))
-
-	// descriptor header, type code
-	tc := UnsafeReadInt8(buf, pos)
-	assert.Equal(t, EventTypeCode(tc), DescriptorEventType)
-	pos += int(unsafe.Sizeof(tc))
-
-	// descriptor header, event length
-	descEventLen := UnsafeReadInt32(buf, pos)
-	pos += int(unsafe.Sizeof(descEventLen))
-
-	// descriptor header, next position
-	descNxtPos := UnsafeReadInt32(buf, pos)
-	assert.Equal(t, descEventLen+int32(unsafe.Sizeof(MagicNumber)), descNxtPos)
-	pos += int(unsafe.Sizeof(descNxtPos))
-
-	// descriptor data fix, collection id
-	collID := UnsafeReadInt64(buf, pos)
-	assert.Equal(t, collID, int64(50))
-	pos += int(unsafe.Sizeof(collID))
-
-	// descriptor data fix, partition id
-	partID := UnsafeReadInt64(buf, pos)
-	assert.Equal(t, partID, int64(-1))
-	pos += int(unsafe.Sizeof(partID))
-
-	// descriptor data fix, segment id
-	segID := UnsafeReadInt64(buf, pos)
-	assert.Equal(t, segID, int64(-1))
-	pos += int(unsafe.Sizeof(segID))
-
-	// descriptor data fix, field id
-	fieldID := UnsafeReadInt64(buf, pos)
-	assert.Equal(t, fieldID, int64(-1))
-	pos += int(unsafe.Sizeof(fieldID))
-
-	// descriptor data fix, nullable
-	nullable := UnsafeReadBool(buf, pos)
-	assert.Equal(t, nullable, false)
-	pos += int(unsafe.Sizeof(nullable))
-
-	// descriptor data fix, start time stamp
-	startts := UnsafeReadInt64(buf, pos)
-	assert.Equal(t, startts, int64(1000))
-	pos += int(unsafe.Sizeof(startts))
-
-	// descriptor data fix, end time stamp
-	endts := UnsafeReadInt64(buf, pos)
-	assert.Equal(t, endts, int64(2000))
-	pos += int(unsafe.Sizeof(endts))
-
-	// descriptor data fix, payload type
-	colType := UnsafeReadInt32(buf, pos)
-	assert.Equal(t, schemapb.DataType(colType), schemapb.DataType_Int64)
-	pos += int(unsafe.Sizeof(colType))
-
-	// descriptor data, post header lengths
-	for i := DescriptorEventType; i < EventTypeEnd; i++ {
-		size := getEventFixPartSize(i)
-		assert.Equal(t, uint8(size), buf[pos])
-		pos++
-	}
-
-	// descriptor data, extra length
-	extraLength := UnsafeReadInt32(buf, pos)
-	assert.Equal(t, extraLength, w.baseBinlogWriter.descriptorEventData.ExtraLength)
-	pos += int(unsafe.Sizeof(extraLength))
-
-	multiBytes := make([]byte, extraLength)
-	for i := 0; i < int(extraLength); i++ {
-		singleByte := UnsafeReadByte(buf, pos)
-		multiBytes[i] = singleByte
-		pos++
-	}
-	var extra map[string]interface{}
-	err = json.Unmarshal(multiBytes, &extra)
-	assert.NoError(t, err)
-	testExtra, ok := extra["test"]
-	assert.True(t, ok)
-	assert.Equal(t, "testExtra", fmt.Sprintf("%v", testExtra))
-	size, ok := extra[originalSizeKey]
-	assert.True(t, ok)
-	assert.Equal(t, fmt.Sprintf("%v", sizeTotal), fmt.Sprintf("%v", size))
-
-	// start of e1
-	assert.Equal(t, pos, int(descNxtPos))
-
-	// insert e1 header, Timestamp
-	e1ts := UnsafeReadInt64(buf, pos)
-	diffts = curts - e1ts
-	assert.LessOrEqual(t, diffts, maxdiff)
-	pos += int(unsafe.Sizeof(e1ts))
-
-	// insert e1 header, type code
-	e1tc := UnsafeReadInt8(buf, pos)
-	assert.Equal(t, EventTypeCode(e1tc), CreateCollectionEventType)
-	pos += int(unsafe.Sizeof(e1tc))
-
-	// insert e1 header, event length
-	e1EventLen := UnsafeReadInt32(buf, pos)
-	pos += int(unsafe.Sizeof(e1EventLen))
-
-	// insert e1 header, next position
-	e1NxtPos := UnsafeReadInt32(buf, pos)
-	assert.Equal(t, descNxtPos+e1EventLen, e1NxtPos)
-	pos += int(unsafe.Sizeof(descNxtPos))
-
-	// insert e1 data, start time stamp
-	e1st := UnsafeReadInt64(buf, pos)
-	assert.Equal(t, e1st, int64(100))
-	pos += int(unsafe.Sizeof(e1st))
-
-	// insert e1 data, end time stamp
-	e1et := UnsafeReadInt64(buf, pos)
-	assert.Equal(t, e1et, int64(200))
-	pos += int(unsafe.Sizeof(e1et))
-
-	// insert e1, payload
-	e1Payload := buf[pos:e1NxtPos]
-	e1r, err := NewPayloadReader(schemapb.DataType_Int64, e1Payload, false)
-	assert.NoError(t, err)
-	e1a, valids, err := e1r.GetInt64FromPayload()
-	assert.Nil(t, valids)
-	assert.NoError(t, err)
-	assert.Equal(t, e1a, []int64{1, 2, 3, 4, 5, 6})
-	e1r.Close()
-
-	// start of e2
-	pos = int(e1NxtPos)
-
-	// insert e2 header, Timestamp
-	e2ts := UnsafeReadInt64(buf, pos)
-	diffts = curts - e2ts
-	assert.LessOrEqual(t, diffts, maxdiff)
-	pos += int(unsafe.Sizeof(e2ts))
-
-	// insert e2 header, type code
-	e2tc := UnsafeReadInt8(buf, pos)
-	assert.Equal(t, EventTypeCode(e2tc), DropCollectionEventType)
-	pos += int(unsafe.Sizeof(e2tc))
-
-	// insert e2 header, event length
-	e2EventLen := UnsafeReadInt32(buf, pos)
-	pos += int(unsafe.Sizeof(e2EventLen))
-
-	// insert e2 header, next position
-	e2NxtPos := UnsafeReadInt32(buf, pos)
-	assert.Equal(t, e1NxtPos+e2EventLen, e2NxtPos)
-	pos += int(unsafe.Sizeof(descNxtPos))
-
-	// insert e2 data, start time stamp
-	e2st := UnsafeReadInt64(buf, pos)
-	assert.Equal(t, e2st, int64(300))
-	pos += int(unsafe.Sizeof(e2st))
-
-	// insert e2 data, end time stamp
-	e2et := UnsafeReadInt64(buf, pos)
-	assert.Equal(t, e2et, int64(400))
-	pos += int(unsafe.Sizeof(e2et))
-
-	// insert e2, payload
-	e2Payload := buf[pos:]
-	e2r, err := NewPayloadReader(schemapb.DataType_Int64, e2Payload, false)
-	assert.NoError(t, err)
-	e2a, valids, err := e2r.GetInt64FromPayload()
-	assert.Nil(t, valids)
-	assert.NoError(t, err)
-	assert.Equal(t, e2a, []int64{7, 8, 9, 10, 11, 12})
-	e2r.Close()
-
-	assert.Equal(t, int(e2NxtPos), len(buf))
-
-	// read binlog
-	r, err := NewBinlogReader(buf)
-	assert.NoError(t, err)
-	event1, err := r.NextEventReader()
-	assert.NoError(t, err)
-	assert.NotNil(t, event1)
-	p1, valids, err := event1.GetInt64FromPayload()
-	assert.Nil(t, valids)
-	assert.Equal(t, p1, []int64{1, 2, 3, 4, 5, 6})
-	assert.NoError(t, err)
-	assert.Equal(t, event1.TypeCode, CreateCollectionEventType)
-	ed1, ok := (event1.eventData).(*createCollectionEventData)
-	assert.True(t, ok)
-	assert.Equal(t, ed1.StartTimestamp, Timestamp(100))
-	assert.Equal(t, ed1.EndTimestamp, Timestamp(200))
-
-	event2, err := r.NextEventReader()
-	assert.NoError(t, err)
-	assert.NotNil(t, event2)
-	p2, valids, err := event2.GetInt64FromPayload()
-	assert.Nil(t, valids)
-	assert.NoError(t, err)
-	assert.Equal(t, p2, []int64{7, 8, 9, 10, 11, 12})
-	assert.Equal(t, event2.TypeCode, DropCollectionEventType)
-	ed2, ok := (event2.eventData).(*dropCollectionEventData)
-	assert.True(t, ok)
-	_, ok = (event2.eventData).(*insertEventData)
-	assert.False(t, ok)
-	assert.Equal(t, ed2.StartTimestamp, Timestamp(300))
-	assert.Equal(t, ed2.EndTimestamp, Timestamp(400))
-}
-
-/* #nosec G103 */
-func TestDDLBinlog2(t *testing.T) {
-	w := NewDDLBinlogWriter(schemapb.DataType_Int64, 50)
-
-	e1, err := w.NextCreatePartitionEventWriter()
-	assert.NoError(t, err)
-	err = e1.AddDataToPayload([]int64{1, 2, 3}, nil)
-	assert.NoError(t, err)
-	err = e1.AddDataToPayload([]int32{4, 5, 6}, nil)
-	assert.Error(t, err)
-	err = e1.AddDataToPayload([]int64{4, 5, 6}, nil)
-	assert.NoError(t, err)
-	e1.SetEventTimestamp(100, 200)
-
-	e2, err := w.NextDropPartitionEventWriter()
-	assert.NoError(t, err)
-	err = e2.AddDataToPayload([]int64{7, 8, 9}, nil)
-	assert.NoError(t, err)
-	err = e2.AddDataToPayload([]bool{true, false, true}, nil)
-	assert.Error(t, err)
-	err = e2.AddDataToPayload([]int64{10, 11, 12}, nil)
-	assert.NoError(t, err)
-	e2.SetEventTimestamp(300, 400)
-
-	w.SetEventTimeStamp(1000, 2000)
-
-	w.baseBinlogWriter.descriptorEventData.AddExtra("test", "testExtra")
-	sizeTotal := 2000000
-	w.baseBinlogWriter.descriptorEventData.AddExtra(originalSizeKey, fmt.Sprintf("%v", sizeTotal))
-
-	_, err = w.GetBuffer()
-	assert.Error(t, err)
-	err = w.Finish()
-	assert.NoError(t, err)
-	buf, err := w.GetBuffer()
-	assert.NoError(t, err)
-	w.Close()
-
-	// magic number
-	magicNum := UnsafeReadInt32(buf, 0)
-	assert.Equal(t, magicNum, MagicNumber)
-	pos := int(unsafe.Sizeof(MagicNumber))
-
-	// descriptor header, timestamp
-	ts := UnsafeReadInt64(buf, pos)
-	assert.Greater(t, ts, int64(0))
-	curts := time.Now().UnixNano() / int64(time.Millisecond)
-	curts = int64(tsoutil.ComposeTS(curts, 0))
-	diffts := curts - ts
-	maxdiff := int64(tsoutil.ComposeTS(1000, 0))
-	assert.LessOrEqual(t, diffts, maxdiff)
-	pos += int(unsafe.Sizeof(ts))
-
-	// descriptor header, type code
-	tc := UnsafeReadInt8(buf, pos)
-	assert.Equal(t, EventTypeCode(tc), DescriptorEventType)
-	pos += int(unsafe.Sizeof(tc))
-
-	// descriptor header, event length
-	descEventLen := UnsafeReadInt32(buf, pos)
-	pos += int(unsafe.Sizeof(descEventLen))
-
-	// descriptor header, next position
-	descNxtPos := UnsafeReadInt32(buf, pos)
-	assert.Equal(t, descEventLen+int32(unsafe.Sizeof(MagicNumber)), descNxtPos)
-	pos += int(unsafe.Sizeof(descNxtPos))
-
-	// descriptor data fix, collection id
-	collID := UnsafeReadInt64(buf, pos)
-	assert.Equal(t, collID, int64(50))
-	pos += int(unsafe.Sizeof(collID))
-
-	// descriptor data fix, partition id
-	partID := UnsafeReadInt64(buf, pos)
-	assert.Equal(t, partID, int64(-1))
-	pos += int(unsafe.Sizeof(partID))
-
-	// descriptor data fix, segment id
-	segID := UnsafeReadInt64(buf, pos)
-	assert.Equal(t, segID, int64(-1))
-	pos += int(unsafe.Sizeof(segID))
-
-	// descriptor data fix, field id
-	fieldID := UnsafeReadInt64(buf, pos)
-	assert.Equal(t, fieldID, int64(-1))
-	pos += int(unsafe.Sizeof(fieldID))
-
-	// descriptor data fix, nullable
-	nullable := UnsafeReadBool(buf, pos)
-	assert.Equal(t, nullable, false)
-	pos += int(unsafe.Sizeof(nullable))
-
-	// descriptor data fix, start time stamp
-	startts := UnsafeReadInt64(buf, pos)
-	assert.Equal(t, startts, int64(1000))
-	pos += int(unsafe.Sizeof(startts))
-
-	// descriptor data fix, end time stamp
-	endts := UnsafeReadInt64(buf, pos)
-	assert.Equal(t, endts, int64(2000))
-	pos += int(unsafe.Sizeof(endts))
-
-	// descriptor data fix, payload type
-	colType := UnsafeReadInt32(buf, pos)
-	assert.Equal(t, schemapb.DataType(colType), schemapb.DataType_Int64)
-	pos += int(unsafe.Sizeof(colType))
-
-	// descriptor data, post header lengths
-	for i := DescriptorEventType; i < EventTypeEnd; i++ {
-		size := getEventFixPartSize(i)
-		assert.Equal(t, uint8(size), buf[pos])
-		pos++
-	}
-
-	// descriptor data, extra length
-	extraLength := UnsafeReadInt32(buf, pos)
-	assert.Equal(t, extraLength, w.baseBinlogWriter.descriptorEventData.ExtraLength)
-	pos += int(unsafe.Sizeof(extraLength))
-
-	multiBytes := make([]byte, extraLength)
-	for i := 0; i < int(extraLength); i++ {
-		singleByte := UnsafeReadByte(buf, pos)
-		multiBytes[i] = singleByte
-		pos++
-	}
-	var extra map[string]interface{}
-	err = json.Unmarshal(multiBytes, &extra)
-	assert.NoError(t, err)
-	testExtra, ok := extra["test"]
-	assert.True(t, ok)
-	assert.Equal(t, "testExtra", fmt.Sprintf("%v", testExtra))
-	size, ok := extra[originalSizeKey]
-	assert.True(t, ok)
-	assert.Equal(t, fmt.Sprintf("%v", sizeTotal), fmt.Sprintf("%v", size))
-
-	// start of e1
-	assert.Equal(t, pos, int(descNxtPos))
-
-	// insert e1 header, Timestamp
-	e1ts := UnsafeReadInt64(buf, pos)
-	diffts = curts - e1ts
-	assert.LessOrEqual(t, diffts, maxdiff)
-	pos += int(unsafe.Sizeof(e1ts))
-
-	// insert e1 header, type code
-	e1tc := UnsafeReadInt8(buf, pos)
-	assert.Equal(t, EventTypeCode(e1tc), CreatePartitionEventType)
-	pos += int(unsafe.Sizeof(e1tc))
-
-	// insert e1 header, event length
-	e1EventLen := UnsafeReadInt32(buf, pos)
-	pos += int(unsafe.Sizeof(e1EventLen))
-
-	// insert e1 header, next position
-	e1NxtPos := UnsafeReadInt32(buf, pos)
-	assert.Equal(t, descNxtPos+e1EventLen, e1NxtPos)
-	pos += int(unsafe.Sizeof(descNxtPos))
-
-	// insert e1 data, start time stamp
-	e1st := UnsafeReadInt64(buf, pos)
-	assert.Equal(t, e1st, int64(100))
-	pos += int(unsafe.Sizeof(e1st))
-
-	// insert e1 data, end time stamp
-	e1et := UnsafeReadInt64(buf, pos)
-	assert.Equal(t, e1et, int64(200))
-	pos += int(unsafe.Sizeof(e1et))
-
-	// insert e1, payload
-	e1Payload := buf[pos:e1NxtPos]
-	e1r, err := NewPayloadReader(schemapb.DataType_Int64, e1Payload, false)
-	assert.NoError(t, err)
-	e1a, valids, err := e1r.GetInt64FromPayload()
-	assert.Nil(t, valids)
-	assert.NoError(t, err)
-	assert.Equal(t, e1a, []int64{1, 2, 3, 4, 5, 6})
-	e1r.Close()
-
-	// start of e2
-	pos = int(e1NxtPos)
-
-	// insert e2 header, Timestamp
-	e2ts := UnsafeReadInt64(buf, pos)
-	diffts = curts - e2ts
-	assert.LessOrEqual(t, diffts, maxdiff)
-	pos += int(unsafe.Sizeof(e2ts))
-
-	// insert e2 header, type code
-	e2tc := UnsafeReadInt8(buf, pos)
-	assert.Equal(t, EventTypeCode(e2tc), DropPartitionEventType)
-	pos += int(unsafe.Sizeof(e2tc))
-
-	// insert e2 header, event length
-	e2EventLen := UnsafeReadInt32(buf, pos)
-	pos += int(unsafe.Sizeof(e2EventLen))
-
-	// insert e2 header, next position
-	e2NxtPos := UnsafeReadInt32(buf, pos)
-	assert.Equal(t, e1NxtPos+e2EventLen, e2NxtPos)
-	pos += int(unsafe.Sizeof(descNxtPos))
-
-	// insert e2 data, start time stamp
-	e2st := UnsafeReadInt64(buf, pos)
-	assert.Equal(t, e2st, int64(300))
-	pos += int(unsafe.Sizeof(e2st))
-
-	// insert e2 data, end time stamp
-	e2et := UnsafeReadInt64(buf, pos)
-	assert.Equal(t, e2et, int64(400))
-	pos += int(unsafe.Sizeof(e2et))
-
-	// insert e2, payload
-	e2Payload := buf[pos:]
-	e2r, err := NewPayloadReader(schemapb.DataType_Int64, e2Payload, false)
-	assert.NoError(t, err)
-	e2a, valids, err := e2r.GetInt64FromPayload()
-	assert.Nil(t, valids)
-	assert.NoError(t, err)
-	assert.Equal(t, e2a, []int64{7, 8, 9, 10, 11, 12})
-	e2r.Close()
-
-	assert.Equal(t, int(e2NxtPos), len(buf))
-
-	// read binlog
-	r, err := NewBinlogReader(buf)
-	assert.NoError(t, err)
-	event1, err := r.NextEventReader()
-	assert.NoError(t, err)
-	assert.NotNil(t, event1)
-	p1, valids, err := event1.GetInt64FromPayload()
-	assert.Nil(t, valids)
-	assert.Equal(t, p1, []int64{1, 2, 3, 4, 5, 6})
-	assert.NoError(t, err)
-	assert.Equal(t, event1.TypeCode, CreatePartitionEventType)
-	ed1, ok := (event1.eventData).(*createPartitionEventData)
-	assert.True(t, ok)
-	assert.Equal(t, ed1.StartTimestamp, Timestamp(100))
-	assert.Equal(t, ed1.EndTimestamp, Timestamp(200))
-
-	event2, err := r.NextEventReader()
-	assert.NoError(t, err)
-	assert.NotNil(t, event2)
-	p2, valids, err := event2.GetInt64FromPayload()
-	assert.Nil(t, valids)
-	assert.NoError(t, err)
-	assert.Equal(t, p2, []int64{7, 8, 9, 10, 11, 12})
-	assert.Equal(t, event2.TypeCode, DropPartitionEventType)
-	ed2, ok := (event2.eventData).(*dropPartitionEventData)
-	assert.True(t, ok)
-	_, ok = (event2.eventData).(*insertEventData)
-	assert.False(t, ok)
-	assert.Equal(t, ed2.StartTimestamp, Timestamp(300))
-	assert.Equal(t, ed2.EndTimestamp, Timestamp(400))
-}
-
-/* #nosec G103 */
 func TestIndexFileBinlog(t *testing.T) {
 	indexBuildID := UniqueID(uniquegenerator.GetUniqueIntGeneratorIns().GetInt())
 	version := int64(uniquegenerator.GetUniqueIntGeneratorIns().GetInt())
@@ -1139,11 +619,6 @@ func TestIndexFileBinlog(t *testing.T) {
 	fID := UnsafeReadInt64(buf, pos)
 	assert.Equal(t, fieldID, fID)
 	pos += int(unsafe.Sizeof(fID))
-
-	// descriptor data fix, nullable
-	nullable := UnsafeReadBool(buf, pos)
-	assert.Equal(t, nullable, false)
-	pos += int(unsafe.Sizeof(nullable))
 
 	// descriptor data fix, start time stamp
 	startts := UnsafeReadInt64(buf, pos)
@@ -1274,11 +749,6 @@ func TestIndexFileBinlogV2(t *testing.T) {
 	assert.Equal(t, fieldID, fID)
 	pos += int(unsafe.Sizeof(fID))
 
-	// descriptor data fix, nullable
-	nullable := UnsafeReadBool(buf, pos)
-	assert.Equal(t, nullable, false)
-	pos += int(unsafe.Sizeof(nullable))
-
 	// descriptor data fix, start time stamp
 	startts := UnsafeReadInt64(buf, pos)
 	assert.Equal(t, startts, int64(timestamp))
@@ -1359,7 +829,7 @@ func TestNewBinlogReaderError(t *testing.T) {
 
 	w.SetEventTimeStamp(1000, 2000)
 
-	e1, err := w.NextInsertEventWriter(false)
+	e1, err := w.NextInsertEventWriter()
 	assert.NoError(t, err)
 	err = e1.AddDataToPayload([]int64{1, 2, 3}, nil)
 	assert.NoError(t, err)
@@ -1423,7 +893,7 @@ func TestNewBinlogWriterTsError(t *testing.T) {
 
 func TestInsertBinlogWriterCloseError(t *testing.T) {
 	insertWriter := NewInsertBinlogWriter(schemapb.DataType_Int64, 10, 20, 30, 40, false)
-	e1, err := insertWriter.NextInsertEventWriter(false)
+	e1, err := insertWriter.NextInsertEventWriter()
 	assert.NoError(t, err)
 
 	sizeTotal := 2000000
@@ -1436,7 +906,7 @@ func TestInsertBinlogWriterCloseError(t *testing.T) {
 	err = insertWriter.Finish()
 	assert.NoError(t, err)
 	assert.NotNil(t, insertWriter.buffer)
-	insertEventWriter, err := insertWriter.NextInsertEventWriter(false)
+	insertEventWriter, err := insertWriter.NextInsertEventWriter()
 	assert.Nil(t, insertEventWriter)
 	assert.Error(t, err)
 	insertWriter.Close()
@@ -1461,42 +931,6 @@ func TestDeleteBinlogWriteCloseError(t *testing.T) {
 	deleteWriter.Close()
 }
 
-func TestDDBinlogWriteCloseError(t *testing.T) {
-	ddBinlogWriter := NewDDLBinlogWriter(schemapb.DataType_Int64, 10)
-	e1, err := ddBinlogWriter.NextCreateCollectionEventWriter()
-	assert.NoError(t, err)
-
-	sizeTotal := 2000000
-	ddBinlogWriter.baseBinlogWriter.descriptorEventData.AddExtra(originalSizeKey, fmt.Sprintf("%v", sizeTotal))
-
-	err = e1.AddDataToPayload([]int64{1, 2, 3}, nil)
-	assert.NoError(t, err)
-	e1.SetEventTimestamp(100, 200)
-
-	ddBinlogWriter.SetEventTimeStamp(1000, 2000)
-	err = ddBinlogWriter.Finish()
-	assert.NoError(t, err)
-	assert.NotNil(t, ddBinlogWriter.buffer)
-
-	createCollectionEventWriter, err := ddBinlogWriter.NextCreateCollectionEventWriter()
-	assert.Nil(t, createCollectionEventWriter)
-	assert.Error(t, err)
-
-	dropCollectionEventWriter, err := ddBinlogWriter.NextDropCollectionEventWriter()
-	assert.Nil(t, dropCollectionEventWriter)
-	assert.Error(t, err)
-
-	createPartitionEventWriter, err := ddBinlogWriter.NextCreatePartitionEventWriter()
-	assert.Nil(t, createPartitionEventWriter)
-	assert.Error(t, err)
-
-	dropPartitionEventWriter, err := ddBinlogWriter.NextDropPartitionEventWriter()
-	assert.Nil(t, dropPartitionEventWriter)
-	assert.Error(t, err)
-
-	ddBinlogWriter.Close()
-}
-
 type testEvent struct {
 	PayloadWriterInterface
 	finishError           bool
@@ -1507,7 +941,7 @@ type testEvent struct {
 
 func (e *testEvent) Finish() error {
 	if e.finishError {
-		return fmt.Errorf("finish error")
+		return errors.New("finish error")
 	}
 	return nil
 }
@@ -1517,21 +951,21 @@ func (e *testEvent) Close() {
 
 func (e *testEvent) Write(buffer *bytes.Buffer) error {
 	if e.writeError {
-		return fmt.Errorf("write error")
+		return errors.New("write error")
 	}
 	return nil
 }
 
 func (e *testEvent) GetMemoryUsageInBytes() (int32, error) {
 	if e.getMemoryError {
-		return -1, fmt.Errorf("getMemory error")
+		return -1, errors.New("getMemory error")
 	}
 	return 0, nil
 }
 
 func (e *testEvent) GetPayloadLengthFromWriter() (int, error) {
 	if e.getPayloadLengthError {
-		return -1, fmt.Errorf("getPayloadLength error")
+		return -1, errors.New("getPayloadLength error")
 	}
 	return 0, nil
 }

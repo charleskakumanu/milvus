@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include "exec/expression/function/FunctionFactory.h"
 #include "common/Exception.h"
 #include "common/Schema.h"
 #include "common/Types.h"
@@ -115,22 +116,26 @@ struct ColumnInfo {
     DataType data_type_;
     DataType element_type_;
     std::vector<std::string> nested_path_;
+    bool nullable_;
 
     ColumnInfo(const proto::plan::ColumnInfo& column_info)
         : field_id_(column_info.field_id()),
           data_type_(static_cast<DataType>(column_info.data_type())),
           element_type_(static_cast<DataType>(column_info.element_type())),
           nested_path_(column_info.nested_path().begin(),
-                       column_info.nested_path().end()) {
+                       column_info.nested_path().end()),
+          nullable_(column_info.nullable()) {
     }
 
     ColumnInfo(FieldId field_id,
                DataType data_type,
-               std::vector<std::string> nested_path = {})
+               std::vector<std::string> nested_path = {},
+               bool nullable = false)
         : field_id_(field_id),
           data_type_(data_type),
           element_type_(DataType::NONE),
-          nested_path_(std::move(nested_path)) {
+          nested_path_(std::move(nested_path)),
+          nullable_(nullable) {
     }
 
     bool
@@ -154,6 +159,19 @@ struct ColumnInfo {
         }
 
         return true;
+    }
+
+    bool
+    operator<(const ColumnInfo& other) const {
+        return std::tie(field_id_,
+                        data_type_,
+                        element_type_,
+                        nested_path_,
+                        nullable_) < std::tie(other.field_id_,
+                                              other.data_type_,
+                                              other.element_type_,
+                                              other.nested_path_,
+                                              other.nullable_);
     }
 
     std::string
@@ -211,6 +229,7 @@ class ITypeExpr {
 
 using TypedExprPtr = std::shared_ptr<const ITypeExpr>;
 
+// NOTE: unused
 class InputTypeExpr : public ITypeExpr {
  public:
     InputTypeExpr(DataType type) : ITypeExpr(type) {
@@ -224,42 +243,7 @@ class InputTypeExpr : public ITypeExpr {
 
 using InputTypeExprPtr = std::shared_ptr<const InputTypeExpr>;
 
-class CallTypeExpr : public ITypeExpr {
- public:
-    CallTypeExpr(DataType type,
-                 const std::vector<TypedExprPtr>& inputs,
-                 std::string fun_name)
-        : ITypeExpr{type, std::move(inputs)} {
-    }
-
-    virtual ~CallTypeExpr() = default;
-
-    virtual const std::string&
-    name() const {
-        return name_;
-    }
-
-    std::string
-    ToString() const override {
-        std::string str{};
-        str += name();
-        str += "(";
-        for (size_t i = 0; i < inputs_.size(); ++i) {
-            if (i != 0) {
-                str += ",";
-            }
-            str += inputs_[i]->ToString();
-        }
-        str += ")";
-        return str;
-    }
-
- private:
-    std::string name_;
-};
-
-using CallTypeExprPtr = std::shared_ptr<const CallTypeExpr>;
-
+// NOTE: unused
 class FieldAccessTypeExpr : public ITypeExpr {
  public:
     FieldAccessTypeExpr(DataType type, const std::string& name)
@@ -311,12 +295,84 @@ class ITypeFilterExpr : public ITypeExpr {
     virtual ~ITypeFilterExpr() = default;
 };
 
+class ColumnExpr : public ITypeExpr {
+ public:
+    explicit ColumnExpr(const ColumnInfo& column)
+        : ITypeExpr(column.data_type_), column_(column) {
+    }
+
+    const ColumnInfo&
+    GetColumn() const {
+        return column_;
+    }
+
+    std::string
+    ToString() const override {
+        std::stringstream ss;
+        ss << "ColumnExpr: {columnInfo:" << column_.ToString() << "}";
+        return ss.str();
+    }
+
+ private:
+    const ColumnInfo column_;
+};
+
+class ValueExpr : public ITypeExpr {
+ public:
+    explicit ValueExpr(const proto::plan::GenericValue& val)
+        : ITypeExpr(DataType::NONE), val_(val) {
+        switch (val.val_case()) {
+            case proto::plan::GenericValue::ValCase::kBoolVal:
+                type_ = DataType::BOOL;
+                break;
+            case proto::plan::GenericValue::ValCase::kInt64Val:
+                type_ = DataType::INT64;
+                break;
+            case proto::plan::GenericValue::ValCase::kFloatVal:
+                type_ = DataType::FLOAT;
+                break;
+            case proto::plan::GenericValue::ValCase::kStringVal:
+                type_ = DataType::VARCHAR;
+                break;
+            case proto::plan::GenericValue::ValCase::kArrayVal:
+                type_ = DataType::ARRAY;
+                break;
+            case proto::plan::GenericValue::ValCase::VAL_NOT_SET:
+                type_ = DataType::NONE;
+                break;
+        }
+    }
+
+    std::string
+    ToString() const override {
+        std::stringstream ss;
+        ss << "ValueExpr: {"
+           << " val:" << val_.DebugString() << "}";
+        return ss.str();
+    }
+
+    const proto::plan::GenericValue
+    GetGenericValue() const {
+        return val_;
+    }
+
+ private:
+    const proto::plan::GenericValue val_;
+};
+
 class UnaryRangeFilterExpr : public ITypeFilterExpr {
  public:
-    explicit UnaryRangeFilterExpr(const ColumnInfo& column,
-                                  proto::plan::OpType op_type,
-                                  const proto::plan::GenericValue& val)
-        : ITypeFilterExpr(), column_(column), op_type_(op_type), val_(val) {
+    explicit UnaryRangeFilterExpr(
+        const ColumnInfo& column,
+        proto::plan::OpType op_type,
+        const proto::plan::GenericValue& val,
+        const std::vector<proto::plan::GenericValue>& extra_values =
+            std::vector<proto::plan::GenericValue>{})
+        : ITypeFilterExpr(),
+          column_(column),
+          op_type_(op_type),
+          val_(val),
+          extra_values_(extra_values) {
     }
 
     std::string
@@ -324,7 +380,16 @@ class UnaryRangeFilterExpr : public ITypeFilterExpr {
         std::stringstream ss;
         ss << "UnaryRangeFilterExpr: {columnInfo:" << column_.ToString()
            << " op_type:" << milvus::proto::plan::OpType_Name(op_type_)
-           << " val:" << val_.DebugString() << "}";
+           << " val:" << val_.DebugString() << " extra_values: [";
+
+        for (size_t i = 0; i < extra_values_.size(); i++) {
+            ss << extra_values_[i].DebugString();
+            if (i != extra_values_.size() - 1) {
+                ss << ", ";
+            }
+        }
+
+        ss << "]}";
         return ss.str();
     }
 
@@ -357,6 +422,7 @@ class UnaryRangeFilterExpr : public ITypeFilterExpr {
     const ColumnInfo column_;
     const proto::plan::OpType op_type_;
     const proto::plan::GenericValue val_;
+    const std::vector<proto::plan::GenericValue> extra_values_;
 };
 
 class AlwaysTrueExpr : public ITypeFilterExpr {
@@ -594,6 +660,64 @@ class BinaryArithOpEvalRangeExpr : public ITypeFilterExpr {
     const proto::plan::GenericValue right_operand_;
     const proto::plan::GenericValue value_;
 };
+
+class NullExpr : public ITypeFilterExpr {
+ public:
+    explicit NullExpr(const ColumnInfo& column, NullExprType op)
+        : ITypeFilterExpr(), column_(column), op_(op) {
+    }
+
+    std::string
+    ToString() const override {
+        return fmt::format("NullExpr:[Column: {}, Operator: {} ",
+                           column_.ToString(),
+                           NullExpr_NullOp_Name(op_));
+    }
+
+ public:
+    const ColumnInfo column_;
+    NullExprType op_;
+};
+
+class CallExpr : public ITypeFilterExpr {
+ public:
+    CallExpr(const std::string fun_name,
+             const std::vector<TypedExprPtr>& parameters,
+             const exec::expression::FilterFunctionPtr function_ptr)
+        : fun_name_(std::move(fun_name)), function_ptr_(function_ptr) {
+        inputs_.insert(inputs_.end(), parameters.begin(), parameters.end());
+    }
+
+    virtual ~CallExpr() = default;
+
+    const std::string&
+    fun_name() const {
+        return fun_name_;
+    }
+
+    const exec::expression::FilterFunctionPtr
+    function_ptr() const {
+        return function_ptr_;
+    }
+
+    std::string
+    ToString() const override {
+        std::string parameters;
+        for (auto& e : inputs_) {
+            parameters += e->ToString();
+            parameters += ", ";
+        }
+        return fmt::format("CallExpr:[Function Name: {}, Parameters: {}]",
+                           fun_name_,
+                           parameters);
+    }
+
+ private:
+    const std::string fun_name_;
+    const exec::expression::FilterFunctionPtr function_ptr_;
+};
+
+using CallExprPtr = std::shared_ptr<const CallExpr>;
 
 class CompareExpr : public ITypeFilterExpr {
  public:

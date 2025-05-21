@@ -2,7 +2,6 @@ package sessionutil
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"math/rand"
 	"net/url"
@@ -26,13 +25,14 @@ import (
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 
+	"github.com/milvus-io/milvus/internal/json"
 	etcdkv "github.com/milvus-io/milvus/internal/kv/etcd"
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/etcd"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/etcd"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 func TestGetServerIDConcurrently(t *testing.T) {
@@ -48,11 +48,11 @@ func TestGetServerIDConcurrently(t *testing.T) {
 	require.NoError(t, err)
 	defer etcdCli.Close()
 	etcdKV := etcdkv.NewEtcdKV(etcdCli, metaRoot)
-	err = etcdKV.RemoveWithPrefix("")
+	err = etcdKV.RemoveWithPrefix(ctx, "")
 	assert.NoError(t, err)
 
 	defer etcdKV.Close()
-	defer etcdKV.RemoveWithPrefix("")
+	defer etcdKV.RemoveWithPrefix(ctx, "")
 
 	var wg sync.WaitGroup
 	muList := sync.Mutex{}
@@ -90,11 +90,11 @@ func TestInit(t *testing.T) {
 	etcdCli, err := etcd.GetRemoteEtcdClient(etcdEndpoints)
 	require.NoError(t, err)
 	etcdKV := etcdkv.NewEtcdKV(etcdCli, metaRoot)
-	err = etcdKV.RemoveWithPrefix("")
+	err = etcdKV.RemoveWithPrefix(ctx, "")
 	assert.NoError(t, err)
 
 	defer etcdKV.Close()
-	defer etcdKV.RemoveWithPrefix("")
+	defer etcdKV.RemoveWithPrefix(ctx, "")
 
 	s := NewSessionWithEtcd(ctx, metaRoot, etcdCli)
 	s.Init("inittest", "testAddr", false, false)
@@ -118,11 +118,11 @@ func TestInitNoArgs(t *testing.T) {
 	etcdCli, err := etcd.GetRemoteEtcdClient(etcdEndpoints)
 	require.NoError(t, err)
 	etcdKV := etcdkv.NewEtcdKV(etcdCli, metaRoot)
-	err = etcdKV.RemoveWithPrefix("")
+	err = etcdKV.RemoveWithPrefix(ctx, "")
 	assert.NoError(t, err)
 
 	defer etcdKV.Close()
-	defer etcdKV.RemoveWithPrefix("")
+	defer etcdKV.RemoveWithPrefix(ctx, "")
 
 	s := NewSession(ctx)
 	s.Init("inittest", "testAddr", false, false)
@@ -148,7 +148,7 @@ func TestUpdateSessions(t *testing.T) {
 	etcdKV := etcdkv.NewEtcdKV(etcdCli, "")
 
 	defer etcdKV.Close()
-	defer etcdKV.RemoveWithPrefix("")
+	defer etcdKV.RemoveWithPrefix(ctx, "")
 
 	var wg sync.WaitGroup
 	muList := sync.Mutex{}
@@ -187,7 +187,7 @@ func TestUpdateSessions(t *testing.T) {
 	notExistSessions, _, _ := s.GetSessions("testt")
 	assert.Equal(t, len(notExistSessions), 0)
 
-	etcdKV.RemoveWithPrefix(metaRoot)
+	etcdKV.RemoveWithPrefix(ctx, metaRoot)
 	assert.Eventually(t, func() bool {
 		sessions, _, _ := s.GetSessions("test")
 		return len(sessions) == 0
@@ -289,7 +289,7 @@ func TestWatcherHandleWatchResp(t *testing.T) {
 
 	etcdKV := etcdkv.NewEtcdKV(etcdCli, "/by-dev/session-ut")
 	defer etcdKV.Close()
-	defer etcdKV.RemoveWithPrefix("/by-dev/session-ut")
+	defer etcdKV.RemoveWithPrefix(ctx, "/by-dev/session-ut")
 	s := NewSessionWithEtcd(ctx, metaRoot, etcdCli)
 	defer s.Revoke(time.Second)
 
@@ -630,6 +630,7 @@ func TestSessionWithVersionRange(t *testing.T) {
 }
 
 func TestSessionProcessActiveStandBy(t *testing.T) {
+	ctx := context.TODO()
 	// initial etcd
 	paramtable.Init()
 	params := paramtable.Get()
@@ -640,11 +641,11 @@ func TestSessionProcessActiveStandBy(t *testing.T) {
 	etcdCli, err := etcd.GetRemoteEtcdClient(etcdEndpoints)
 	require.NoError(t, err)
 	etcdKV := etcdkv.NewEtcdKV(etcdCli, metaRoot)
-	err = etcdKV.RemoveWithPrefix("")
+	err = etcdKV.RemoveWithPrefix(ctx, "")
 	assert.NoError(t, err)
 
 	defer etcdKV.Close()
-	defer etcdKV.RemoveWithPrefix("")
+	defer etcdKV.RemoveWithPrefix(ctx, "")
 
 	var wg sync.WaitGroup
 	signal := make(chan struct{})
@@ -787,7 +788,7 @@ func TestIntegrationMode(t *testing.T) {
 	etcdCli, err := etcd.GetRemoteEtcdClient(etcdEndpoints)
 	require.NoError(t, err)
 	etcdKV := etcdkv.NewEtcdKV(etcdCli, metaRoot)
-	err = etcdKV.RemoveWithPrefix("")
+	err = etcdKV.RemoveWithPrefix(ctx, "")
 	assert.NoError(t, err)
 
 	s1 := NewSessionWithEtcd(ctx, metaRoot, etcdCli)
@@ -1062,6 +1063,21 @@ func (s *SessionSuite) TestSafeCloseLiveCh() {
 	assert.NotPanics(s.T(), func() {
 		session.safeCloseLiveCh()
 	})
+}
+
+func (s *SessionSuite) TestGetSessions() {
+	os.Setenv("MILVUS_SERVER_LABEL_key1", "value1")
+	os.Setenv("MILVUS_SERVER_LABEL_key2", "value2")
+	os.Setenv("key3", "value3")
+
+	defer os.Unsetenv("MILVUS_SERVER_LABEL_key1")
+	defer os.Unsetenv("MILVUS_SERVER_LABEL_key2")
+	defer os.Unsetenv("key3")
+
+	ret := GetServerLabelsFromEnv("querynode")
+	assert.Equal(s.T(), 2, len(ret))
+	assert.Equal(s.T(), "value1", ret["key1"])
+	assert.Equal(s.T(), "value2", ret["key2"])
 }
 
 func TestSessionSuite(t *testing.T) {

@@ -42,22 +42,48 @@ class PhyExistsFilterExpr : public SegmentExpr {
         const std::string& name,
         const segcore::SegmentInternalInterface* segment,
         int64_t active_count,
-        int64_t batch_size)
+        int64_t batch_size,
+        int32_t consistency_level)
         : SegmentExpr(std::move(input),
                       name,
                       segment,
                       expr->column_.field_id_,
+                      expr->column_.nested_path_,
+                      DataType::NONE,
                       active_count,
-                      batch_size),
+                      batch_size,
+                      true,
+                      consistency_level),
           expr_(expr) {
     }
 
     void
     Eval(EvalCtx& context, VectorPtr& result) override;
 
+    std::string
+    ToString() const {
+        return fmt::format("{}", expr_->ToString());
+    }
+
+    bool
+    IsSource() const override {
+        return true;
+    }
+
+    std::optional<milvus::expr::ColumnInfo>
+    GetColumnInfo() const override {
+        return expr_->column_;
+    }
+
  private:
     VectorPtr
-    EvalJsonExistsForDataSegment();
+    EvalJsonExistsForDataSegment(EvalCtx& context);
+
+    VectorPtr
+    EvalJsonExistsForIndex();
+
+    VectorPtr
+    EvalJsonExistsForDataSegmentForIndex();
 
  private:
     std::shared_ptr<const milvus::expr::ExistsExpr> expr_;

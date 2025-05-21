@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 const (
@@ -29,8 +29,6 @@ milvus run [server type] [flags]
 		Start the rootcoord server.
 	-querycoord 'true'
 		Start the querycoord server.
-	-indexcoord 'true'
-		Start the indexcoord server.
 	-datacoord 'true'
 		Start the datacoord server.
 	-alias ''

@@ -18,11 +18,11 @@ package rootcoord
 
 import (
 	"context"
-	"fmt"
 
+	"github.com/cockroachdb/errors"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/v2/log"
 )
 
 type baseUndoTask struct {
@@ -46,13 +46,13 @@ func (b *baseUndoTask) AddStep(todoStep, undoStep nestedStep) {
 
 func (b *baseUndoTask) Execute(ctx context.Context) error {
 	if len(b.todoStep) != len(b.undoStep) {
-		return fmt.Errorf("todo step and undo step length not equal")
+		return errors.New("todo step and undo step length not equal")
 	}
 	for i := 0; i < len(b.todoStep); i++ {
 		todoStep := b.todoStep[i]
 		// no children step in normal case.
 		if _, err := todoStep.Execute(ctx); err != nil {
-			log.Warn("failed to execute step, trying to undo", zap.Error(err), zap.String("desc", todoStep.Desc()))
+			log.Ctx(ctx).Warn("failed to execute step, trying to undo", zap.Error(err), zap.String("desc", todoStep.Desc()))
 			undoSteps := b.undoStep[:i]
 			b.undoStep = nil // let baseUndoTask can be collected.
 			go b.stepExecutor.AddSteps(&stepStack{undoSteps})

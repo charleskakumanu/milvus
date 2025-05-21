@@ -22,6 +22,7 @@
 #include "common/EasyAssert.h"
 #include "common/Types.h"
 #include "common/Utils.h"
+#include "segcore/Record.h"
 #include "common/Exception.h"
 #include "knowhere/sparse_utils.h"
 #include "pb/schema.pb.h"
@@ -39,16 +40,39 @@ TEST(Util, StringMatch) {
 
     ASSERT_TRUE(PrefixMatch("prefix1", "prefix"));
     ASSERT_TRUE(PostfixMatch("1postfix", "postfix"));
+    ASSERT_TRUE(InnerMatch("xxinner1xx", "inner"));
     ASSERT_TRUE(Match(
         std::string("prefix1"), std::string("prefix"), OpType::PrefixMatch));
     ASSERT_TRUE(Match(
         std::string("1postfix"), std::string("postfix"), OpType::PostfixMatch));
+    ASSERT_TRUE(Match(std::string("xxpostfixxx"),
+                      std::string("postfix"),
+                      OpType::InnerMatch));
 
     ASSERT_FALSE(PrefixMatch("", "longer"));
     ASSERT_FALSE(PostfixMatch("", "longer"));
+    ASSERT_FALSE(InnerMatch("", "longer"));
 
     ASSERT_FALSE(PrefixMatch("dontmatch", "prefix"));
-    ASSERT_FALSE(PostfixMatch("dontmatch", "postfix"));
+    ASSERT_FALSE(InnerMatch("dontmatch", "postfix"));
+
+    ASSERT_TRUE(Match(std::string_view("prefix1"),
+                      std::string("prefix"),
+                      OpType::PrefixMatch));
+
+    ASSERT_TRUE(Match(std::string_view("1postfix"),
+                      std::string("postfix"),
+                      OpType::PostfixMatch));
+
+    ASSERT_TRUE(Match(std::string_view("xxpostfixxx"),
+                      std::string("postfix"),
+                      OpType::InnerMatch));
+    ASSERT_TRUE(
+        Match(std::string_view("x"), std::string("x"), OpType::PrefixMatch));
+    ASSERT_FALSE(
+        Match(std::string_view(""), std::string("x"), OpType::InnerMatch));
+    ASSERT_TRUE(
+        Match(std::string_view("x"), std::string(""), OpType::InnerMatch));
 }
 
 TEST(Util, GetDeleteBitmap) {
@@ -63,8 +87,13 @@ TEST(Util, GetDeleteBitmap) {
     schema->set_primary_field_id(i64_fid);
     auto N = 10;
     uint64_t seg_id = 101;
-    InsertRecord insert_record(*schema, N);
-    DeletedRecord delete_record;
+    InsertRecord<false> insert_record(*schema, N);
+    DeletedRecord<false> delete_record(
+        &insert_record,
+        [&insert_record](const PkType& pk, Timestamp timestamp) {
+            return insert_record.search_pk(pk, timestamp);
+        },
+        0);
 
     // fill insert record, all insert records has same pk = 1, timestamps= {1 ... N}
     std::vector<int64_t> age_data(N);
@@ -76,44 +105,21 @@ TEST(Util, GetDeleteBitmap) {
     }
     auto insert_offset = insert_record.reserved.fetch_add(N);
     insert_record.timestamps_.set_data_raw(insert_offset, tss.data(), N);
-    auto field_data = insert_record.get_field_data_base(i64_fid);
+    auto field_data = insert_record.get_data_base(i64_fid);
     field_data->set_data_raw(insert_offset, age_data.data(), N);
     insert_record.ack_responder_.AddSegment(insert_offset, insert_offset + N);
 
     // test case delete pk1(ts = 0) -> insert repeated pk1 (ts = {1 ... N}) -> query (ts = N)
     std::vector<Timestamp> delete_ts = {0};
     std::vector<PkType> delete_pk = {1};
-    delete_record.push(delete_pk, delete_ts.data());
+    delete_record.StreamPush(delete_pk, delete_ts.data());
 
     auto query_timestamp = tss[N - 1];
-    auto del_barrier = get_barrier(delete_record, query_timestamp);
     auto insert_barrier = get_barrier(insert_record, query_timestamp);
-    auto res_bitmap = get_deleted_bitmap(del_barrier,
-                                         insert_barrier,
-                                         delete_record,
-                                         insert_record,
-                                         query_timestamp);
-    ASSERT_EQ(res_bitmap->bitmap_ptr->count(), 0);
-
-    // test case insert repeated pk1 (ts = {1 ... N}) -> delete pk1 (ts = N) -> query (ts = N)
-    delete_ts = {uint64_t(N)};
-    delete_pk = {1};
-    delete_record.push(delete_pk, delete_ts.data());
-
-    del_barrier = get_barrier(delete_record, query_timestamp);
-    res_bitmap = get_deleted_bitmap(del_barrier,
-                                    insert_barrier,
-                                    delete_record,
-                                    insert_record,
-                                    query_timestamp);
-    ASSERT_EQ(res_bitmap->bitmap_ptr->count(), N - 1);
-
-    // test case insert repeated pk1 (ts = {1 ... N}) -> delete pk1 (ts = N) -> query (ts = N/2)
-    query_timestamp = tss[N - 1] / 2;
-    del_barrier = get_barrier(delete_record, query_timestamp);
-    res_bitmap = get_deleted_bitmap(
-        del_barrier, N, delete_record, insert_record, query_timestamp);
-    ASSERT_EQ(res_bitmap->bitmap_ptr->count(), 0);
+    BitsetType res_bitmap(insert_barrier);
+    BitsetTypeView res_view(res_bitmap);
+    delete_record.Query(res_view, insert_barrier, query_timestamp);
+    ASSERT_EQ(res_view.count(), 0);
 }
 
 TEST(Util, OutOfRange) {
@@ -211,4 +217,20 @@ TEST(Util, get_common_prefix) {
     str2 = "";
     common_prefix = milvus::GetCommonPrefix(str1, str2);
     EXPECT_STREQ(common_prefix.c_str(), "");
+}
+
+TEST(Util, dis_closer) {
+    EXPECT_TRUE(milvus::query::dis_closer(0.1, 0.2, "L2"));
+    EXPECT_FALSE(milvus::query::dis_closer(0.2, 0.1, "L2"));
+    EXPECT_FALSE(milvus::query::dis_closer(0.1, 0.1, "L2"));
+
+    EXPECT_TRUE(milvus::query::dis_closer(0.2, 0.1, "IP"));
+    EXPECT_FALSE(milvus::query::dis_closer(0.1, 0.2, "IP"));
+    EXPECT_FALSE(milvus::query::dis_closer(0.1, 0.1, "IP"));
+}
+
+TEST(Util, ProtoLayout) {
+    milvus::ProtoLayout layout;
+    milvus::proto::cgo::IndexStats result;
+    EXPECT_TRUE(layout.SerializeAndHoldProto(result));
 }

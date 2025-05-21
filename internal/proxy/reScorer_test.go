@@ -1,17 +1,18 @@
 package proxy
 
 import (
-	"encoding/json"
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus/internal/json"
 )
 
 func TestRescorer(t *testing.T) {
 	t.Run("default scorer", func(t *testing.T) {
-		rescorers, err := NewReScorers(2, nil)
+		rescorers, err := NewReScorers(context.TODO(), 2, nil)
 		assert.NoError(t, err)
 		assert.Equal(t, 2, len(rescorers))
 		assert.Equal(t, rrfRankType, rescorers[0].scorerType())
@@ -26,7 +27,7 @@ func TestRescorer(t *testing.T) {
 			{Key: RankParamsKey, Value: string(b)},
 		}
 
-		_, err = NewReScorers(2, rankParams)
+		_, err = NewReScorers(context.TODO(), 2, rankParams)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "k not found in rank_params")
 	})
@@ -41,7 +42,7 @@ func TestRescorer(t *testing.T) {
 			{Key: RankParamsKey, Value: string(b)},
 		}
 
-		_, err = NewReScorers(2, rankParams)
+		_, err = NewReScorers(context.TODO(), 2, rankParams)
 		assert.Error(t, err)
 
 		params[RRFParamsKey] = maxRRFParamsValue + 1
@@ -52,7 +53,7 @@ func TestRescorer(t *testing.T) {
 			{Key: RankParamsKey, Value: string(b)},
 		}
 
-		_, err = NewReScorers(2, rankParams)
+		_, err = NewReScorers(context.TODO(), 2, rankParams)
 		assert.Error(t, err)
 	})
 
@@ -66,7 +67,7 @@ func TestRescorer(t *testing.T) {
 			{Key: RankParamsKey, Value: string(b)},
 		}
 
-		rescorers, err := NewReScorers(2, rankParams)
+		rescorers, err := NewReScorers(context.TODO(), 2, rankParams)
 		assert.NoError(t, err)
 		assert.Equal(t, 2, len(rescorers))
 		assert.Equal(t, rrfRankType, rescorers[0].scorerType())
@@ -82,7 +83,7 @@ func TestRescorer(t *testing.T) {
 			{Key: RankParamsKey, Value: string(b)},
 		}
 
-		_, err = NewReScorers(2, rankParams)
+		_, err = NewReScorers(context.TODO(), 2, rankParams)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "not found in rank_params")
 	})
@@ -98,14 +99,34 @@ func TestRescorer(t *testing.T) {
 			{Key: RankParamsKey, Value: string(b)},
 		}
 
-		_, err = NewReScorers(2, rankParams)
+		_, err = NewReScorers(context.TODO(), 2, rankParams)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "rank param weight should be in range [0, 1]")
 	})
 
+	t.Run("weights with norm_score false", func(t *testing.T) {
+		weights := []float64{0.5, 0.2}
+		params := make(map[string]interface{})
+		params[WeightsParamsKey] = weights
+		params[NormScoreKey] = false
+		b, err := json.Marshal(params)
+		assert.NoError(t, err)
+		rankParams := []*commonpb.KeyValuePair{
+			{Key: RankTypeKey, Value: "weighted"},
+			{Key: RankParamsKey, Value: string(b)},
+		}
+
+		rescorers, err := NewReScorers(context.TODO(), 2, rankParams)
+		assert.NoError(t, err)
+		assert.Equal(t, 2, len(rescorers))
+		assert.Equal(t, weightedRankType, rescorers[0].scorerType())
+		assert.Equal(t, float32(weights[0]), rescorers[0].(*weightedScorer).weight)
+		assert.False(t, rescorers[0].(*weightedScorer).normScore)
+	})
+
 	t.Run("weights", func(t *testing.T) {
 		weights := []float64{0.5, 0.2}
-		params := make(map[string][]float64)
+		params := make(map[string]interface{})
 		params[WeightsParamsKey] = weights
 		b, err := json.Marshal(params)
 		assert.NoError(t, err)
@@ -114,10 +135,12 @@ func TestRescorer(t *testing.T) {
 			{Key: RankParamsKey, Value: string(b)},
 		}
 
-		rescorers, err := NewReScorers(2, rankParams)
+		rescorers, err := NewReScorers(context.TODO(), 2, rankParams)
 		assert.NoError(t, err)
 		assert.Equal(t, 2, len(rescorers))
 		assert.Equal(t, weightedRankType, rescorers[0].scorerType())
 		assert.Equal(t, float32(weights[0]), rescorers[0].(*weightedScorer).weight)
+		// normalize scores by default
+		assert.True(t, rescorers[0].(*weightedScorer).normScore)
 	})
 }

@@ -22,6 +22,7 @@ import (
 	"net"
 	"testing"
 
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/suite"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -32,10 +33,10 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus/internal/proxy/connection"
-	"github.com/milvus-io/milvus/pkg/util"
-	"github.com/milvus-io/milvus/pkg/util/crypto"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util"
+	"github.com/milvus-io/milvus/pkg/v2/util/crypto"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 type GrpcAccessInfoSuite struct {
@@ -98,9 +99,30 @@ func (s *GrpcAccessInfoSuite) TestErrorMsg() {
 	result = Get(s.info, "$error_msg")
 	s.Equal(merr.ErrChannelLack.Error(), result[0])
 
+	// replace line breaks
+	s.info.resp = merr.Status(errors.New("test error. stack: 1:\n 2:\n 3:\n"))
+	result = Get(s.info, "$error_msg")
+	s.Equal("test error. stack: 1:\\n 2:\\n 3:\\n", result[0])
+
 	s.info.err = status.Errorf(codes.Unavailable, "mock")
 	result = Get(s.info, "$error_msg")
 	s.Equal("rpc error: code = Unavailable desc = mock", result[0])
+}
+
+func (s *GrpcAccessInfoSuite) TestErrorType() {
+	s.info.resp = &milvuspb.QueryResults{
+		Status: merr.Status(nil),
+	}
+	result := Get(s.info, "$error_type")
+	s.Equal("", result[0])
+
+	s.info.resp = merr.Status(merr.WrapErrAsInputError(merr.ErrParameterInvalid))
+	result = Get(s.info, "$error_type")
+	s.Equal(merr.InputError.String(), result[0])
+
+	s.info.err = merr.ErrParameterInvalid
+	result = Get(s.info, "$error_type")
+	s.Equal(merr.SystemError.String(), result[0])
 }
 
 func (s *GrpcAccessInfoSuite) TestDbName() {

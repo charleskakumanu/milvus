@@ -39,7 +39,7 @@ func ParseSchema(r interface{}) (*entity.Schema, error) {
 	// MapRow is not supported for schema definition
 	// TODO add PrimaryKey() interface later
 	if t.Kind() == reflect.Map {
-		return nil, fmt.Errorf("map row is not supported for schema definition")
+		return nil, errors.New("map row is not supported for schema definition")
 	}
 
 	if t.Kind() != reflect.Struct {
@@ -147,6 +147,8 @@ func ParseSchema(r interface{}) (*entity.Schema, error) {
 				}
 			case reflect.Float32:
 				field.DataType = entity.FieldTypeFloatVector
+			case reflect.Int8:
+				field.DataType = entity.FieldTypeInt8Vector
 			default:
 				return nil, fmt.Errorf("field %s is slice of %v, which is not supported", f.Name, elemType)
 			}

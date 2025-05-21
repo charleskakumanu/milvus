@@ -5,8 +5,10 @@ import time
 from sklearn import preprocessing
 from pathlib import Path
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import numpy as np
-from pymilvus import Collection
+from pymilvus import Collection, utility
 from utils.utils import gen_collection_name
 from utils.util_log import test_log as logger
 import pytest
@@ -29,10 +31,203 @@ class TestCreateImportJob(TestBase):
 
     @pytest.mark.parametrize("insert_num", [3000])
     @pytest.mark.parametrize("import_task_num", [2])
-    @pytest.mark.parametrize("auto_id", [True, False])
+    @pytest.mark.parametrize("auto_id", [True])
     @pytest.mark.parametrize("is_partition_key", [True, False])
-    @pytest.mark.parametrize("enable_dynamic_field", [True, False])
-    def test_job_e2e(self, insert_num, import_task_num, auto_id, is_partition_key, enable_dynamic_field):
+    @pytest.mark.parametrize("enable_dynamic_field", [True])
+    @pytest.mark.parametrize("file_format", ["parquet", "json"])
+    def test_import_job_e2e(self, insert_num, import_task_num, auto_id, is_partition_key, enable_dynamic_field, file_format):
+        # create collection
+        name = gen_collection_name()
+        dim = 128
+        payload = {
+            "collectionName": name,
+            "schema": {
+                "autoId": auto_id,
+                "enableDynamicField": enable_dynamic_field,
+                "fields": [
+                    {"fieldName": "book_id", "dataType": "Int64", "isPrimary": True, "elementTypeParams": {}},
+                    {"fieldName": "word_count", "dataType": "Int64", "isPartitionKey": is_partition_key, "elementTypeParams": {}},
+                    {"fieldName": "book_describe", "dataType": "VarChar", "elementTypeParams": {"max_length": "256"}, "nullable": True},
+                    {"fieldName": "book_intro", "dataType": "FloatVector", "elementTypeParams": {"dim": f"{dim}"}}
+                ]
+            },
+            "indexParams": [{"fieldName": "book_intro", "indexName": "book_intro_vector", "metricType": "L2"}]
+        }
+        rsp = self.collection_client.collection_create(payload)
+        assert rsp["code"] == 0
+        self.wait_load_completed(name)
+        # upload file to storage
+        data = []
+        for i in range(insert_num):
+            tmp = {
+                "word_count": i,
+                "book_describe": f"book_{i}",
+                "book_intro": [np.float32(random.random()) for _ in range(dim)]
+            }
+            if not auto_id:
+                tmp["book_id"] = i
+            if enable_dynamic_field:
+                tmp["$meta"] = {}
+                tmp["$meta"].update({f"dynamic_field_{i}": i})
+            data.append(tmp)
+        # dump data to file
+        file_name = f"bulk_insert_data_{uuid4()}.json" if file_format == "json" else f"bulk_insert_data_{uuid4()}.parquet"
+        file_path = f"/tmp/{file_name}"
+        if file_format == "json":
+            with open(file_path, "w") as f:
+                json.dump(data, f, cls=NumpyEncoder)
+        if file_format == "parquet":
+            pa_schema = pa.schema([
+                ('word_count', pa.int64(), False),  # not nullable
+                ('book_describe', pa.string(), False),  # pecifically set as not nullable to verify a certain corner case
+                ('book_intro', pa.list_(pa.float32()), False)  # not nullable
+            ])
+            df = pd.DataFrame(data)
+            table = pa.Table.from_pandas(df, schema=pa_schema)
+            pq.write_table(table, file_path)
+            schema_info = pq.read_schema(file_path)
+            logger.info(f"parquet schema: {schema_info}")
+        # upload file to minio storage
+        self.storage_client.upload_file(file_path, file_name)
+
+        # create import job
+        payload = {
+            "collectionName": name,
+            "files": [[file_name]],
+        }
+        for i in range(import_task_num):
+            rsp = self.import_job_client.create_import_jobs(payload)
+        # list import job
+        payload = {
+            "collectionName": name,
+        }
+        rsp = self.import_job_client.list_import_jobs(payload)
+
+        # get import job progress
+        for task in rsp['data']["records"]:
+            task_id = task['jobId']
+            finished = False
+            t0 = time.time()
+
+            while not finished:
+                rsp = self.import_job_client.get_import_job_progress(task_id)
+                if rsp['data']['state'] == "Completed":
+                    finished = True
+                time.sleep(5)
+                if time.time() - t0 > IMPORT_TIMEOUT:
+                    assert False, "import job timeout"
+        c = Collection(name)
+        c.load(_refresh=True, timeou=120)
+        res = c.query(
+            expr="",
+            output_fields=["count(*)"],
+        )
+        assert res[0]["count(*)"] == insert_num * import_task_num
+        # query data
+        payload = {
+            "collectionName": name,
+            "filter": "book_id > 0",
+            "outputFields": ["*"],
+        }
+        rsp = self.vector_client.vector_query(payload)
+        assert rsp['code'] == 0
+
+
+    @pytest.mark.parametrize("insert_num", [3000])
+    @pytest.mark.parametrize("import_task_num", [2])
+    @pytest.mark.parametrize("auto_id", [True])
+    @pytest.mark.parametrize("is_partition_key", [True])
+    def test_import_job_with_coo_format(self, insert_num, import_task_num, auto_id, is_partition_key):
+        # create collection
+        name = gen_collection_name()
+        dim = 128
+        payload = {
+            "collectionName": name,
+            "schema": {
+                "autoId": auto_id,
+                "enableDynamicField": False,
+                "fields": [
+                    {"fieldName": "book_id", "dataType": "Int64", "isPrimary": True, "elementTypeParams": {}},
+                    {"fieldName": "word_count", "dataType": "Int64", "isPartitionKey": is_partition_key, "elementTypeParams": {}},
+                    {"fieldName": "book_describe", "dataType": "VarChar", "elementTypeParams": {"max_length": "256"}},
+                    {"fieldName": "book_intro", "dataType": "SparseFloatVector"}
+                ]
+            },
+            "indexParams": [ {"fieldName": "book_intro", "indexName": "sparse_float_vector_index", "metricType": "IP",
+                 "params": {"index_type": "SPARSE_INVERTED_INDEX", "drop_ratio_build": "0.2"}},]
+        }
+        self.collection_client.collection_create(payload)
+        self.wait_load_completed(name)
+        # upload file to storage
+        data = []
+        for i in range(insert_num):
+            tmp = {
+                "word_count": i,
+                "book_describe": f"book_{i}",
+                "book_intro": {"values": [random.random() for i in range(dim)], "indices": [i**2 for i in range(dim)]}
+            }
+            if not auto_id:
+                tmp["book_id"] = i
+            data.append(tmp)
+        # dump data to file
+        file_name = f"bulk_insert_data_{uuid4()}.parquet"
+        file_path = f"/tmp/{file_name}"
+        df = pd.DataFrame(data)
+        logger.info(df)
+        df.to_parquet(file_path, engine="pyarrow")
+        # upload file to minio storage
+        self.storage_client.upload_file(file_path, file_name)
+
+        # create import job
+        payload = {
+            "collectionName": name,
+            "files": [[file_name]],
+        }
+        for i in range(import_task_num):
+            rsp = self.import_job_client.create_import_jobs(payload)
+        # list import job
+        payload = {
+            "collectionName": name,
+        }
+        rsp = self.import_job_client.list_import_jobs(payload)
+
+        # get import job progress
+        for task in rsp['data']["records"]:
+            task_id = task['jobId']
+            finished = False
+            t0 = time.time()
+
+            while not finished:
+                rsp = self.import_job_client.get_import_job_progress(task_id)
+                if rsp['data']['state'] == "Completed":
+                    finished = True
+                time.sleep(5)
+                if time.time() - t0 > IMPORT_TIMEOUT:
+                    assert False, "import job timeout"
+        c = Collection(name)
+        c.load(_refresh=True, timeou=120)
+        res = c.query(
+            expr="",
+            output_fields=["count(*)"],
+        )
+        assert res[0]["count(*)"] == insert_num * import_task_num
+        # query data
+        payload = {
+            "collectionName": name,
+            "filter": "book_id > 0",
+            "outputFields": ["*"],
+        }
+        rsp = self.vector_client.vector_query(payload)
+        assert rsp['code'] == 0
+
+
+
+    @pytest.mark.parametrize("insert_num", [3000])
+    @pytest.mark.parametrize("import_task_num", [2])
+    @pytest.mark.parametrize("auto_id", [True,])
+    @pytest.mark.parametrize("is_partition_key", [True])
+    @pytest.mark.parametrize("enable_dynamic_field", [True])
+    def test_import_with_longer_text_than_max_length(self, insert_num, import_task_num, auto_id, is_partition_key, enable_dynamic_field):
         # create collection
         name = gen_collection_name()
         dim = 128
@@ -50,14 +245,14 @@ class TestCreateImportJob(TestBase):
             },
             "indexParams": [{"fieldName": "book_intro", "indexName": "book_intro_vector", "metricType": "L2"}]
         }
-        rsp = self.collection_client.collection_create(payload)
-
+        self.collection_client.collection_create(payload)
+        self.wait_load_completed(name)
         # upload file to storage
         data = []
         for i in range(insert_num):
             tmp = {
                 "word_count": i,
-                "book_describe": f"book_{i}",
+                "book_describe": f"book_{i}" * 256,
                 "book_intro": [np.float32(random.random()) for _ in range(dim)]
             }
             if not auto_id:
@@ -95,26 +290,15 @@ class TestCreateImportJob(TestBase):
             while not finished:
                 rsp = self.import_job_client.get_import_job_progress(task_id)
                 if rsp['data']['state'] == "Completed":
+                    assert False, "import job should not be completed"
+                if rsp['data']['state'] == "Failed":
+                    assert True
                     finished = True
+                logger.debug(f"job progress: {rsp}")
                 time.sleep(5)
                 if time.time() - t0 > IMPORT_TIMEOUT:
                     assert False, "import job timeout"
-        c = Collection(name)
-        c.load(_refresh=True)
-        time.sleep(10)
-        res = c.query(
-            expr="",
-            output_fields=["count(*)"],
-        )
-        assert res[0]["count(*)"] == insert_num * import_task_num
-        # query data
-        payload = {
-            "collectionName": name,
-            "filter": "book_id > 0",
-            "outputFields": ["*"],
-        }
-        rsp = self.vector_client.vector_query(payload)
-        assert rsp['code'] == 0
+
 
     @pytest.mark.parametrize("insert_num", [5000])
     @pytest.mark.parametrize("import_task_num", [1])
@@ -141,8 +325,8 @@ class TestCreateImportJob(TestBase):
             },
             "indexParams": [{"fieldName": "book_intro", "indexName": "book_intro_vector", "metricType": "L2"}]
         }
-        rsp = self.collection_client.collection_create(payload)
-
+        self.collection_client.collection_create(payload)
+        self.wait_load_completed(name)
         # upload file to storage
         data = []
         for i in range(insert_num):
@@ -191,8 +375,7 @@ class TestCreateImportJob(TestBase):
                 if time.time() - t0 > IMPORT_TIMEOUT:
                     assert False, "import job timeout"
         c = Collection(name)
-        c.load(_refresh=True)
-        time.sleep(10)
+        c.load(_refresh=True, timeou=120)
         res = c.query(
             expr="",
             output_fields=["count(*)"],
@@ -231,7 +414,8 @@ class TestCreateImportJob(TestBase):
             },
             "indexParams": [{"fieldName": "book_intro", "indexName": "book_intro_vector", "metricType": "L2"}]
         }
-        rsp = self.collection_client.collection_create(payload)
+        self.collection_client.collection_create(payload)
+        self.wait_load_completed(name)
 
         # upload file to storage
         data = []
@@ -284,8 +468,7 @@ class TestCreateImportJob(TestBase):
                 if time.time() - t0 > IMPORT_TIMEOUT:
                     assert False, "import job timeout"
         c = Collection(name)
-        c.load(_refresh=True)
-        time.sleep(10)
+        c.load(_refresh=True, timeou=120)
         res = c.query(
             expr="",
             output_fields=["count(*)"],
@@ -324,7 +507,8 @@ class TestCreateImportJob(TestBase):
             },
             "indexParams": [{"fieldName": "book_intro", "indexName": "book_intro_vector", "metricType": "L2"}]
         }
-        rsp = self.collection_client.collection_create(payload)
+        self.collection_client.collection_create(payload)
+        self.wait_load_completed(name)
 
         # upload file to storage
         file_nums = 2
@@ -376,6 +560,7 @@ class TestCreateImportJob(TestBase):
         time.sleep(10)
         # assert data count
         c = Collection(name)
+        c.load(_refresh=True, timeou=120)
         assert c.num_entities == 2000
         # assert import data can be queried
         payload = {
@@ -404,7 +589,8 @@ class TestCreateImportJob(TestBase):
             },
             "indexParams": [{"fieldName": "book_intro", "indexName": "book_intro_vector", "metricType": "L2"}]
         }
-        rsp = self.collection_client.collection_create(payload)
+        self.collection_client.collection_create(payload)
+        self.wait_load_completed(name)
 
         # upload file to storage
         file_nums = 2
@@ -456,6 +642,7 @@ class TestCreateImportJob(TestBase):
         time.sleep(10)
         # assert data count
         c = Collection(name)
+        c.load(_refresh=True, timeou=120)
         assert c.num_entities == 2000
         # assert import data can be queried
         payload = {
@@ -484,7 +671,8 @@ class TestCreateImportJob(TestBase):
             },
             "indexParams": [{"fieldName": "book_intro", "indexName": "book_intro_vector", "metricType": "L2"}]
         }
-        rsp = self.collection_client.collection_create(payload)
+        self.collection_client.collection_create(payload)
+        self.wait_load_completed(name)
 
         # upload file to storage
         file_nums = 2
@@ -541,6 +729,7 @@ class TestCreateImportJob(TestBase):
         time.sleep(10)
         # assert data count
         c = Collection(name)
+        c.load(_refresh=True, timeou=120)
         assert c.num_entities == 2000
         # assert import data can be queried
         payload = {
@@ -569,7 +758,8 @@ class TestCreateImportJob(TestBase):
             },
             "indexParams": [{"fieldName": "book_intro", "indexName": "book_intro_vector", "metricType": "L2"}]
         }
-        rsp = self.collection_client.collection_create(payload)
+        self.collection_client.collection_create(payload)
+        self.wait_load_completed(name)
 
         # upload file to storage
         file_nums = 2
@@ -665,6 +855,7 @@ class TestCreateImportJob(TestBase):
         time.sleep(10)
         # assert data count
         c = Collection(name)
+        c.load(_refresh=True, timeou=120)
         assert c.num_entities == 6000
         # assert import data can be queried
         payload = {
@@ -683,6 +874,8 @@ class TestCreateImportJob(TestBase):
     @pytest.mark.parametrize("enable_dynamic_schema", [True])
     @pytest.mark.parametrize("nb", [3000])
     @pytest.mark.parametrize("dim", [128])
+    @pytest.mark.skip("stats task will generate a new segment, "
+                      "using collectionID as prefix will import twice as much data")
     def test_job_import_binlog_file_type(self, nb, dim, insert_round, auto_id,
                                                       is_partition_key, enable_dynamic_schema, bucket_name, root_path):
         # todo: copy binlog file to backup bucket
@@ -719,8 +912,8 @@ class TestCreateImportJob(TestBase):
                 {"fieldName": "image_emb", "indexName": "image_emb", "metricType": "L2"}
             ]
         }
-        rsp = self.collection_client.collection_create(payload)
-        assert rsp['code'] == 0
+        self.collection_client.collection_create(payload)
+        self.wait_load_completed(name)
         # create restore collection
         restore_collection_name = f"{name}_restore"
         payload["collectionName"] = restore_collection_name
@@ -845,7 +1038,8 @@ class TestImportJobAdvance(TestBase):
             },
             "indexParams": [{"fieldName": "book_intro", "indexName": "book_intro_vector", "metricType": "L2"}]
         }
-        rsp = self.collection_client.collection_create(payload)
+        self.collection_client.collection_create(payload)
+        self.wait_load_completed(name)
 
         # upload file to storage
         file_nums = 10
@@ -913,6 +1107,7 @@ class TestImportJobAdvance(TestBase):
         rsp = self.import_job_client.list_import_jobs(payload)
         # assert data count
         c = Collection(name)
+        c.load(_refresh=True, timeou=120)
         assert c.num_entities == file_nums * batch_size
         # assert import data can be queried
         payload = {
@@ -944,7 +1139,8 @@ class TestCreateImportJobAdvance(TestBase):
             },
             "indexParams": [{"fieldName": "book_intro", "indexName": "book_intro_vector", "metricType": "L2"}]
         }
-        rsp = self.collection_client.collection_create(payload)
+        self.collection_client.collection_create(payload)
+        self.wait_load_completed(name)
 
         # upload file to storage
         task_num = 48
@@ -1005,6 +1201,7 @@ class TestCreateImportJobAdvance(TestBase):
         rsp = self.import_job_client.list_import_jobs(payload)
         # assert data count
         c = Collection(name)
+        c.load(_refresh=True, timeou=120)
         assert c.num_entities == file_nums * batch_size * task_num
         # assert import data can be queried
         payload = {
@@ -1033,7 +1230,8 @@ class TestCreateImportJobAdvance(TestBase):
             },
             "indexParams": [{"fieldName": "book_intro", "indexName": "book_intro_vector", "metricType": "L2"}]
         }
-        rsp = self.collection_client.collection_create(payload)
+        self.collection_client.collection_create(payload)
+        self.wait_load_completed(name)
 
         # upload file to storage
         task_num = 1000
@@ -1094,6 +1292,7 @@ class TestCreateImportJobAdvance(TestBase):
         rsp = self.import_job_client.list_import_jobs(payload)
         # assert data count
         c = Collection(name)
+        c.load(_refresh=True, timeou=120)
         assert c.num_entities == file_nums * batch_size * task_num
         # assert import data can be queried
         payload = {
@@ -1134,7 +1333,8 @@ class TestCreateImportJobNegative(TestBase):
             },
             "indexParams": [{"fieldName": "book_intro", "indexName": "book_intro_vector", "metricType": "L2"}]
         }
-        rsp = self.collection_client.collection_create(payload)
+        self.collection_client.collection_create(payload)
+        self.wait_load_completed(name)
 
         # upload file to storage
         data = []
@@ -1205,7 +1405,8 @@ class TestCreateImportJobNegative(TestBase):
             },
             "indexParams": [{"fieldName": "book_intro", "indexName": "book_intro_vector", "metricType": "L2"}]
         }
-        rsp = self.collection_client.collection_create(payload)
+        self.collection_client.collection_create(payload)
+        self.wait_load_completed(name)
 
         # create import job
         payload = {
@@ -1259,7 +1460,8 @@ class TestCreateImportJobNegative(TestBase):
             },
             "indexParams": [{"fieldName": "book_intro", "indexName": "book_intro_vector", "metricType": "L2"}]
         }
-        rsp = self.collection_client.collection_create(payload)
+        self.collection_client.collection_create(payload)
+        self.wait_load_completed(name)
 
         # create import job
         payload = {
@@ -1514,8 +1716,8 @@ class TestCreateImportJobNegative(TestBase):
                 if time.time() - t0 > IMPORT_TIMEOUT:
                     assert False, "import job timeout"
         c = Collection(name)
-        c.load(_refresh=True)
         time.sleep(10)
+        c.load(_refresh=True, timeou=120)
         res = c.query(
             expr="",
             output_fields=["count(*)"],

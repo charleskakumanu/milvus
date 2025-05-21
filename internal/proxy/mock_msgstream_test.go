@@ -5,18 +5,18 @@ import (
 
 	"github.com/cockroachdb/errors"
 
-	"github.com/milvus-io/milvus/pkg/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
 )
 
 type mockMsgStream struct {
 	msgstream.MsgStream
-	asProducer    func([]string)
-	setRepack     func(repackFunc msgstream.RepackFunc)
-	close         func()
-	enableProduce func(bool)
+	asProducer         func([]string)
+	setRepack          func(repackFunc msgstream.RepackFunc)
+	close              func()
+	forceEnableProduce func(bool)
 }
 
-func (m *mockMsgStream) AsProducer(producers []string) {
+func (m *mockMsgStream) AsProducer(ctx context.Context, producers []string) {
 	if m.asProducer != nil {
 		m.asProducer(producers)
 	}
@@ -34,10 +34,13 @@ func (m *mockMsgStream) Close() {
 	}
 }
 
-func (m *mockMsgStream) EnableProduce(enabled bool) {
-	if m.enableProduce != nil {
-		m.enableProduce(enabled)
+func (m *mockMsgStream) ForceEnableProduce(enabled bool) {
+	if m.forceEnableProduce != nil {
+		m.forceEnableProduce(enabled)
 	}
+}
+
+func (m *mockMsgStream) SetReplicate(config *msgstream.ReplicateConfig) {
 }
 
 func newMockMsgStream() *mockMsgStream {

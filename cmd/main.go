@@ -25,12 +25,19 @@ import (
 
 	"golang.org/x/exp/slices"
 
+	"github.com/milvus-io/milvus/cmd/asan"
 	"github.com/milvus-io/milvus/cmd/milvus"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/internal/util/streamingutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 func main() {
+	// after 2.6.0, we enable streaming service by default.
+	// TODO: after remove all streamingutil.IsStreamingServiceEnabled(), we can remove this code.
+	streamingutil.SetStreamingServiceEnabled()
+
+	defer asan.LsanDoLeakCheck()
 	idx := slices.Index(os.Args, "--run-with-subprocess")
 
 	// execute command as a subprocess if the command contains "--run-with-subprocess"

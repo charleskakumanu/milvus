@@ -1,7 +1,7 @@
 package cgo
 
 /*
-#cgo pkg-config: milvus_common
+#cgo pkg-config: milvus_core
 
 #include "common/type_c.h"
 #include <stdlib.h>
@@ -11,7 +11,7 @@ import "C"
 import (
 	"unsafe"
 
-	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 )
 
 func ConsumeCStatusIntoError(status *C.CStatus) error {

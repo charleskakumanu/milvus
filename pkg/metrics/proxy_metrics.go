@@ -21,7 +21,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 var (
@@ -66,7 +66,7 @@ var (
 			Subsystem: typeutil.ProxyRole,
 			Name:      "delete_vectors_count",
 			Help:      "counter of vectors successfully deleted",
-		}, []string{nodeIDLabelName, databaseLabelName})
+		}, []string{nodeIDLabelName, databaseLabelName, collectionName})
 
 	// ProxySQLatency record the latency of search successfully.
 	ProxySQLatency = prometheus.NewHistogramVec(
@@ -263,6 +263,43 @@ var (
 			Help:      "count of bytes sent back to sdk",
 		}, []string{nodeIDLabelName})
 
+	// RestfulFunctionCall records the number of times the restful apis was called.
+	RestfulFunctionCall = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.ProxyRole,
+			Name:      "restful_api_req_count",
+			Help:      "count of operation executed",
+		}, []string{nodeIDLabelName, pathLabelName})
+
+	// RestfulReqLatency records the latency that for all requests.
+	RestfulReqLatency = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.ProxyRole,
+			Name:      "restful_api_req_latency",
+			Help:      "latency of each request",
+			Buckets:   buckets, // unit: ms
+		}, []string{nodeIDLabelName, pathLabelName})
+
+	// RestfulReceiveBytes record the received bytes of messages in Proxy
+	RestfulReceiveBytes = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.ProxyRole,
+			Name:      "restful_api_receive_bytes_count",
+			Help:      "count of bytes received  from sdk",
+		}, []string{nodeIDLabelName, pathLabelName})
+
+	// RestfulSendBytes record the bytes sent back to client by Proxy
+	RestfulSendBytes = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.ProxyRole,
+			Name:      "restful_api_send_bytes_count",
+			Help:      "count of bytes sent back to sdk",
+		}, []string{nodeIDLabelName, pathLabelName})
+
 	// ProxyReportValue records value about the request
 	ProxyReportValue = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -334,6 +371,89 @@ var (
 			Name:      "slow_query_count",
 			Help:      "count of slow query executed",
 		}, []string{nodeIDLabelName, msgTypeLabelName})
+
+	// ProxyReqInQueueLatency records the latency that requests wait in the queue, like "CreateCollection".
+	ProxyReqInQueueLatency = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.ProxyRole,
+			Name:      "req_in_queue_latency",
+			Help:      "latency which request waits in the queue",
+			Buckets:   buckets, // unit: ms
+		}, []string{nodeIDLabelName, functionLabelName})
+
+	MaxInsertRate = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.ProxyRole,
+			Name:      "max_insert_rate",
+			Help:      "max insert rate",
+		}, []string{"node_id", "scope"})
+
+	// ProxyRetrySearchCount records the retry search count when result count does not meet limit and topk reduce is on
+	ProxyRetrySearchCount = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.ProxyRole,
+			Name:      "retry_search_cnt",
+			Help:      "counter of retry search",
+		}, []string{nodeIDLabelName, queryTypeLabelName, collectionName})
+
+	// ProxyRetrySearchResultInsufficientCount records the retry search without reducing topk that still not meet result limit
+	// there are more likely some non-index-related reasons like we do not have enough entities for very big k, duplicate pks, etc
+	ProxyRetrySearchResultInsufficientCount = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.ProxyRole,
+			Name:      "retry_search_result_insufficient_cnt",
+			Help:      "counter of retry search which does not have enough results",
+		}, []string{nodeIDLabelName, queryTypeLabelName, collectionName})
+
+	// ProxyRecallSearchCount records the counter that users issue recall evaluation requests, which are cpu-intensive
+	ProxyRecallSearchCount = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.ProxyRole,
+			Name:      "recall_search_cnt",
+			Help:      "counter of recall search",
+		}, []string{nodeIDLabelName, queryTypeLabelName, collectionName})
+
+	// ProxySearchSparseNumNonZeros records the estimated number of non-zeros in each sparse search task
+	ProxySearchSparseNumNonZeros = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.ProxyRole,
+			Name:      "search_sparse_num_non_zeros",
+			Help:      "the number of non-zeros in each sparse search task",
+			Buckets:   buckets,
+		}, []string{nodeIDLabelName, collectionName, queryTypeLabelName, fieldIDLabelName})
+
+	// ProxyQueueTaskNum records task number of queue in Proxy.
+	ProxyQueueTaskNum = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.ProxyRole,
+			Name:      "queue_task_num",
+			Help:      "",
+		}, []string{nodeIDLabelName, queueTypeLabelName, TaskStateLabel})
+
+	ProxyParseExpressionLatency = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.ProxyRole,
+			Name:      "parse_expr_latency",
+			Help:      "the latency of parse expression",
+			Buckets:   buckets,
+		}, []string{nodeIDLabelName, functionLabelName, statusLabelName})
+	// ProxyFunctionlatency records the latency of function
+	ProxyFunctionlatency = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.ProxyRole,
+			Name:      "function_udf_call_latency",
+			Help:      "latency of function call",
+			Buckets:   buckets,
+		}, []string{nodeIDLabelName, collectionName, functionTypeName, functionProvider, functionName})
 )
 
 // RegisterProxy registers Proxy metrics
@@ -373,6 +493,12 @@ func RegisterProxy(registry *prometheus.Registry) {
 	registry.MustRegister(ProxyReceiveBytes)
 	registry.MustRegister(ProxyReadReqSendBytes)
 
+	registry.MustRegister(RestfulFunctionCall)
+	registry.MustRegister(RestfulReqLatency)
+
+	registry.MustRegister(RestfulReceiveBytes)
+	registry.MustRegister(RestfulSendBytes)
+
 	registry.MustRegister(ProxyLimiterRate)
 	registry.MustRegister(ProxyHookFunc)
 	registry.MustRegister(UserRPCCounter)
@@ -383,6 +509,21 @@ func RegisterProxy(registry *prometheus.Registry) {
 
 	registry.MustRegister(ProxySlowQueryCount)
 	registry.MustRegister(ProxyReportValue)
+	registry.MustRegister(ProxyReqInQueueLatency)
+
+	registry.MustRegister(MaxInsertRate)
+	registry.MustRegister(ProxyRetrySearchCount)
+	registry.MustRegister(ProxyRetrySearchResultInsufficientCount)
+	registry.MustRegister(ProxyRecallSearchCount)
+
+	registry.MustRegister(ProxySearchSparseNumNonZeros)
+	registry.MustRegister(ProxyQueueTaskNum)
+
+	registry.MustRegister(ProxyParseExpressionLatency)
+
+	registry.MustRegister(ProxyFunctionlatency)
+
+	RegisterStreamingServiceClient(registry)
 }
 
 func CleanupProxyDBMetrics(nodeID int64, dbName string) {
@@ -485,5 +626,30 @@ func CleanupProxyCollectionMetrics(nodeID int64, collection string) {
 	ProxyReceiveBytes.Delete(prometheus.Labels{
 		nodeIDLabelName:  strconv.FormatInt(nodeID, 10),
 		msgTypeLabelName: UpsertLabel, collectionName: collection,
+	})
+	ProxyRetrySearchCount.Delete(prometheus.Labels{
+		nodeIDLabelName:    strconv.FormatInt(nodeID, 10),
+		queryTypeLabelName: SearchLabel,
+		collectionName:     collection,
+	})
+	ProxyRetrySearchCount.Delete(prometheus.Labels{
+		nodeIDLabelName:    strconv.FormatInt(nodeID, 10),
+		queryTypeLabelName: HybridSearchLabel,
+		collectionName:     collection,
+	})
+	ProxyRetrySearchResultInsufficientCount.Delete(prometheus.Labels{
+		nodeIDLabelName:    strconv.FormatInt(nodeID, 10),
+		queryTypeLabelName: SearchLabel,
+		collectionName:     collection,
+	})
+	ProxyRetrySearchResultInsufficientCount.Delete(prometheus.Labels{
+		nodeIDLabelName:    strconv.FormatInt(nodeID, 10),
+		queryTypeLabelName: HybridSearchLabel,
+		collectionName:     collection,
+	})
+	ProxyRecallSearchCount.Delete(prometheus.Labels{
+		nodeIDLabelName:    strconv.FormatInt(nodeID, 10),
+		queryTypeLabelName: SearchLabel,
+		collectionName:     collection,
 	})
 }

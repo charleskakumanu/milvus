@@ -1,6 +1,7 @@
 package row
 
 import (
+	"fmt"
 	"reflect"
 	"testing"
 
@@ -25,7 +26,7 @@ type ValidStruct struct {
 type ValidStruct2 struct {
 	ID      int64 `milvus:"primary_key"`
 	Vector  [16]float32
-	Vector2 [4]byte
+	Attr1   float64
 	Ignored bool `milvus:"-"`
 }
 
@@ -60,7 +61,7 @@ func (s *RowsSuite) TestRowsToColumns() {
 		s.Equal("Vector", columns[0].Name())
 	})
 
-	s.Run("fp16", func() {
+	s.Run("bf16", func() {
 		type BF16Struct struct {
 			ID     int64  `milvus:"primary_key;auto_id"`
 			Vector []byte `milvus:"dim:16;vector_type:bf16"`
@@ -84,6 +85,18 @@ func (s *RowsSuite) TestRowsToColumns() {
 		s.Equal(entity.FieldTypeFloat16Vector, columns[0].Type())
 	})
 
+	s.Run("int8", func() {
+		type Int8Struct struct {
+			ID     int64  `milvus:"primary_key;auto_id"`
+			Vector []int8 `milvus:"dim:16;vector_type:int8"`
+		}
+		columns, err := AnyToColumns([]any{&Int8Struct{}})
+		s.Nil(err)
+		s.Require().Equal(1, len(columns))
+		s.Equal("Vector", columns[0].Name())
+		s.Equal(entity.FieldTypeInt8Vector, columns[0].Type())
+	})
+
 	s.Run("invalid_cases", func() {
 		// empty input
 		_, err := AnyToColumns([]any{})
@@ -97,7 +110,7 @@ func (s *RowsSuite) TestRowsToColumns() {
 		_, err = AnyToColumns([]any{&ValidStruct{}}, &entity.Schema{
 			Fields: []*entity.Field{
 				{
-					Name:     "int64",
+					Name:     "Attr1",
 					DataType: entity.FieldTypeInt64,
 				},
 			},
@@ -126,6 +139,10 @@ func (s *RowsSuite) TestDynamicSchema() {
 }
 
 func (s *RowsSuite) TestReflectValueCandi() {
+	type DynamicRows struct {
+		Float float32 `json:"float" milvus:"name:float"`
+	}
+
 	cases := []struct {
 		tag       string
 		v         reflect.Value
@@ -149,6 +166,65 @@ func (s *RowsSuite) TestReflectValueCandi() {
 			},
 			expectErr: false,
 		},
+		{
+			tag: "StructRow",
+			v: reflect.ValueOf(struct {
+				A string
+				B int64
+			}{A: "abc", B: 16}),
+			expect: map[string]fieldCandi{
+				"A": {
+					name: "A",
+					v:    reflect.ValueOf("abc"),
+				},
+				"B": {
+					name: "B",
+					v:    reflect.ValueOf(int64(16)),
+				},
+			},
+			expectErr: false,
+		},
+		{
+			tag: "StructRow_DuplicateName",
+			v: reflect.ValueOf(struct {
+				A string `milvus:"name:a"`
+				B int64  `milvus:"name:a"`
+			}{A: "abc", B: 16}),
+			expectErr: true,
+		},
+		{
+			tag: "StructRow_EmbedStruct",
+			v: reflect.ValueOf(struct {
+				A string `milvus:"name:a"`
+				DynamicRows
+			}{A: "emb", DynamicRows: DynamicRows{Float: 0.1}}),
+			expect: map[string]fieldCandi{
+				"a": {
+					name: "a",
+					v:    reflect.ValueOf("emb"),
+				},
+				"float": {
+					name: "float",
+					v:    reflect.ValueOf(float32(0.1)),
+				},
+			},
+			expectErr: false,
+		},
+		{
+			tag: "StructRow_EmbedDuplicateName",
+			v: reflect.ValueOf(struct {
+				Int64    int64     `json:"int64" milvus:"name:int64"`
+				Float    float32   `json:"float" milvus:"name:float"`
+				FloatVec []float32 `json:"floatVec" milvus:"name:floatVec"`
+				DynamicRows
+			}{}),
+			expectErr: true,
+		},
+		{
+			tag:       "Unsupported_primitive",
+			v:         reflect.ValueOf(int64(1)),
+			expectErr: true,
+		},
 	}
 
 	for _, c := range cases {
@@ -162,7 +238,7 @@ func (s *RowsSuite) TestReflectValueCandi() {
 			s.Equal(len(c.expect), len(r))
 			for k, v := range c.expect {
 				rv, has := r[k]
-				s.Require().True(has)
+				s.Require().True(has, fmt.Sprintf("candidate with key(%s) must provided", k))
 				s.Equal(v.name, rv.name)
 			}
 		})

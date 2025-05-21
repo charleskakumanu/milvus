@@ -19,16 +19,19 @@ package rootcoord
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus/internal/metastore/model"
 	mockrootcoord "github.com/milvus-io/milvus/internal/rootcoord/mocks"
-	"github.com/milvus-io/milvus/pkg/common"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
 )
 
 func Test_alterCollectionTask_Prepare(t *testing.T) {
@@ -92,8 +95,9 @@ func Test_alterCollectionTask_Execute(t *testing.T) {
 			mock.Anything,
 			mock.Anything,
 		).Return(errors.New("err"))
+		meta.On("ListAliasesByID", mock.Anything, mock.Anything).Return([]string{})
 
-		core := newTestCore(withMeta(meta))
+		core := newTestCore(withValidProxyManager(), withMeta(meta), withInvalidTsoAllocator())
 		task := &alterCollectionTask{
 			baseTask: newBaseTask(context.Background(), core),
 			Req: &milvuspb.AlterCollectionRequest{
@@ -121,13 +125,49 @@ func Test_alterCollectionTask_Execute(t *testing.T) {
 			mock.Anything,
 			mock.Anything,
 		).Return(nil)
+		meta.On("ListAliasesByID", mock.Anything, mock.Anything).Return([]string{})
 
 		broker := newMockBroker()
 		broker.BroadcastAlteredCollectionFunc = func(ctx context.Context, req *milvuspb.AlterCollectionRequest) error {
 			return errors.New("err")
 		}
 
-		core := newTestCore(withMeta(meta), withBroker(broker))
+		core := newTestCore(withValidProxyManager(), withMeta(meta), withBroker(broker), withInvalidTsoAllocator())
+		task := &alterCollectionTask{
+			baseTask: newBaseTask(context.Background(), core),
+			Req: &milvuspb.AlterCollectionRequest{
+				Base:           &commonpb.MsgBase{MsgType: commonpb.MsgType_AlterCollection},
+				CollectionName: "cn",
+				Properties:     properties,
+			},
+		}
+
+		err := task.Execute(context.Background())
+		assert.Error(t, err)
+	})
+
+	t.Run("expire cache failed", func(t *testing.T) {
+		meta := mockrootcoord.NewIMetaTable(t)
+		meta.On("GetCollectionByName",
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+		).Return(&model.Collection{CollectionID: int64(1)}, nil)
+		meta.On("AlterCollection",
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+		).Return(nil)
+		meta.On("ListAliasesByID", mock.Anything, mock.Anything).Return([]string{})
+
+		broker := newMockBroker()
+		broker.BroadcastAlteredCollectionFunc = func(ctx context.Context, req *milvuspb.AlterCollectionRequest) error {
+			return errors.New("err")
+		}
+
+		core := newTestCore(withInvalidProxyManager(), withMeta(meta), withBroker(broker), withInvalidTsoAllocator())
 		task := &alterCollectionTask{
 			baseTask: newBaseTask(context.Background(), core),
 			Req: &milvuspb.AlterCollectionRequest{
@@ -148,26 +188,31 @@ func Test_alterCollectionTask_Execute(t *testing.T) {
 			mock.Anything,
 			mock.Anything,
 			mock.Anything,
-		).Return(&model.Collection{CollectionID: int64(1)}, nil)
-		meta.On("AlterCollection",
-			mock.Anything,
-			mock.Anything,
-			mock.Anything,
-			mock.Anything,
-		).Return(nil)
-
-		broker := newMockBroker()
-		broker.BroadcastAlteredCollectionFunc = func(ctx context.Context, req *milvuspb.AlterCollectionRequest) error {
-			return nil
-		}
-
-		core := newTestCore(withMeta(meta), withBroker(broker))
+		).Return(&model.Collection{
+			CollectionID: int64(1),
+			Properties: []*commonpb.KeyValuePair{
+				{
+					Key:   common.CollectionTTLConfigKey,
+					Value: "1",
+				},
+				{
+					Key:   common.CollectionAutoCompactionKey,
+					Value: "true",
+				},
+			},
+		}, nil)
+		core := newTestCore(withValidProxyManager(), withMeta(meta), withInvalidTsoAllocator())
 		task := &alterCollectionTask{
 			baseTask: newBaseTask(context.Background(), core),
 			Req: &milvuspb.AlterCollectionRequest{
 				Base:           &commonpb.MsgBase{MsgType: commonpb.MsgType_AlterCollection},
 				CollectionName: "cn",
-				Properties:     properties,
+				Properties: []*commonpb.KeyValuePair{
+					{
+						Key:   common.CollectionAutoCompactionKey,
+						Value: "true",
+					},
+				},
 			},
 		}
 
@@ -191,7 +236,7 @@ func Test_alterCollectionTask_Execute(t *testing.T) {
 				Value: "true",
 			},
 		}
-		updateCollectionProperties(coll, updateProps1)
+		coll.Properties = MergeProperties(coll.Properties, updateProps1)
 
 		assert.Contains(t, coll.Properties, &commonpb.KeyValuePair{
 			Key:   common.CollectionTTLConfigKey,
@@ -209,7 +254,7 @@ func Test_alterCollectionTask_Execute(t *testing.T) {
 				Value: "2",
 			},
 		}
-		updateCollectionProperties(coll, updateProps2)
+		coll.Properties = MergeProperties(coll.Properties, updateProps2)
 
 		assert.Contains(t, coll.Properties, &commonpb.KeyValuePair{
 			Key:   common.CollectionTTLConfigKey,
@@ -220,5 +265,156 @@ func Test_alterCollectionTask_Execute(t *testing.T) {
 			Key:   common.CollectionAutoCompactionKey,
 			Value: "true",
 		})
+
+		updatePropsIso := []*commonpb.KeyValuePair{
+			{
+				Key:   common.PartitionKeyIsolationKey,
+				Value: "true",
+			},
+		}
+		coll.Properties = MergeProperties(coll.Properties, updatePropsIso)
+		assert.Contains(t, coll.Properties, &commonpb.KeyValuePair{
+			Key:   common.PartitionKeyIsolationKey,
+			Value: "true",
+		})
+	})
+
+	t.Run("test delete collection props", func(t *testing.T) {
+		coll := &model.Collection{
+			Properties: []*commonpb.KeyValuePair{
+				{
+					Key:   common.CollectionTTLConfigKey,
+					Value: "1",
+				},
+				{
+					Key:   common.CollectionAutoCompactionKey,
+					Value: "true",
+				},
+			},
+		}
+
+		deleteKeys := []string{common.CollectionTTLConfigKey}
+		coll.Properties = DeleteProperties(coll.Properties, deleteKeys)
+		assert.NotContains(t, coll.Properties, &commonpb.KeyValuePair{
+			Key:   common.CollectionTTLConfigKey,
+			Value: "1",
+		})
+
+		assert.Contains(t, coll.Properties, &commonpb.KeyValuePair{
+			Key:   common.CollectionAutoCompactionKey,
+			Value: "true",
+		})
+
+		deleteKeys = []string{"nonexistent.key"}
+		coll.Properties = DeleteProperties(coll.Properties, deleteKeys)
+		assert.Contains(t, coll.Properties, &commonpb.KeyValuePair{
+			Key:   common.CollectionAutoCompactionKey,
+			Value: "true",
+		})
+
+		deleteKeys = []string{common.CollectionAutoCompactionKey}
+		coll.Properties = DeleteProperties(coll.Properties, deleteKeys)
+		assert.Empty(t, coll.Properties)
+	})
+
+	testFunc := func(t *testing.T, oldProps []*commonpb.KeyValuePair,
+		newProps []*commonpb.KeyValuePair, deleteKeys []string,
+	) chan *msgstream.ConsumeMsgPack {
+		meta := mockrootcoord.NewIMetaTable(t)
+		meta.On("GetCollectionByName",
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+		).Return(&model.Collection{
+			CollectionID:         int64(1),
+			Name:                 "cn",
+			DBName:               "foo",
+			Properties:           oldProps,
+			PhysicalChannelNames: []string{"by-dev-rootcoord-dml_1"},
+		}, nil)
+		meta.On("AlterCollection",
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+		).Return(nil)
+		meta.On("ListAliasesByID", mock.Anything, mock.Anything).Return([]string{})
+
+		broker := newMockBroker()
+		broker.BroadcastAlteredCollectionFunc = func(ctx context.Context, req *milvuspb.AlterCollectionRequest) error {
+			return nil
+		}
+		packChan := make(chan *msgstream.ConsumeMsgPack, 10)
+		ticker := newChanTimeTickSync(packChan)
+		ticker.addDmlChannels("by-dev-rootcoord-dml_1")
+
+		core := newTestCore(withValidProxyManager(), withMeta(meta), withBroker(broker), withTtSynchronizer(ticker), withInvalidTsoAllocator())
+		task := &alterCollectionTask{
+			baseTask: newBaseTask(context.Background(), core),
+			Req: &milvuspb.AlterCollectionRequest{
+				Base:           &commonpb.MsgBase{MsgType: commonpb.MsgType_AlterCollection},
+				CollectionName: "cn",
+				Properties:     newProps,
+				DeleteKeys:     deleteKeys,
+			},
+		}
+
+		err := task.Execute(context.Background())
+		assert.NoError(t, err)
+		return packChan
+	}
+
+	t.Run("alter successfully2", func(t *testing.T) {
+		oldProps := []*commonpb.KeyValuePair{
+			{
+				Key:   common.ReplicateIDKey,
+				Value: "local-test",
+			},
+		}
+		newProps := append(properties, &commonpb.KeyValuePair{
+			Key:   common.ReplicateEndTSKey,
+			Value: "10000",
+		})
+		packChan := testFunc(t, oldProps, newProps, nil)
+
+		unmarshalFactory := &msgstream.ProtoUDFactory{}
+		unmarshalDispatcher := unmarshalFactory.NewUnmarshalDispatcher()
+		time.Sleep(time.Second)
+		select {
+		case pack := <-packChan:
+			assert.Equal(t, commonpb.MsgType_Replicate, pack.Msgs[0].GetType())
+			tsMsg, err := pack.Msgs[0].Unmarshal(unmarshalDispatcher)
+			require.NoError(t, err)
+			replicateMsg := tsMsg.(*msgstream.ReplicateMsg)
+			assert.Equal(t, "foo", replicateMsg.ReplicateMsg.GetDatabase())
+			assert.Equal(t, "cn", replicateMsg.ReplicateMsg.GetCollection())
+			assert.True(t, replicateMsg.ReplicateMsg.GetIsEnd())
+		default:
+			assert.Fail(t, "no message sent")
+		}
+	})
+
+	t.Run("alter successfully3", func(t *testing.T) {
+		newProps := []*commonpb.KeyValuePair{
+			{
+				Key:   common.ConsistencyLevel,
+				Value: "1",
+			},
+		}
+		testFunc(t, nil, newProps, nil)
+	})
+
+	t.Run("alter successfully4", func(t *testing.T) {
+		newProps := []*commonpb.KeyValuePair{
+			{
+				Key:   common.CollectionDescription,
+				Value: "abc",
+			},
+		}
+		testFunc(t, nil, newProps, nil)
+	})
+	t.Run("alter successfully5", func(t *testing.T) {
+		testFunc(t, nil, nil, []string{common.CollectionDescription})
 	})
 }

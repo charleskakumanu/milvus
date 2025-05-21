@@ -25,6 +25,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "common/Common.h"
 #include "common/Tracer.h"
 #include "common/Types.h"
 #include "common/type_c.h"
@@ -32,6 +33,7 @@
 
 #include "index/Index.h"
 #include "index/IndexInfo.h"
+#include "index/Meta.h"
 #include "index/Utils.h"
 #include "common/EasyAssert.h"
 #include "config/ConfigKnowhere.h"
@@ -48,9 +50,8 @@
 #include "storage/DataCodec.h"
 #include "storage/MemFileManagerImpl.h"
 #include "storage/ThreadPools.h"
-#include "storage/space.h"
 #include "storage/Util.h"
-#include "storage/prometheus_client.h"
+#include "monitor/prometheus_client.h"
 
 namespace milvus::index {
 
@@ -59,8 +60,10 @@ VectorMemIndex<T>::VectorMemIndex(
     const IndexType& index_type,
     const MetricType& metric_type,
     const IndexVersion& version,
+    bool use_knowhere_build_pool,
     const storage::FileManagerContext& file_manager_context)
-    : VectorIndex(index_type, metric_type) {
+    : VectorIndex(index_type, metric_type),
+      use_knowhere_build_pool_(use_knowhere_build_pool) {
     CheckMetricTypeSupport<T>(metric_type);
     AssertInfo(!is_unsupported(index_type, metric_type),
                index_type + " doesn't support metric: " + metric_type);
@@ -84,89 +87,22 @@ VectorMemIndex<T>::VectorMemIndex(
 }
 
 template <typename T>
-VectorMemIndex<T>::VectorMemIndex(
-    const CreateIndexInfo& create_index_info,
-    const storage::FileManagerContext& file_manager_context,
-    std::shared_ptr<milvus_storage::Space> space)
-    : VectorIndex(create_index_info.index_type, create_index_info.metric_type),
-      space_(space),
-      create_index_info_(create_index_info) {
-    CheckMetricTypeSupport<T>(create_index_info.metric_type);
-    AssertInfo(!is_unsupported(create_index_info.index_type,
-                               create_index_info.metric_type),
-               create_index_info.index_type +
-                   " doesn't support metric: " + create_index_info.metric_type);
-    if (file_manager_context.Valid()) {
-        file_manager_ = std::make_shared<storage::MemFileManagerImpl>(
-            file_manager_context, file_manager_context.space_);
-        AssertInfo(file_manager_ != nullptr, "create file manager failed!");
-    }
-    auto version = create_index_info.index_engine_version;
-    CheckCompatible(version);
-    auto get_index_obj =
-        knowhere::IndexFactory::Instance().Create<T>(GetIndexType(), version);
-    if (get_index_obj.has_value()) {
-        index_ = get_index_obj.value();
-    } else {
-        auto err = get_index_obj.error();
-        if (err == knowhere::Status::invalid_index_error) {
-            PanicInfo(ErrorCode::Unsupported, get_index_obj.what());
-        }
-        PanicInfo(ErrorCode::KnowhereError, get_index_obj.what());
-    }
-}
-
-template <typename T>
-BinarySet
-VectorMemIndex<T>::UploadV2(const Config& config) {
-    auto binary_set = Serialize(config);
-    file_manager_->AddFileV2(binary_set);
-
-    auto store_version = file_manager_->space()->GetCurrentVersion();
-    std::shared_ptr<uint8_t[]> store_version_data(
-        new uint8_t[sizeof(store_version)]);
-    store_version_data[0] = store_version & 0x00000000000000FF;
-    store_version = store_version >> 8;
-    store_version_data[1] = store_version & 0x00000000000000FF;
-    store_version = store_version >> 8;
-    store_version_data[2] = store_version & 0x00000000000000FF;
-    store_version = store_version >> 8;
-    store_version_data[3] = store_version & 0x00000000000000FF;
-    store_version = store_version >> 8;
-    store_version_data[4] = store_version & 0x00000000000000FF;
-    store_version = store_version >> 8;
-    store_version_data[5] = store_version & 0x00000000000000FF;
-    store_version = store_version >> 8;
-    store_version_data[6] = store_version & 0x00000000000000FF;
-    store_version = store_version >> 8;
-    store_version_data[7] = store_version & 0x00000000000000FF;
-    BinarySet ret;
-    ret.Append("index_store_version", store_version_data, 8);
-
-    return ret;
-}
-
-template <typename T>
-knowhere::expected<std::vector<std::shared_ptr<knowhere::IndexNode::iterator>>>
+knowhere::expected<std::vector<knowhere::IndexNode::IteratorPtr>>
 VectorMemIndex<T>::VectorIterators(const milvus::DatasetPtr dataset,
                                    const knowhere::Json& conf,
                                    const milvus::BitsetView& bitset) const {
-    return this->index_.AnnIterator(*dataset, conf, bitset);
+    return this->index_.AnnIterator(dataset, conf, bitset);
 }
 
 template <typename T>
-BinarySet
+IndexStatsPtr
 VectorMemIndex<T>::Upload(const Config& config) {
     auto binary_set = Serialize(config);
     file_manager_->AddFile(binary_set);
 
     auto remote_paths_to_size = file_manager_->GetRemotePathsToFileSize();
-    BinarySet ret;
-    for (auto& file : remote_paths_to_size) {
-        ret.Append(file.first, nullptr, file.second);
-    }
-
-    return ret;
+    return IndexStats::NewFromSizeMap(file_manager_->GetAddedTotalMemSize(),
+                                      remote_paths_to_size);
 }
 
 template <typename T>
@@ -204,108 +140,9 @@ VectorMemIndex<T>::Load(const BinarySet& binary_set, const Config& config) {
 
 template <typename T>
 void
-VectorMemIndex<T>::LoadV2(const Config& config) {
-    if (config.contains(kMmapFilepath)) {
-        return LoadFromFileV2(config);
-    }
-
-    auto blobs = space_->StatisticsBlobs();
-    std::unordered_set<std::string> pending_index_files;
-    auto index_prefix = file_manager_->GetRemoteIndexObjectPrefixV2();
-    for (auto& blob : blobs) {
-        if (blob.name.rfind(index_prefix, 0) == 0) {
-            pending_index_files.insert(blob.name);
-        }
-    }
-
-    auto slice_meta_file = index_prefix + "/" + INDEX_FILE_SLICE_META;
-    auto res = space_->GetBlobByteSize(std::string(slice_meta_file));
-    std::map<std::string, FieldDataPtr> index_datas{};
-
-    if (!res.ok() && !res.status().IsFileNotFound()) {
-        PanicInfo(DataFormatBroken, "failed to read blob");
-    }
-    bool slice_meta_exist = res.ok();
-
-    auto read_blob = [&](const std::string& file_name)
-        -> std::unique_ptr<storage::DataCodec> {
-        auto res = space_->GetBlobByteSize(file_name);
-        if (!res.ok()) {
-            PanicInfo(DataFormatBroken, "unable to read index blob");
-        }
-        auto index_blob_data =
-            std::shared_ptr<uint8_t[]>(new uint8_t[res.value()]);
-        auto status = space_->ReadBlob(file_name, index_blob_data.get());
-        if (!status.ok()) {
-            PanicInfo(DataFormatBroken, "unable to read index blob");
-        }
-        return storage::DeserializeFileData(index_blob_data, res.value());
-    };
-    if (slice_meta_exist) {
-        pending_index_files.erase(slice_meta_file);
-        auto slice_meta_sz = res.value();
-        auto slice_meta_data =
-            std::shared_ptr<uint8_t[]>(new uint8_t[slice_meta_sz]);
-        auto status = space_->ReadBlob(slice_meta_file, slice_meta_data.get());
-        if (!status.ok()) {
-            PanicInfo(DataFormatBroken, "unable to read slice meta");
-        }
-        auto raw_slice_meta =
-            storage::DeserializeFileData(slice_meta_data, slice_meta_sz);
-        Config meta_data = Config::parse(std::string(
-            static_cast<const char*>(raw_slice_meta->GetFieldData()->Data()),
-            raw_slice_meta->GetFieldData()->Size()));
-        for (auto& item : meta_data[META]) {
-            std::string prefix = item[NAME];
-            int slice_num = item[SLICE_NUM];
-            auto total_len = static_cast<size_t>(item[TOTAL_LEN]);
-
-            auto new_field_data =
-                milvus::storage::CreateFieldData(DataType::INT8, 1, total_len);
-            for (auto i = 0; i < slice_num; ++i) {
-                std::string file_name =
-                    index_prefix + "/" + GenSlicedFileName(prefix, i);
-                auto raw_index_blob = read_blob(file_name);
-                new_field_data->FillFieldData(
-                    raw_index_blob->GetFieldData()->Data(),
-                    raw_index_blob->GetFieldData()->Size());
-                pending_index_files.erase(file_name);
-            }
-            AssertInfo(
-                new_field_data->IsFull(),
-                "index len is inconsistent after disassemble and assemble");
-            index_datas[prefix] = new_field_data;
-        }
-    }
-
-    if (!pending_index_files.empty()) {
-        for (auto& file_name : pending_index_files) {
-            auto raw_index_blob = read_blob(file_name);
-            index_datas.insert({file_name, raw_index_blob->GetFieldData()});
-        }
-    }
-    LOG_INFO("construct binary set...");
-    BinarySet binary_set;
-    for (auto& [key, data] : index_datas) {
-        LOG_INFO("add index data to binary set: {}", key);
-        auto size = data->Size();
-        auto deleter = [&](uint8_t*) {};  // avoid repeated deconstruction
-        auto buf = std::shared_ptr<uint8_t[]>(
-            (uint8_t*)const_cast<void*>(data->Data()), deleter);
-        auto file_name = key.substr(key.find_last_of('/') + 1);
-        binary_set.Append(file_name, buf, size);
-    }
-
-    LOG_INFO("load index into Knowhere...");
-    LoadWithoutAssemble(binary_set, config);
-    LOG_INFO("load vector index done");
-}
-
-template <typename T>
-void
 VectorMemIndex<T>::Load(milvus::tracer::TraceContext ctx,
                         const Config& config) {
-    if (config.contains(kMmapFilepath)) {
+    if (config.contains(MMAP_FILE_PATH)) {
         return LoadFromFile(config);
     }
 
@@ -318,11 +155,7 @@ VectorMemIndex<T>::Load(milvus::tracer::TraceContext ctx,
                                                         index_files->end());
 
     LOG_INFO("load index files: {}", index_files.value().size());
-
-    auto parallel_degree =
-        static_cast<uint64_t>(DEFAULT_FIELD_MAX_MEMORY_LIMIT / FILE_SLICE_SIZE);
-    std::map<std::string, FieldDataPtr> index_datas{};
-
+    std::map<std::string, IndexDataCodec> index_data_codecs{};
     // try to read slice meta first
     std::string slice_meta_filepath;
     for (auto& file : pending_index_files) {
@@ -349,18 +182,14 @@ VectorMemIndex<T>::Load(milvus::tracer::TraceContext ctx,
 
             auto result =
                 file_manager_->LoadIndexToMemory({slice_meta_filepath});
-            auto raw_slice_meta = result[INDEX_FILE_SLICE_META];
-            Config meta_data = Config::parse(
-                std::string(static_cast<const char*>(raw_slice_meta->Data()),
-                            raw_slice_meta->Size()));
-
+            auto raw_slice_meta = std::move(result[INDEX_FILE_SLICE_META]);
+            Config meta_data = Config::parse(std::string(
+                reinterpret_cast<const char*>(raw_slice_meta->PayloadData()),
+                raw_slice_meta->PayloadSize()));
             for (auto& item : meta_data[META]) {
                 std::string prefix = item[NAME];
                 int slice_num = item[SLICE_NUM];
                 auto total_len = static_cast<size_t>(item[TOTAL_LEN]);
-
-                auto new_field_data = milvus::storage::CreateFieldData(
-                    DataType::INT8, 1, total_len);
 
                 std::vector<std::string> batch;
                 batch.reserve(slice_num);
@@ -370,23 +199,26 @@ VectorMemIndex<T>::Load(milvus::tracer::TraceContext ctx,
                 }
 
                 auto batch_data = file_manager_->LoadIndexToMemory(batch);
+                int64_t payload_size = 0;
+                index_data_codecs.insert({prefix, IndexDataCodec{}});
+                auto& index_data_codec = index_data_codecs.at(prefix);
                 for (const auto& file_path : batch) {
                     const std::string file_name =
                         file_path.substr(file_path.find_last_of('/') + 1);
                     AssertInfo(batch_data.find(file_name) != batch_data.end(),
                                "lost index slice data: {}",
                                file_name);
-                    auto data = batch_data[file_name];
-                    new_field_data->FillFieldData(data->Data(), data->Size());
+                    payload_size += batch_data[file_name]->PayloadSize();
+                    index_data_codec.codecs_.push_back(
+                        std::move(batch_data[file_name]));
                 }
                 for (auto& file : batch) {
                     pending_index_files.erase(file);
                 }
-
                 AssertInfo(
-                    new_field_data->IsFull(),
+                    payload_size == total_len,
                     "index len is inconsistent after disassemble and assemble");
-                index_datas[prefix] = new_field_data;
+                index_data_codec.size_ = payload_size;
             }
         }
 
@@ -395,7 +227,12 @@ VectorMemIndex<T>::Load(milvus::tracer::TraceContext ctx,
                 file_manager_->LoadIndexToMemory(std::vector<std::string>(
                     pending_index_files.begin(), pending_index_files.end()));
             for (auto&& index_data : result) {
-                index_datas.insert(std::move(index_data));
+                auto prefix = index_data.first;
+                index_data_codecs.insert({prefix, IndexDataCodec{}});
+                auto& index_data_codec = index_data_codecs.at(prefix);
+                index_data_codec.size_ = index_data.second->PayloadSize();
+                index_data_codec.codecs_.push_back(
+                    std::move(index_data.second));
             }
         }
 
@@ -404,14 +241,7 @@ VectorMemIndex<T>::Load(milvus::tracer::TraceContext ctx,
 
     LOG_INFO("construct binary set...");
     BinarySet binary_set;
-    for (auto& [key, data] : index_datas) {
-        LOG_INFO("add index data to binary set: {}", key);
-        auto size = data->Size();
-        auto deleter = [&](uint8_t*) {};  // avoid repeated deconstruction
-        auto buf = std::shared_ptr<uint8_t[]>(
-            (uint8_t*)const_cast<void*>(data->Data()), deleter);
-        binary_set.Append(key, buf, size);
-    }
+    AssembleIndexDatas(index_data_codecs, binary_set);
 
     // start engine load index span
     auto span_load_engine =
@@ -434,7 +264,7 @@ VectorMemIndex<T>::BuildWithDataset(const DatasetPtr& dataset,
     SetDim(dataset->GetDim());
 
     knowhere::TimeRecorder rc("BuildWithoutIds", 1);
-    auto stat = index_.Build(*dataset, index_config);
+    auto stat = index_.Build(dataset, index_config, use_knowhere_build_pool_);
     if (stat != knowhere::Status::success)
         PanicInfo(ErrorCode::IndexBuildError,
                   "failed to build index, " + KnowhereStatusString(stat));
@@ -444,68 +274,21 @@ VectorMemIndex<T>::BuildWithDataset(const DatasetPtr& dataset,
 
 template <typename T>
 void
-VectorMemIndex<T>::BuildV2(const Config& config) {
-    auto field_name = create_index_info_.field_name;
-    auto field_type = create_index_info_.field_type;
-    auto dim = create_index_info_.dim;
-    auto reader = space_->ScanData();
-    std::vector<FieldDataPtr> field_datas;
-    for (auto rec : *reader) {
-        if (!rec.ok()) {
-            PanicInfo(IndexBuildError,
-                      "failed to read data: {}",
-                      rec.status().ToString());
-        }
-        auto data = rec.ValueUnsafe();
-        if (data == nullptr) {
-            break;
-        }
-        auto total_num_rows = data->num_rows();
-        auto col_data = data->GetColumnByName(field_name);
-        auto field_data =
-            storage::CreateFieldData(field_type, dim, total_num_rows);
-        field_data->FillFieldData(col_data);
-        field_datas.push_back(field_data);
-    }
-    int64_t total_size = 0;
-    int64_t total_num_rows = 0;
-    for (const auto& data : field_datas) {
-        total_size += data->Size();
-        total_num_rows += data->get_num_rows();
-        AssertInfo(dim == 0 || dim == data->get_dim(),
-                   "inconsistent dim value between field datas!");
-    }
-
-    auto buf = std::shared_ptr<uint8_t[]>(new uint8_t[total_size]);
-    int64_t offset = 0;
-    for (auto data : field_datas) {
-        std::memcpy(buf.get() + offset, data->Data(), data->Size());
-        offset += data->Size();
-        data.reset();
-    }
-    field_datas.clear();
-
-    Config build_config;
-    build_config.update(config);
-    build_config.erase("insert_files");
-
-    auto dataset = GenDataset(total_num_rows, dim, buf.get());
-    BuildWithDataset(dataset, build_config);
-}
-
-template <typename T>
-void
 VectorMemIndex<T>::Build(const Config& config) {
-    auto insert_files =
-        GetValueFromConfig<std::vector<std::string>>(config, "insert_files");
-    AssertInfo(insert_files.has_value(),
-               "insert file paths is empty when building in memory index");
-    auto field_datas =
-        file_manager_->CacheRawDataToMemory(insert_files.value());
+    auto field_datas = file_manager_->CacheRawDataToMemory(config);
+    auto opt_fields = GetValueFromConfig<OptFieldT>(config, VEC_OPT_FIELDS);
+    std::unordered_map<int64_t, std::vector<std::vector<uint32_t>>> scalar_info;
+    auto is_partition_key_isolation =
+        GetValueFromConfig<bool>(config, "partition_key_isolation");
+    if (opt_fields.has_value() &&
+        index_.IsAdditionalScalarSupported(
+            is_partition_key_isolation.value_or(false))) {
+        scalar_info = file_manager_->CacheOptFieldToMemory(opt_fields.value());
+    }
 
     Config build_config;
     build_config.update(config);
-    build_config.erase("insert_files");
+    build_config.erase(INSERT_FILES_KEY);
     build_config.erase(VEC_OPT_FIELDS);
     if (!IndexIsSparse(GetIndexType())) {
         int64_t total_size = 0;
@@ -530,6 +313,9 @@ VectorMemIndex<T>::Build(const Config& config) {
         field_datas.clear();
 
         auto dataset = GenDataset(total_num_rows, dim, buf.get());
+        if (!scalar_info.empty()) {
+            dataset->Set(knowhere::meta::SCALAR_INFO, std::move(scalar_info));
+        }
         BuildWithDataset(dataset, build_config);
     } else {
         // sparse
@@ -560,6 +346,9 @@ VectorMemIndex<T>::Build(const Config& config) {
         }
         auto dataset = GenDataset(total_rows, dim, vec.data());
         dataset->SetIsSparse(true);
+        if (!scalar_info.empty()) {
+            dataset->Set(knowhere::meta::SCALAR_INFO, std::move(scalar_info));
+        }
         BuildWithDataset(dataset, build_config);
     }
 }
@@ -572,7 +361,7 @@ VectorMemIndex<T>::AddWithDataset(const DatasetPtr& dataset,
     index_config.update(config);
 
     knowhere::TimeRecorder rc("AddWithDataset", 1);
-    auto stat = index_.Add(*dataset, index_config);
+    auto stat = index_.Add(dataset, index_config, use_knowhere_build_pool_);
     if (stat != knowhere::Status::success)
         PanicInfo(ErrorCode::IndexBuildError,
                   "failed to append index, " + KnowhereStatusString(stat));
@@ -594,14 +383,10 @@ VectorMemIndex<T>::Query(const DatasetPtr dataset,
     // TODO :: check dim of search data
     auto final = [&] {
         auto index_type = GetIndexType();
-        if (CheckKeyInConfig(search_conf, RADIUS)) {
-            if (CheckKeyInConfig(search_conf, RANGE_FILTER)) {
-                CheckRangeSearchParam(search_conf[RADIUS],
-                                      search_conf[RANGE_FILTER],
-                                      GetMetricType());
-            }
+        if (CheckAndUpdateKnowhereRangeSearchParam(
+                search_info, topk, GetMetricType(), search_conf)) {
             milvus::tracer::AddEvent("start_knowhere_index_range_search");
-            auto res = index_.RangeSearch(*dataset, search_conf, bitset);
+            auto res = index_.RangeSearch(dataset, search_conf, bitset);
             milvus::tracer::AddEvent("finish_knowhere_index_range_search");
             if (!res.has_value()) {
                 PanicInfo(ErrorCode::UnexpectedError,
@@ -615,13 +400,16 @@ VectorMemIndex<T>::Query(const DatasetPtr dataset,
             return result;
         } else {
             milvus::tracer::AddEvent("start_knowhere_index_search");
-            auto res = index_.Search(*dataset, search_conf, bitset);
+            auto res = index_.Search(dataset, search_conf, bitset);
             milvus::tracer::AddEvent("finish_knowhere_index_search");
             if (!res.has_value()) {
-                PanicInfo(ErrorCode::UnexpectedError,
-                          "failed to search: {}: {}",
-                          KnowhereStatusString(res.error()),
-                          res.what());
+                PanicInfo(
+                    ErrorCode::UnexpectedError,
+                    // escape json brace in case of using message as format
+                    "failed to search: config={} {}: {}",
+                    milvus::EscapeBraces(search_conf.dump()),
+                    KnowhereStatusString(res.error()),
+                    res.what());
             }
             return res.value();
         }
@@ -662,7 +450,12 @@ VectorMemIndex<T>::GetVector(const DatasetPtr dataset) const {
                   "failed to get vector, index is sparse");
     }
 
-    auto res = index_.GetVectorByIds(*dataset);
+    // if dataset is empty, return empty vector
+    if (dataset->GetRows() == 0) {
+        return {};
+    }
+
+    auto res = index_.GetVectorByIds(dataset);
     if (!res.has_value()) {
         PanicInfo(ErrorCode::UnexpectedError,
                   "failed to get vector, " + KnowhereStatusString(res.error()));
@@ -680,7 +473,7 @@ VectorMemIndex<T>::GetVector(const DatasetPtr dataset) const {
 template <typename T>
 std::unique_ptr<const knowhere::sparse::SparseRow<float>[]>
 VectorMemIndex<T>::GetSparseVector(const DatasetPtr dataset) const {
-    auto res = index_.GetVectorByIds(*dataset);
+    auto res = index_.GetVectorByIds(dataset);
     if (!res.has_value()) {
         PanicInfo(ErrorCode::UnexpectedError,
                   "failed to get vector, " + KnowhereStatusString(res.error()));
@@ -694,7 +487,7 @@ VectorMemIndex<T>::GetSparseVector(const DatasetPtr dataset) const {
 
 template <typename T>
 void VectorMemIndex<T>::LoadFromFile(const Config& config) {
-    auto filepath = GetValueFromConfig<std::string>(config, kMmapFilepath);
+    auto filepath = GetValueFromConfig<std::string>(config, MMAP_FILE_PATH);
     AssertInfo(filepath.has_value(), "mmap filepath is empty when load index");
 
     std::filesystem::create_directories(
@@ -737,10 +530,10 @@ void VectorMemIndex<T>::LoadFromFile(const Config& config) {
         batch.reserve(parallel_degree);
 
         auto result = file_manager_->LoadIndexToMemory({slice_meta_filepath});
-        auto raw_slice_meta = result[INDEX_FILE_SLICE_META];
-        Config meta_data = Config::parse(
-            std::string(static_cast<const char*>(raw_slice_meta->Data()),
-                        raw_slice_meta->Size()));
+        auto raw_slice_meta = std::move(result[INDEX_FILE_SLICE_META]);
+        Config meta_data = Config::parse(std::string(
+            reinterpret_cast<const char*>(raw_slice_meta->PayloadData()),
+            raw_slice_meta->PayloadSize()));
 
         for (auto& item : meta_data[META]) {
             std::string prefix = item[NAME];
@@ -755,13 +548,14 @@ void VectorMemIndex<T>::LoadFromFile(const Config& config) {
                     std::string file_name = GenSlicedFileName(prefix, j);
                     AssertInfo(batch_data.find(file_name) != batch_data.end(),
                                "lost index slice data");
-                    auto data = batch_data[file_name];
+                    auto&& data = batch_data[file_name];
                     auto start_write_file = std::chrono::system_clock::now();
-                    auto written = file.Write(data->Data(), data->Size());
+                    auto written =
+                        file.Write(data->PayloadData(), data->PayloadSize());
                     write_disk_duration_sum +=
                         (std::chrono::system_clock::now() - start_write_file);
                     AssertInfo(
-                        written == data->Size(),
+                        written == data->PayloadSize(),
                         fmt::format("failed to write index data to disk {}: {}",
                                     filepath->data(),
                                     strerror(errno)));
@@ -793,15 +587,15 @@ void VectorMemIndex<T>::LoadFromFile(const Config& config) {
         //2. write data into files
         auto start_write_file = std::chrono::system_clock::now();
         for (auto& [_, index_data] : result) {
-            file.Write(index_data->Data(), index_data->Size());
+            file.Write(index_data->PayloadData(), index_data->PayloadSize());
         }
         write_disk_duration_sum +=
             (std::chrono::system_clock::now() - start_write_file);
     }
-    milvus::storage::internal_storage_download_duration.Observe(
+    milvus::monitor::internal_storage_download_duration.Observe(
         std::chrono::duration_cast<std::chrono::milliseconds>(load_duration_sum)
             .count());
-    milvus::storage::internal_storage_write_disk_duration.Observe(
+    milvus::monitor::internal_storage_write_disk_duration.Observe(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             write_disk_duration_sum)
             .count());
@@ -809,8 +603,8 @@ void VectorMemIndex<T>::LoadFromFile(const Config& config) {
 
     LOG_INFO("load index into Knowhere...");
     auto conf = config;
-    conf.erase(kMmapFilepath);
-    conf[kEnableMmap] = true;
+    conf.erase(MMAP_FILE_PATH);
+    conf[ENABLE_MMAP] = true;
     auto start_deserialize = std::chrono::system_clock::now();
     auto stat = index_.DeserializeFromFile(filepath.value(), conf);
     auto deserialize_duration =
@@ -820,7 +614,7 @@ void VectorMemIndex<T>::LoadFromFile(const Config& config) {
                   "failed to Deserialize index: {}",
                   KnowhereStatusString(stat));
     }
-    milvus::storage::internal_storage_deserialize_duration.Observe(
+    milvus::monitor::internal_storage_deserialize_duration.Observe(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             deserialize_duration)
             .count());
@@ -847,112 +641,10 @@ void VectorMemIndex<T>::LoadFromFile(const Config& config) {
             .count());
 }
 
-template <typename T>
-void
-VectorMemIndex<T>::LoadFromFileV2(const Config& config) {
-    auto filepath = GetValueFromConfig<std::string>(config, kMmapFilepath);
-    AssertInfo(filepath.has_value(), "mmap filepath is empty when load index");
-
-    std::filesystem::create_directories(
-        std::filesystem::path(filepath.value()).parent_path());
-
-    auto file = File::Open(filepath.value(), O_CREAT | O_TRUNC | O_RDWR);
-
-    auto blobs = space_->StatisticsBlobs();
-    std::unordered_set<std::string> pending_index_files;
-    auto index_prefix = file_manager_->GetRemoteIndexObjectPrefixV2();
-    for (auto& blob : blobs) {
-        if (blob.name.rfind(index_prefix, 0) == 0) {
-            pending_index_files.insert(blob.name);
-        }
-    }
-
-    auto slice_meta_file = index_prefix + "/" + INDEX_FILE_SLICE_META;
-    auto res = space_->GetBlobByteSize(std::string(slice_meta_file));
-
-    if (!res.ok() && !res.status().IsFileNotFound()) {
-        PanicInfo(DataFormatBroken, "failed to read blob");
-    }
-    bool slice_meta_exist = res.ok();
-
-    auto read_blob = [&](const std::string& file_name)
-        -> std::unique_ptr<storage::DataCodec> {
-        auto res = space_->GetBlobByteSize(file_name);
-        if (!res.ok()) {
-            PanicInfo(DataFormatBroken, "unable to read index blob");
-        }
-        auto index_blob_data =
-            std::shared_ptr<uint8_t[]>(new uint8_t[res.value()]);
-        auto status = space_->ReadBlob(file_name, index_blob_data.get());
-        if (!status.ok()) {
-            PanicInfo(DataFormatBroken, "unable to read index blob");
-        }
-        return storage::DeserializeFileData(index_blob_data, res.value());
-    };
-    if (slice_meta_exist) {
-        pending_index_files.erase(slice_meta_file);
-        auto slice_meta_sz = res.value();
-        auto slice_meta_data =
-            std::shared_ptr<uint8_t[]>(new uint8_t[slice_meta_sz]);
-        auto status = space_->ReadBlob(slice_meta_file, slice_meta_data.get());
-        if (!status.ok()) {
-            PanicInfo(DataFormatBroken, "unable to read slice meta");
-        }
-        auto raw_slice_meta =
-            storage::DeserializeFileData(slice_meta_data, slice_meta_sz);
-        Config meta_data = Config::parse(std::string(
-            static_cast<const char*>(raw_slice_meta->GetFieldData()->Data()),
-            raw_slice_meta->GetFieldData()->Size()));
-        for (auto& item : meta_data[META]) {
-            std::string prefix = item[NAME];
-            int slice_num = item[SLICE_NUM];
-            auto total_len = static_cast<size_t>(item[TOTAL_LEN]);
-
-            for (auto i = 0; i < slice_num; ++i) {
-                std::string file_name =
-                    index_prefix + "/" + GenSlicedFileName(prefix, i);
-                auto raw_index_blob = read_blob(file_name);
-                auto written =
-                    file.Write(raw_index_blob->GetFieldData()->Data(),
-                               raw_index_blob->GetFieldData()->Size());
-                pending_index_files.erase(file_name);
-            }
-        }
-    }
-
-    if (!pending_index_files.empty()) {
-        for (auto& file_name : pending_index_files) {
-            auto raw_index_blob = read_blob(file_name);
-            file.Write(raw_index_blob->GetFieldData()->Data(),
-                       raw_index_blob->GetFieldData()->Size());
-        }
-    }
-    file.Close();
-
-    LOG_INFO("load index into Knowhere...");
-    auto conf = config;
-    conf.erase(kMmapFilepath);
-    conf[kEnableMmap] = true;
-    auto stat = index_.DeserializeFromFile(filepath.value(), conf);
-    if (stat != knowhere::Status::success) {
-        PanicInfo(DataFormatBroken,
-                  "failed to Deserialize index: {}",
-                  KnowhereStatusString(stat));
-    }
-
-    auto dim = index_.Dim();
-    this->SetDim(index_.Dim());
-
-    auto ok = unlink(filepath->data());
-    AssertInfo(ok == 0,
-               "failed to unlink mmap index file {}: {}",
-               filepath.value(),
-               strerror(errno));
-    LOG_INFO("load vector index done");
-}
 template class VectorMemIndex<float>;
 template class VectorMemIndex<bin1>;
 template class VectorMemIndex<float16>;
 template class VectorMemIndex<bfloat16>;
+template class VectorMemIndex<int8>;
 
 }  // namespace milvus::index

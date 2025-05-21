@@ -22,6 +22,7 @@
 #include "common/Types.h"
 #include "common/Vector.h"
 #include "exec/expression/Expr.h"
+#include "exec/expression/Element.h"
 #include "segcore/SegmentInterface.h"
 
 namespace milvus {
@@ -56,13 +57,19 @@ class PhyTermFilterExpr : public SegmentExpr {
         const segcore::SegmentInternalInterface* segment,
         int64_t active_count,
         milvus::Timestamp timestamp,
-        int64_t batch_size)
+        int64_t batch_size,
+        int32_t consistency_level)
         : SegmentExpr(std::move(input),
                       name,
                       segment,
                       expr->column_.field_id_,
+                      expr->column_.nested_path_,
+                      expr->vals_.size() == 0
+                          ? DataType::NONE
+                          : FromValCase(expr->vals_[0].val_case()),
                       active_count,
-                      batch_size),
+                      batch_size,
+                      consistency_level),
           expr_(expr),
           query_timestamp_(timestamp) {
     }
@@ -70,9 +77,19 @@ class PhyTermFilterExpr : public SegmentExpr {
     void
     Eval(EvalCtx& context, VectorPtr& result) override;
 
-    void
-    SetUseCacheOffsets() {
-        use_cache_offsets_ = true;
+    bool
+    IsSource() const override {
+        return true;
+    }
+
+    std::string
+    ToString() const {
+        return fmt::format("{}", expr_->ToString());
+    }
+
+    std::optional<milvus::expr::ColumnInfo>
+    GetColumnInfo() const override {
+        return expr_->column_;
     }
 
  private:
@@ -88,7 +105,7 @@ class PhyTermFilterExpr : public SegmentExpr {
 
     template <typename T>
     VectorPtr
-    ExecVisitorImpl();
+    ExecVisitorImpl(EvalCtx& context);
 
     template <typename T>
     VectorPtr
@@ -96,40 +113,46 @@ class PhyTermFilterExpr : public SegmentExpr {
 
     template <typename T>
     VectorPtr
-    ExecVisitorImplForData();
+    ExecVisitorImplForData(EvalCtx& context);
 
     template <typename ValueType>
     VectorPtr
-    ExecVisitorImplTemplateJson();
+    ExecVisitorImplTemplateJson(EvalCtx& context);
 
     template <typename ValueType>
     VectorPtr
-    ExecTermJsonVariableInField();
+    ExecTermJsonVariableInField(EvalCtx& context);
 
     template <typename ValueType>
     VectorPtr
-    ExecTermJsonFieldInVariable();
+    ExecTermJsonFieldInVariable(EvalCtx& context);
 
     template <typename ValueType>
     VectorPtr
-    ExecVisitorImplTemplateArray();
+    ExecVisitorImplTemplateArray(EvalCtx& context);
 
     template <typename ValueType>
     VectorPtr
-    ExecTermArrayVariableInField();
+    ExecTermArrayVariableInField(EvalCtx& context);
 
     template <typename ValueType>
     VectorPtr
-    ExecTermArrayFieldInVariable();
+    ExecTermArrayFieldInVariable(EvalCtx& context);
+
+    template <typename ValueType>
+    VectorPtr
+    ExecJsonInVariableByKeyIndex();
 
  private:
     std::shared_ptr<const milvus::expr::TermFilterExpr> expr_;
     milvus::Timestamp query_timestamp_;
-    // If expr is like "pk in (..)", can use pk index to optimize
-    bool use_cache_offsets_{false};
-    bool cached_offsets_inited_{false};
-    ColumnVectorPtr cached_offsets_;
+    bool cached_bits_inited_{false};
     TargetBitmap cached_bits_;
+    bool arg_inited_{false};
+    std::shared_ptr<MultiElement> arg_set_;
+    std::shared_ptr<MultiElement> arg_set_float_;
+    SingleElement arg_val_;
+    int32_t consistency_level_ = 0;
 };
 }  //namespace exec
 }  // namespace milvus

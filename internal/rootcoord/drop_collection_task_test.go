@@ -18,6 +18,7 @@ package rootcoord
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,8 +30,8 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus/internal/metastore/model"
 	mockrootcoord "github.com/milvus-io/milvus/internal/rootcoord/mocks"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 )
 
 func Test_dropCollectionTask_Prepare(t *testing.T) {
@@ -49,6 +50,7 @@ func Test_dropCollectionTask_Prepare(t *testing.T) {
 
 		meta := mockrootcoord.NewIMetaTable(t)
 		meta.On("IsAlias",
+			mock.Anything,
 			mock.Anything,
 			mock.Anything,
 		).Return(true)
@@ -70,6 +72,7 @@ func Test_dropCollectionTask_Prepare(t *testing.T) {
 
 		meta := mockrootcoord.NewIMetaTable(t)
 		meta.On("IsAlias",
+			mock.Anything,
 			mock.Anything,
 			mock.Anything,
 		).Return(false)
@@ -129,6 +132,7 @@ func Test_dropCollectionTask_Execute(t *testing.T) {
 			mock.Anything,
 		).Return(coll.Clone(), nil)
 		meta.On("ListAliasesByID",
+			mock.Anything,
 			mock.AnythingOfType("int64"),
 		).Return([]string{})
 
@@ -163,6 +167,7 @@ func Test_dropCollectionTask_Execute(t *testing.T) {
 		).Return(errors.New("error mock ChangeCollectionState"))
 		meta.On("ListAliasesByID",
 			mock.Anything,
+			mock.Anything,
 		).Return([]string{})
 
 		core := newTestCore(withValidProxyManager(), withMeta(meta))
@@ -175,6 +180,40 @@ func Test_dropCollectionTask_Execute(t *testing.T) {
 		}
 		err := task.Execute(context.Background())
 		assert.Error(t, err)
+	})
+
+	t.Run("aliases have not been dropped", func(t *testing.T) {
+		defer cleanTestEnv()
+
+		collectionName := funcutil.GenRandomStr()
+		shardNum := 2
+
+		ticker := newRocksMqTtSynchronizer()
+		pchans := ticker.getDmlChannelNames(shardNum)
+		ticker.addDmlChannels(pchans...)
+
+		coll := &model.Collection{Name: collectionName, ShardsNum: int32(shardNum), PhysicalChannelNames: pchans}
+
+		meta := mockrootcoord.NewIMetaTable(t)
+		meta.EXPECT().GetCollectionByName(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+			Return(coll.Clone(), nil)
+		meta.EXPECT().ListAliasesByID(mock.Anything, mock.Anything).
+			Return([]string{"mock-alias-0", "mock-alias-1"})
+
+		core := newTestCore(
+			withMeta(meta),
+			withTtSynchronizer(ticker))
+
+		task := &dropCollectionTask{
+			baseTask: newBaseTask(context.Background(), core),
+			Req: &milvuspb.DropCollectionRequest{
+				Base:           &commonpb.MsgBase{MsgType: commonpb.MsgType_DropCollection},
+				CollectionName: collectionName,
+			},
+		}
+		err := task.Execute(context.Background())
+		assert.Error(t, err)
+		assert.True(t, strings.Contains(err.Error(), "please remove all aliases"))
 	})
 
 	t.Run("normal case, redo", func(t *testing.T) {
@@ -206,6 +245,7 @@ func Test_dropCollectionTask_Execute(t *testing.T) {
 			mock.Anything,
 		).Return(nil)
 		meta.On("ListAliasesByID",
+			mock.Anything,
 			mock.Anything,
 		).Return([]string{})
 		removeCollectionMetaCalled := false
@@ -240,14 +280,14 @@ func Test_dropCollectionTask_Execute(t *testing.T) {
 			return true
 		}
 
-		gc := newMockGarbageCollector()
+		gc := mockrootcoord.NewGarbageCollector(t)
 		deleteCollectionCalled := false
 		deleteCollectionChan := make(chan struct{}, 1)
-		gc.GcCollectionDataFunc = func(ctx context.Context, coll *model.Collection) (Timestamp, error) {
+		gc.EXPECT().GcCollectionData(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, coll *model.Collection) (Timestamp, error) {
 			deleteCollectionCalled = true
 			deleteCollectionChan <- struct{}{}
 			return 0, nil
-		}
+		})
 
 		core := newTestCore(
 			withValidProxyManager(),

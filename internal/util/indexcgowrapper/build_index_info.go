@@ -17,7 +17,7 @@
 package indexcgowrapper
 
 /*
-#cgo pkg-config: milvus_indexbuilder
+#cgo pkg-config: milvus_core
 #include <stdlib.h>	// free
 #include "indexbuilder/index_c.h"
 */
@@ -27,12 +27,12 @@ import (
 	"fmt"
 	"unsafe"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/internal/proto/indexcgopb"
-	"github.com/milvus-io/milvus/internal/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/indexcgopb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
 )
 
 type BuildIndexInfo struct {
@@ -52,6 +52,7 @@ func NewBuildIndexInfo(config *indexpb.StorageConfig) (*BuildIndexInfo, error) {
 	cRegion := C.CString(config.Region)
 	cCloudProvider := C.CString(config.CloudProvider)
 	cSslCACert := C.CString(config.SslCACert)
+	cGcpCredentialJSON := C.CString(config.GcpCredentialJSON)
 	defer C.free(unsafe.Pointer(cAddress))
 	defer C.free(unsafe.Pointer(cBucketName))
 	defer C.free(unsafe.Pointer(cAccessKey))
@@ -62,21 +63,23 @@ func NewBuildIndexInfo(config *indexpb.StorageConfig) (*BuildIndexInfo, error) {
 	defer C.free(unsafe.Pointer(cRegion))
 	defer C.free(unsafe.Pointer(cCloudProvider))
 	defer C.free(unsafe.Pointer(cSslCACert))
+	defer C.free(unsafe.Pointer(cGcpCredentialJSON))
 	storageConfig := C.CStorageConfig{
-		address:          cAddress,
-		bucket_name:      cBucketName,
-		access_key_id:    cAccessKey,
-		access_key_value: cAccessValue,
-		root_path:        cRootPath,
-		storage_type:     cStorageType,
-		iam_endpoint:     cIamEndPoint,
-		cloud_provider:   cCloudProvider,
-		useSSL:           C.bool(config.UseSSL),
-		sslCACert:        cSslCACert,
-		useIAM:           C.bool(config.UseIAM),
-		region:           cRegion,
-		useVirtualHost:   C.bool(config.UseVirtualHost),
-		requestTimeoutMs: C.int64_t(config.RequestTimeoutMs),
+		address:             cAddress,
+		bucket_name:         cBucketName,
+		access_key_id:       cAccessKey,
+		access_key_value:    cAccessValue,
+		root_path:           cRootPath,
+		storage_type:        cStorageType,
+		iam_endpoint:        cIamEndPoint,
+		cloud_provider:      cCloudProvider,
+		useSSL:              C.bool(config.UseSSL),
+		sslCACert:           cSslCACert,
+		useIAM:              C.bool(config.UseIAM),
+		region:              cRegion,
+		useVirtualHost:      C.bool(config.UseVirtualHost),
+		requestTimeoutMs:    C.int64_t(config.RequestTimeoutMs),
+		gcp_credential_json: cGcpCredentialJSON,
 	}
 
 	status := C.NewBuildIndexInfo(&cBuildIndexInfo, storageConfig)

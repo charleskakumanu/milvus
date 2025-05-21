@@ -19,14 +19,12 @@ package storage
 import (
 	"bytes"
 	"encoding/binary"
-	"fmt"
 	"io"
 
 	"github.com/cockroachdb/errors"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/common"
 )
 
 // EventTypeCode represents event type by code
@@ -212,17 +210,18 @@ func newDescriptorEvent() *descriptorEvent {
 	}
 }
 
-func newInsertEventWriter(dataType schemapb.DataType, nullable bool, dim ...int) (*insertEventWriter, error) {
-	var payloadWriter PayloadWriterInterface
-	var err error
-	if typeutil.IsVectorType(dataType) && !typeutil.IsSparseFloatVectorType(dataType) {
-		if len(dim) != 1 {
-			return nil, fmt.Errorf("incorrect input numbers")
-		}
-		payloadWriter, err = NewPayloadWriter(dataType, nullable, dim[0])
-	} else {
-		payloadWriter, err = NewPayloadWriter(dataType, nullable)
-	}
+func NewBaseDescriptorEvent(collectionID int64, partitionID int64, segmentID int64) *descriptorEvent {
+	de := newDescriptorEvent()
+	de.CollectionID = collectionID
+	de.PartitionID = partitionID
+	de.SegmentID = segmentID
+	de.StartTimestamp = 0
+	de.EndTimestamp = 0
+	return de
+}
+
+func newInsertEventWriter(dataType schemapb.DataType, opts ...PayloadWriterOptions) (*insertEventWriter, error) {
+	payloadWriter, err := NewPayloadWriter(dataType, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -243,8 +242,8 @@ func newInsertEventWriter(dataType schemapb.DataType, nullable bool, dim ...int)
 	return writer, nil
 }
 
-func newDeleteEventWriter(dataType schemapb.DataType) (*deleteEventWriter, error) {
-	payloadWriter, err := NewPayloadWriter(dataType, false)
+func newDeleteEventWriter(dataType schemapb.DataType, opts ...PayloadWriterOptions) (*deleteEventWriter, error) {
+	payloadWriter, err := NewPayloadWriter(dataType, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -270,7 +269,7 @@ func newCreateCollectionEventWriter(dataType schemapb.DataType) (*createCollecti
 		return nil, errors.New("incorrect data type")
 	}
 
-	payloadWriter, err := NewPayloadWriter(dataType, false)
+	payloadWriter, err := NewPayloadWriter(dataType)
 	if err != nil {
 		return nil, err
 	}
@@ -296,7 +295,7 @@ func newDropCollectionEventWriter(dataType schemapb.DataType) (*dropCollectionEv
 		return nil, errors.New("incorrect data type")
 	}
 
-	payloadWriter, err := NewPayloadWriter(dataType, false)
+	payloadWriter, err := NewPayloadWriter(dataType)
 	if err != nil {
 		return nil, err
 	}
@@ -322,7 +321,7 @@ func newCreatePartitionEventWriter(dataType schemapb.DataType) (*createPartition
 		return nil, errors.New("incorrect data type")
 	}
 
-	payloadWriter, err := NewPayloadWriter(dataType, false)
+	payloadWriter, err := NewPayloadWriter(dataType)
 	if err != nil {
 		return nil, err
 	}
@@ -348,7 +347,7 @@ func newDropPartitionEventWriter(dataType schemapb.DataType) (*dropPartitionEven
 		return nil, errors.New("incorrect data type")
 	}
 
-	payloadWriter, err := NewPayloadWriter(dataType, false)
+	payloadWriter, err := NewPayloadWriter(dataType)
 	if err != nil {
 		return nil, err
 	}
@@ -370,7 +369,7 @@ func newDropPartitionEventWriter(dataType schemapb.DataType) (*dropPartitionEven
 }
 
 func newIndexFileEventWriter(dataType schemapb.DataType) (*indexFileEventWriter, error) {
-	payloadWriter, err := NewPayloadWriter(dataType, false)
+	payloadWriter, err := NewPayloadWriter(dataType)
 	if err != nil {
 		return nil, err
 	}

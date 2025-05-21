@@ -22,7 +22,8 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 )
 
 const (
@@ -100,7 +101,7 @@ func (c Channel) PhysicalName() string {
 }
 
 func (c Channel) VirtualName() string {
-	return fmt.Sprintf("%s_%dv%d", c.PhysicalName(), c.collectionID, c.shardIdx)
+	return funcutil.GetVirtualChannel(c.PhysicalName(), c.collectionID, int(c.shardIdx))
 }
 
 func (c Channel) Equal(ac Channel) bool {
@@ -115,6 +116,10 @@ func (c Channel) EqualString(str string) bool {
 		return false
 	}
 	return c.Equal(ac)
+}
+
+func (c Channel) IsZero() bool {
+	return c.ChannelMapper == nil
 }
 
 func ParseChannel(virtualName string, mapper ChannelMapper) (Channel, error) {

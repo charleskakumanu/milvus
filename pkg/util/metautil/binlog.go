@@ -5,8 +5,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 const pathSep = "/"
@@ -50,6 +50,11 @@ func GetSegmentIDFromInsertLogPath(logPath string) typeutil.UniqueID {
 func BuildStatsLogPath(rootPath string, collectionID, partitionID, segmentID, fieldID, logID typeutil.UniqueID) string {
 	k := JoinIDPath(collectionID, partitionID, segmentID, fieldID, logID)
 	return path.Join(rootPath, common.SegmentStatslogPath, k)
+}
+
+func BuildBm25LogPath(rootPath string, collectionID, partitionID, segmentID, fieldID, logID typeutil.UniqueID) string {
+	k := JoinIDPath(collectionID, partitionID, segmentID, fieldID, logID)
+	return path.Join(rootPath, common.SegmentBm25LogPath, k)
 }
 
 func GetSegmentIDFromStatsLogPath(logPath string) typeutil.UniqueID {

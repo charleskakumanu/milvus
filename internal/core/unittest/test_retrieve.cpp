@@ -13,9 +13,9 @@
 
 #include "common/Types.h"
 #include "knowhere/comp/index_param.h"
-#include "query/Expr.h"
 #include "test_utils/DataGen.h"
-#include "plan/PlanNode.h"
+#include "test_utils/storage_test_utils.h"
+#include "test_utils/GenExprProto.h"
 
 using namespace milvus;
 using namespace milvus::segcore;
@@ -61,8 +61,7 @@ TEST_P(RetrieveTest, AutoID) {
     auto choose = [=](int i) { return i * 3 % N; };
 
     auto dataset = DataGen(schema, N);
-    auto segment = CreateSealedSegment(schema);
-    SealedLoadFieldData(dataset, *segment);
+    auto segment = CreateSealedWithFieldDataLoaded(schema, dataset);
     auto i64_col = dataset.get_col<int64_t>(fid_64);
 
     auto plan = std::make_unique<query::RetrievePlan>(*schema);
@@ -77,8 +76,8 @@ TEST_P(RetrieveTest, AutoID) {
             fid_64, DataType::INT64, std::vector<std::string>()),
         values);
     plan->plan_node_ = std::make_unique<query::RetrievePlanNode>();
-    plan->plan_node_->filter_plannode_ =
-        std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID, term_expr);
+    plan->plan_node_->plannodes_ =
+        milvus::test::CreateRetrievePlanByExpr(term_expr);
     std::vector<FieldId> target_fields_id{fid_64, fid_vec};
     plan->field_ids_ = target_fields_id;
 
@@ -119,8 +118,7 @@ TEST_P(RetrieveTest, AutoID2) {
     auto choose = [=](int i) { return i * 3 % N; };
 
     auto dataset = DataGen(schema, N);
-    auto segment = CreateSealedSegment(schema);
-    SealedLoadFieldData(dataset, *segment);
+    auto segment = CreateSealedWithFieldDataLoaded(schema, dataset);
     auto i64_col = dataset.get_col<int64_t>(fid_64);
 
     auto plan = std::make_unique<query::RetrievePlan>(*schema);
@@ -137,8 +135,8 @@ TEST_P(RetrieveTest, AutoID2) {
             fid_64, DataType::INT64, std::vector<std::string>()),
         values);
     plan->plan_node_ = std::make_unique<query::RetrievePlanNode>();
-    plan->plan_node_->filter_plannode_ =
-        std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID, term_expr);
+    plan->plan_node_->plannodes_ =
+        milvus::test::CreateRetrievePlanByExpr(term_expr);
     std::vector<FieldId> target_offsets{fid_64, fid_vec};
     plan->field_ids_ = target_offsets;
 
@@ -180,8 +178,7 @@ TEST_P(RetrieveTest, NotExist) {
     auto choose2 = [=](int i) { return i * 3 % N + 3 * N; };
 
     auto dataset = DataGen(schema, N);
-    auto segment = CreateSealedSegment(schema);
-    SealedLoadFieldData(dataset, *segment);
+    auto segment = CreateSealedWithFieldDataLoaded(schema, dataset);
     auto i64_col = dataset.get_col<int64_t>(fid_64);
 
     auto plan = std::make_unique<query::RetrievePlan>(*schema);
@@ -202,8 +199,8 @@ TEST_P(RetrieveTest, NotExist) {
             fid_64, DataType::INT64, std::vector<std::string>()),
         values);
     plan->plan_node_ = std::make_unique<query::RetrievePlanNode>();
-    plan->plan_node_->filter_plannode_ =
-        std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID, term_expr);
+    plan->plan_node_->plannodes_ =
+        milvus::test::CreateRetrievePlanByExpr(term_expr);
     std::vector<FieldId> target_offsets{fid_64, fid_vec};
     plan->field_ids_ = target_offsets;
 
@@ -259,8 +256,8 @@ TEST_P(RetrieveTest, Empty) {
             fid_64, DataType::INT64, std::vector<std::string>()),
         values);
     plan->plan_node_ = std::make_unique<query::RetrievePlanNode>();
-    plan->plan_node_->filter_plannode_ =
-        std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID, term_expr);
+    plan->plan_node_->plannodes_ =
+        milvus::test::CreateRetrievePlanByExpr(term_expr);
     std::vector<FieldId> target_offsets{fid_64, fid_vec};
     plan->field_ids_ = target_offsets;
 
@@ -290,8 +287,7 @@ TEST_P(RetrieveTest, Limit) {
 
     int64_t N = 101;
     auto dataset = DataGen(schema, N, 42);
-    auto segment = CreateSealedSegment(schema);
-    SealedLoadFieldData(dataset, *segment);
+    auto segment = CreateSealedWithFieldDataLoaded(schema, dataset);
 
     auto plan = std::make_unique<query::RetrievePlan>(*schema);
     proto::plan::GenericValue unary_val;
@@ -300,10 +296,10 @@ TEST_P(RetrieveTest, Limit) {
         milvus::expr::ColumnInfo(
             fid_64, DataType::INT64, std::vector<std::string>()),
         OpType::GreaterEqual,
-        unary_val);
+        unary_val,
+        std::vector<proto::plan::GenericValue>{});
     plan->plan_node_ = std::make_unique<query::RetrievePlanNode>();
-    plan->plan_node_->filter_plannode_ =
-        std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID, expr);
+    plan->plan_node_->plannodes_ = milvus::test::CreateRetrievePlanByExpr(expr);
 
     // test query results exceed the limit size
     std::vector<FieldId> target_fields{TimestampFieldID, fid_64, fid_vec};
@@ -339,8 +335,7 @@ TEST_P(RetrieveTest, FillEntry) {
 
     int64_t N = 101;
     auto dataset = DataGen(schema, N, 42);
-    auto segment = CreateSealedSegment(schema);
-    SealedLoadFieldData(dataset, *segment);
+    auto segment = CreateSealedWithFieldDataLoaded(schema, dataset);
     auto plan = std::make_unique<query::RetrievePlan>(*schema);
     proto::plan::GenericValue unary_val;
     unary_val.set_int64_val(0);
@@ -348,11 +343,10 @@ TEST_P(RetrieveTest, FillEntry) {
         milvus::expr::ColumnInfo(
             fid_64, DataType::INT64, std::vector<std::string>()),
         OpType::GreaterEqual,
-        unary_val);
+        unary_val,
+        std::vector<proto::plan::GenericValue>{});
     plan->plan_node_ = std::make_unique<query::RetrievePlanNode>();
-    plan->plan_node_->filter_plannode_ =
-        std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID, expr);
-
+    plan->plan_node_->plannodes_ = milvus::test::CreateRetrievePlanByExpr(expr);
     // test query results exceed the limit size
     std::vector<FieldId> target_fields{TimestampFieldID,
                                        fid_64,
@@ -384,8 +378,7 @@ TEST_P(RetrieveTest, LargeTimestamp) {
     auto choose = [=](int i) { return i * choose_sep % N; };
     uint64_t ts_offset = 100;
     auto dataset = DataGen(schema, N, 42, ts_offset + 1);
-    auto segment = CreateSealedSegment(schema);
-    SealedLoadFieldData(dataset, *segment);
+    auto segment = CreateSealedWithFieldDataLoaded(schema, dataset);
     auto i64_col = dataset.get_col<int64_t>(fid_64);
 
     auto plan = std::make_unique<query::RetrievePlan>(*schema);
@@ -403,8 +396,8 @@ TEST_P(RetrieveTest, LargeTimestamp) {
         values);
     ;
     plan->plan_node_ = std::make_unique<query::RetrievePlanNode>();
-    plan->plan_node_->filter_plannode_ =
-        std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID, term_expr);
+    plan->plan_node_->plannodes_ =
+        milvus::test::CreateRetrievePlanByExpr(term_expr);
     std::vector<FieldId> target_offsets{fid_64, fid_vec};
     plan->field_ids_ = target_offsets;
 
@@ -453,8 +446,7 @@ TEST_P(RetrieveTest, Delete) {
     auto choose = [=](int i) { return i; };
 
     auto dataset = DataGen(schema, N);
-    auto segment = CreateSealedSegment(schema);
-    SealedLoadFieldData(dataset, *segment);
+    auto segment = CreateSealedWithFieldDataLoaded(schema, dataset);
     auto i64_col = dataset.get_col<int64_t>(fid_64);
     auto ts_col = dataset.get_col<int64_t>(fid_ts);
 
@@ -476,8 +468,8 @@ TEST_P(RetrieveTest, Delete) {
             fid_64, DataType::INT64, std::vector<std::string>()),
         values);
     plan->plan_node_ = std::make_unique<query::RetrievePlanNode>();
-    plan->plan_node_->filter_plannode_ =
-        std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID, term_expr);
+    plan->plan_node_->plannodes_ =
+        milvus::test::CreateRetrievePlanByExpr(term_expr);
     std::vector<FieldId> target_offsets{fid_ts, fid_64, fid_vec};
     plan->field_ids_ = target_offsets;
 
@@ -536,10 +528,7 @@ TEST_P(RetrieveTest, Delete) {
     auto ids = std::make_unique<IdArray>();
     ids->mutable_int_id()->mutable_data()->Add(new_pks.begin(), new_pks.end());
     std::vector<idx_t> new_timestamps{10, 10, 10, 10, 10, 10};
-    auto reserved_offset = segment->get_deleted_count();
-    ASSERT_EQ(reserved_offset, row_count);
-    segment->Delete(reserved_offset,
-                    new_count,
+    segment->Delete(new_count,
                     ids.get(),
                     reinterpret_cast<const Timestamp*>(new_timestamps.data()));
 

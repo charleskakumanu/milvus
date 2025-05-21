@@ -1,66 +1,28 @@
+#include <assert.h>
 #include <sstream>
 #include <fmt/format.h>
 #include <set>
 #include <iostream>
+#include <map>
+#include <vector>
+#include <type_traits>
+
+#include "common/EasyAssert.h"
 #include "tantivy-binding.h"
+#include "rust-binding.h"
+#include "rust-array.h"
+#include "rust-hashmap.h"
+#include "index/Utils.h"
 
 namespace milvus::tantivy {
-struct RustArrayWrapper {
-    explicit RustArrayWrapper(RustArray array) : array_(array) {
-    }
+using Map = std::map<std::string, std::string>;
 
-    RustArrayWrapper(RustArrayWrapper&) = delete;
-    RustArrayWrapper&
-    operator=(RustArrayWrapper&) = delete;
-
-    RustArrayWrapper(RustArrayWrapper&& other) noexcept {
-        array_.array = other.array_.array;
-        array_.len = other.array_.len;
-        array_.cap = other.array_.cap;
-        other.array_.array = nullptr;
-        other.array_.len = 0;
-        other.array_.cap = 0;
-    }
-
-    RustArrayWrapper&
-    operator=(RustArrayWrapper&& other) noexcept {
-        if (this != &other) {
-            free();
-            array_.array = other.array_.array;
-            array_.len = other.array_.len;
-            array_.cap = other.array_.cap;
-            other.array_.array = nullptr;
-            other.array_.len = 0;
-            other.array_.cap = 0;
-        }
-        return *this;
-    }
-
-    ~RustArrayWrapper() {
-        free();
-    }
-
-    void
-    debug() {
-        std::stringstream ss;
-        ss << "[ ";
-        for (int i = 0; i < array_.len; i++) {
-            ss << array_.array[i] << " ";
-        }
-        ss << "]";
-        std::cout << ss.str() << std::endl;
-    }
-
-    RustArray array_;
-
- private:
-    void
-    free() {
-        if (array_.array != nullptr) {
-            free_rust_array(array_);
-        }
-    }
-};
+static constexpr const char* DEFAULT_TOKENIZER_NAME = "milvus_tokenizer";
+static const char* DEFAULT_analyzer_params = "{}";
+static constexpr uintptr_t DEFAULT_NUM_THREADS =
+    1;  // Every field with index writer will generate a thread, make huge thread amount, wait for refactoring.
+static constexpr uintptr_t DEFAULT_OVERALL_MEMORY_BUDGET_IN_BYTES =
+    DEFAULT_NUM_THREADS * 15 * 1024 * 1024;
 
 template <typename T>
 inline TantivyDataType
@@ -81,15 +43,14 @@ guess_data_type() {
                       typeid(T).name());
 }
 
+// TODO: should split this into IndexWriter & IndexReader.
 struct TantivyIndexWrapper {
     using IndexWriter = void*;
     using IndexReader = void*;
 
-    TantivyIndexWrapper() = default;
+    NO_COPY_OR_ASSIGN(TantivyIndexWrapper);
 
-    TantivyIndexWrapper(TantivyIndexWrapper&) = delete;
-    TantivyIndexWrapper&
-    operator=(TantivyIndexWrapper&) = delete;
+    TantivyIndexWrapper() = default;
 
     TantivyIndexWrapper(TantivyIndexWrapper&& other) noexcept {
         writer_ = other.writer_;
@@ -118,68 +79,407 @@ struct TantivyIndexWrapper {
         return *this;
     }
 
+    // create index writer for non-text type.
     TantivyIndexWrapper(const char* field_name,
                         TantivyDataType data_type,
-                        const char* path) {
-        writer_ = tantivy_create_index(field_name, data_type, path);
+                        const char* path,
+                        uint32_t tantivy_index_version,
+                        bool inverted_single_semgnent = false,
+                        uintptr_t num_threads = DEFAULT_NUM_THREADS,
+                        uintptr_t overall_memory_budget_in_bytes =
+                            DEFAULT_OVERALL_MEMORY_BUDGET_IN_BYTES,
+                        bool enable_user_specified_doc_id = true) {
+        RustResultWrapper res;
+        if (inverted_single_semgnent) {
+            AssertInfo(tantivy_index_version == 5,
+                       "TantivyIndexWrapper: inverted_single_semgnent only "
+                       "support tantivy 5");
+            res = RustResultWrapper(tantivy_create_index_with_single_segment(
+                field_name, data_type, path));
+        } else {
+            res = RustResultWrapper(
+                tantivy_create_index(field_name,
+                                     data_type,
+                                     path,
+                                     tantivy_index_version,
+                                     num_threads,
+                                     overall_memory_budget_in_bytes,
+                                     enable_user_specified_doc_id));
+        }
+        AssertInfo(res.result_->success,
+                   "failed to create index: {}",
+                   res.result_->error);
+        writer_ = res.result_->value.ptr._0;
         path_ = std::string(path);
     }
 
-    explicit TantivyIndexWrapper(const char* path) {
+    // load index. create index reader.
+    explicit TantivyIndexWrapper(const char* path, SetBitsetFn set_bitset) {
         assert(tantivy_index_exist(path));
-        reader_ = tantivy_load_index(path);
+        auto res = RustResultWrapper(tantivy_load_index(path, set_bitset));
+        AssertInfo(res.result_->success,
+                   "failed to load index: {}",
+                   res.result_->error);
+        reader_ = res.result_->value.ptr._0;
         path_ = std::string(path);
+    }
+
+    // create index writer for text type with tokenizer.
+    TantivyIndexWrapper(const char* field_name,
+                        bool in_ram,
+                        const char* path,
+                        uint32_t tantivy_index_version,
+                        const char* tokenizer_name = DEFAULT_TOKENIZER_NAME,
+                        const char* analyzer_params = DEFAULT_analyzer_params,
+                        uintptr_t num_threads = DEFAULT_NUM_THREADS,
+                        uintptr_t overall_memory_budget_in_bytes =
+                            DEFAULT_OVERALL_MEMORY_BUDGET_IN_BYTES) {
+        auto res = RustResultWrapper(
+            tantivy_create_text_writer(field_name,
+                                       path,
+                                       tantivy_index_version,
+                                       tokenizer_name,
+                                       analyzer_params,
+                                       num_threads,
+                                       overall_memory_budget_in_bytes,
+                                       in_ram));
+        AssertInfo(res.result_->success,
+                   "failed to create text writer: {}",
+                   res.result_->error);
+        writer_ = res.result_->value.ptr._0;
+        path_ = std::string(path);
+    }
+
+    // create index writer for json key stats
+    TantivyIndexWrapper(const char* field_name,
+                        const char* path,
+                        uint32_t tantivy_index_version,
+                        bool in_ram = false,
+                        uintptr_t num_threads = DEFAULT_NUM_THREADS,
+                        uintptr_t overall_memory_budget_in_bytes =
+                            DEFAULT_OVERALL_MEMORY_BUDGET_IN_BYTES) {
+        auto res = RustResultWrapper(
+            tantivy_create_json_key_stats_writer(field_name,
+                                                 path,
+                                                 tantivy_index_version,
+                                                 num_threads,
+                                                 overall_memory_budget_in_bytes,
+                                                 in_ram));
+        AssertInfo(res.result_->success,
+                   "failed to create text writer: {}",
+                   res.result_->error);
+        writer_ = res.result_->value.ptr._0;
+        path_ = std::string(path);
+    }
+
+    // create reader.
+    void
+    create_reader() {
+        if (writer_ != nullptr) {
+            auto res = RustResultWrapper(tantivy_create_reader_from_writer(
+                writer_, milvus::index::SetBitset));
+            AssertInfo(res.result_->success,
+                       "failed to create reader from writer: {}",
+                       res.result_->error);
+            reader_ = res.result_->value.ptr._0;
+        } else if (!path_.empty()) {
+            assert(tantivy_index_exist(path_.c_str()));
+            auto res = RustResultWrapper(
+                tantivy_load_index(path_.c_str(), milvus::index::SetBitset));
+            AssertInfo(res.result_->success,
+                       "failed to load index: {}",
+                       res.result_->error);
+            reader_ = res.result_->value.ptr._0;
+        }
     }
 
     ~TantivyIndexWrapper() {
         free();
     }
 
+    void
+    register_tokenizer(const char* tokenizer_name,
+                       const char* analyzer_params) {
+        if (reader_ != nullptr) {
+            auto res = RustResultWrapper(tantivy_register_tokenizer(
+                reader_, tokenizer_name, analyzer_params));
+            AssertInfo(res.result_->success,
+                       "failed to register tokenizer: {}",
+                       res.result_->error);
+        }
+    }
+
     template <typename T>
     void
-    add_data(const T* array, uintptr_t len) {
+    add_data(const T* array, uintptr_t len, int64_t offset_begin) {
         assert(!finished_);
 
         if constexpr (std::is_same_v<T, bool>) {
-            tantivy_index_add_bools(writer_, array, len);
+            auto res = RustResultWrapper(
+                tantivy_index_add_bools(writer_, array, len, offset_begin));
+            AssertInfo(res.result_->success,
+                       "failed to add bools: {}",
+                       res.result_->error);
             return;
         }
 
         if constexpr (std::is_same_v<T, int8_t>) {
-            tantivy_index_add_int8s(writer_, array, len);
+            auto res = RustResultWrapper(
+                tantivy_index_add_int8s(writer_, array, len, offset_begin));
+            AssertInfo(res.result_->success,
+                       "failed to add int8s: {}",
+                       res.result_->error);
             return;
         }
 
         if constexpr (std::is_same_v<T, int16_t>) {
-            tantivy_index_add_int16s(writer_, array, len);
+            auto res = RustResultWrapper(
+                tantivy_index_add_int16s(writer_, array, len, offset_begin));
+            AssertInfo(res.result_->success,
+                       "failed to add int16s: {}",
+                       res.result_->error);
             return;
         }
 
         if constexpr (std::is_same_v<T, int32_t>) {
-            tantivy_index_add_int32s(writer_, array, len);
+            auto res = RustResultWrapper(
+                tantivy_index_add_int32s(writer_, array, len, offset_begin));
+            AssertInfo(res.result_->success,
+                       "failed to add int32s: {}",
+                       res.result_->error);
             return;
         }
 
         if constexpr (std::is_same_v<T, int64_t>) {
-            tantivy_index_add_int64s(writer_, array, len);
+            auto res = RustResultWrapper(
+                tantivy_index_add_int64s(writer_, array, len, offset_begin));
+            AssertInfo(res.result_->success,
+                       "failed to add int64s: {}",
+                       res.result_->error);
             return;
         }
 
         if constexpr (std::is_same_v<T, float>) {
-            tantivy_index_add_f32s(writer_, array, len);
+            auto res = RustResultWrapper(
+                tantivy_index_add_f32s(writer_, array, len, offset_begin));
+            AssertInfo(res.result_->success,
+                       "failed to add f32s: {}",
+                       res.result_->error);
             return;
         }
 
         if constexpr (std::is_same_v<T, double>) {
-            tantivy_index_add_f64s(writer_, array, len);
+            auto res = RustResultWrapper(
+                tantivy_index_add_f64s(writer_, array, len, offset_begin));
+            AssertInfo(res.result_->success,
+                       "failed to add f64s: {}",
+                       res.result_->error);
             return;
         }
 
         if constexpr (std::is_same_v<T, std::string>) {
             // TODO: not very efficient, a lot of overhead due to rust-ffi call.
             for (uintptr_t i = 0; i < len; i++) {
-                tantivy_index_add_keyword(
-                    writer_, static_cast<const std::string*>(array)[i].c_str());
+                auto res = RustResultWrapper(tantivy_index_add_string(
+                    writer_,
+                    static_cast<const std::string*>(array)[i].c_str(),
+                    offset_begin + i));
+                AssertInfo(res.result_->success,
+                           "failed to add string: {}",
+                           res.result_->error);
+            }
+            return;
+        }
+
+        throw fmt::format("InvertedIndex.add_data: unsupported data type: {}",
+                          typeid(T).name());
+    }
+
+    void
+    add_json_key_stats_data_by_batch(const char* const* keys,
+                                     const int64_t* const* json_offsets,
+                                     const uintptr_t* json_offsets_lens,
+                                     uintptr_t len_of_lens) {
+        assert(!finished_);
+        auto res =
+            RustResultWrapper(tantivy_index_add_json_key_stats_data_by_batch(
+                writer_, keys, json_offsets, json_offsets_lens, len_of_lens));
+        AssertInfo(res.result_->success,
+                   "failed to add json key stats: {}",
+                   res.result_->error);
+    }
+
+    template <typename T>
+    void
+    add_array_data(const T* array, uintptr_t len, int64_t offset) {
+        assert(!finished_);
+
+        if constexpr (std::is_same_v<T, bool>) {
+            auto res = RustResultWrapper(
+                tantivy_index_add_array_bools(writer_, array, len, offset));
+            AssertInfo(res.result_->success,
+                       "failed to add multi bools: {}",
+                       res.result_->error);
+            return;
+        }
+
+        if constexpr (std::is_same_v<T, int8_t>) {
+            auto res = RustResultWrapper(
+                tantivy_index_add_array_int8s(writer_, array, len, offset));
+            AssertInfo(res.result_->success,
+                       "failed to add multi int8s: {}",
+                       res.result_->error);
+            return;
+        }
+
+        if constexpr (std::is_same_v<T, int16_t>) {
+            auto res = RustResultWrapper(
+                tantivy_index_add_array_int16s(writer_, array, len, offset));
+            AssertInfo(res.result_->success,
+                       "failed to add multi int16s: {}",
+                       res.result_->error);
+            return;
+        }
+
+        if constexpr (std::is_same_v<T, int32_t>) {
+            auto res = RustResultWrapper(
+                tantivy_index_add_array_int32s(writer_, array, len, offset));
+            AssertInfo(res.result_->success,
+                       "failed to add multi int32s: {}",
+                       res.result_->error);
+            return;
+        }
+
+        if constexpr (std::is_same_v<T, int64_t>) {
+            auto res = RustResultWrapper(
+                tantivy_index_add_array_int64s(writer_, array, len, offset));
+            AssertInfo(res.result_->success,
+                       "failed to add multi int64s: {}",
+                       res.result_->error);
+            return;
+        }
+
+        if constexpr (std::is_same_v<T, float>) {
+            auto res = RustResultWrapper(
+                tantivy_index_add_array_f32s(writer_, array, len, offset));
+            AssertInfo(res.result_->success,
+                       "failed to add multi f32s: {}",
+                       res.result_->error);
+            return;
+        }
+
+        if constexpr (std::is_same_v<T, double>) {
+            auto res = RustResultWrapper(
+                tantivy_index_add_array_f64s(writer_, array, len, offset));
+            AssertInfo(res.result_->success,
+                       "failed to add multi f64s: {}",
+                       res.result_->error);
+            return;
+        }
+
+        if constexpr (std::is_same_v<T, std::string>) {
+            std::vector<const char*> views;
+            for (uintptr_t i = 0; i < len; i++) {
+                views.push_back(array[i].c_str());
+            }
+            auto res = RustResultWrapper(tantivy_index_add_array_keywords(
+                writer_, views.data(), len, offset));
+            AssertInfo(res.result_->success,
+                       "failed to add multi keywords: {}",
+                       res.result_->error);
+            return;
+        }
+
+        throw fmt::format(
+            "InvertedIndex.add_array_data: unsupported data type: {}",
+            typeid(T).name());
+    }
+
+    template <typename T>
+    void
+    add_data_by_single_segment_writer(const T* array, uintptr_t len) {
+        assert(!finished_);
+
+        if constexpr (std::is_same_v<T, bool>) {
+            auto res = RustResultWrapper(
+                tantivy_index_add_bools_by_single_segment_writer(
+                    writer_, array, len));
+            AssertInfo(res.result_->success,
+                       "failed to add bools: {}",
+                       res.result_->error);
+            return;
+        }
+
+        if constexpr (std::is_same_v<T, int8_t>) {
+            auto res = RustResultWrapper(
+                tantivy_index_add_int8s_by_single_segment_writer(
+                    writer_, array, len));
+            AssertInfo(res.result_->success,
+                       "failed to add int8s: {}",
+                       res.result_->error);
+            return;
+        }
+
+        if constexpr (std::is_same_v<T, int16_t>) {
+            auto res = RustResultWrapper(
+                tantivy_index_add_int16s_by_single_segment_writer(
+                    writer_, array, len));
+            AssertInfo(res.result_->success,
+                       "failed to add int16s: {}",
+                       res.result_->error);
+            return;
+        }
+
+        if constexpr (std::is_same_v<T, int32_t>) {
+            auto res = RustResultWrapper(
+                tantivy_index_add_int32s_by_single_segment_writer(
+                    writer_, array, len));
+            AssertInfo(res.result_->success,
+                       "failed to add int32s: {}",
+                       res.result_->error);
+            return;
+        }
+
+        if constexpr (std::is_same_v<T, int64_t>) {
+            auto res = RustResultWrapper(
+                tantivy_index_add_int64s_by_single_segment_writer(
+                    writer_, array, len));
+            AssertInfo(res.result_->success,
+                       "failed to add int64s: {}",
+                       res.result_->error);
+            return;
+        }
+
+        if constexpr (std::is_same_v<T, float>) {
+            auto res = RustResultWrapper(
+                tantivy_index_add_f32s_by_single_segment_writer(
+                    writer_, array, len));
+            AssertInfo(res.result_->success,
+                       "failed to add f32s: {}",
+                       res.result_->error);
+            return;
+        }
+
+        if constexpr (std::is_same_v<T, double>) {
+            auto res = RustResultWrapper(
+                tantivy_index_add_f64s_by_single_segment_writer(
+                    writer_, array, len));
+            AssertInfo(res.result_->success,
+                       "failed to add f64s: {}",
+                       res.result_->error);
+            return;
+        }
+
+        if constexpr (std::is_same_v<T, std::string>) {
+            // TODO: not very efficient, a lot of overhead due to rust-ffi call.
+            for (uintptr_t i = 0; i < len; i++) {
+                auto res = RustResultWrapper(
+                    tantivy_index_add_string_by_single_segment_writer(
+                        writer_,
+                        static_cast<const std::string*>(array)[i].c_str()));
+                AssertInfo(res.result_->success,
+                           "failed to add string: {}",
+                           res.result_->error);
             }
             return;
         }
@@ -190,41 +490,76 @@ struct TantivyIndexWrapper {
 
     template <typename T>
     void
-    add_multi_data(const T* array, uintptr_t len) {
+    add_array_data_by_single_segment_writer(const T* array, uintptr_t len) {
         assert(!finished_);
 
         if constexpr (std::is_same_v<T, bool>) {
-            tantivy_index_add_multi_bools(writer_, array, len);
+            auto res = RustResultWrapper(
+                tantivy_index_add_array_bools_by_single_segment_writer(
+                    writer_, array, len));
+            AssertInfo(res.result_->success,
+                       "failed to add multi bools: {}",
+                       res.result_->error);
             return;
         }
 
         if constexpr (std::is_same_v<T, int8_t>) {
-            tantivy_index_add_multi_int8s(writer_, array, len);
+            auto res = RustResultWrapper(
+                tantivy_index_add_array_int8s_by_single_segment_writer(
+                    writer_, array, len));
+            AssertInfo(res.result_->success,
+                       "failed to add multi int8s: {}",
+                       res.result_->error);
             return;
         }
 
         if constexpr (std::is_same_v<T, int16_t>) {
-            tantivy_index_add_multi_int16s(writer_, array, len);
+            auto res = RustResultWrapper(
+                tantivy_index_add_array_int16s_by_single_segment_writer(
+                    writer_, array, len));
+            AssertInfo(res.result_->success,
+                       "failed to add multi int16s: {}",
+                       res.result_->error);
             return;
         }
 
         if constexpr (std::is_same_v<T, int32_t>) {
-            tantivy_index_add_multi_int32s(writer_, array, len);
+            auto res = RustResultWrapper(
+                tantivy_index_add_array_int32s_by_single_segment_writer(
+                    writer_, array, len));
+            AssertInfo(res.result_->success,
+                       "failed to add multi int32s: {}",
+                       res.result_->error);
             return;
         }
 
         if constexpr (std::is_same_v<T, int64_t>) {
-            tantivy_index_add_multi_int64s(writer_, array, len);
+            auto res = RustResultWrapper(
+                tantivy_index_add_array_int64s_by_single_segment_writer(
+                    writer_, array, len));
+            AssertInfo(res.result_->success,
+                       "failed to add multi int64s: {}",
+                       res.result_->error);
             return;
         }
 
         if constexpr (std::is_same_v<T, float>) {
-            tantivy_index_add_multi_f32s(writer_, array, len);
+            auto res = RustResultWrapper(
+                tantivy_index_add_array_f32s_by_single_segment_writer(
+                    writer_, array, len));
+            AssertInfo(res.result_->success,
+                       "failed to add multi f32s: {}",
+                       res.result_->error);
             return;
         }
 
         if constexpr (std::is_same_v<T, double>) {
-            tantivy_index_add_multi_f64s(writer_, array, len);
+            auto res = RustResultWrapper(
+                tantivy_index_add_array_f64s_by_single_segment_writer(
+                    writer_, array, len));
+            AssertInfo(res.result_->success,
+                       "failed to add multi f64s: {}",
+                       res.result_->error);
             return;
         }
 
@@ -233,80 +568,147 @@ struct TantivyIndexWrapper {
             for (uintptr_t i = 0; i < len; i++) {
                 views.push_back(array[i].c_str());
             }
-            tantivy_index_add_multi_keywords(writer_, views.data(), len);
+            auto res = RustResultWrapper(
+                tantivy_index_add_array_keywords_by_single_segment_writer(
+                    writer_, views.data(), len));
+            AssertInfo(res.result_->success,
+                       "failed to add multi keywords: {}",
+                       res.result_->error);
             return;
         }
 
         throw fmt::format(
-            "InvertedIndex.add_multi_data: unsupported data type: {}",
+            "InvertedIndex.add_array_data: unsupported data type: {}",
             typeid(T).name());
     }
 
     inline void
     finish() {
-        if (!finished_) {
-            tantivy_finish_index(writer_);
-            writer_ = nullptr;
-            reader_ = tantivy_load_index(path_.c_str());
-            finished_ = true;
+        if (finished_) {
+            return;
+        }
+
+        auto res = RustResultWrapper(tantivy_finish_index(writer_));
+        AssertInfo(res.result_->success,
+                   "failed to finish index: {}",
+                   res.result_->error);
+        writer_ = nullptr;
+        finished_ = true;
+    }
+
+    inline void
+    commit() {
+        if (writer_ != nullptr) {
+            auto res = RustResultWrapper(tantivy_commit_index(writer_));
+            AssertInfo(res.result_->success,
+                       "failed to commit index: {}",
+                       res.result_->error);
+        }
+    }
+
+    inline void
+    reload() {
+        if (reader_ != nullptr) {
+            auto res = RustResultWrapper(tantivy_reload_index(reader_));
+            AssertInfo(res.result_->success,
+                       "failed to reload index: {}",
+                       res.result_->error);
         }
     }
 
     inline uint32_t
     count() {
-        return tantivy_index_count(reader_);
+        auto res = RustResultWrapper(tantivy_index_count(reader_));
+        AssertInfo(res.result_->success,
+                   "failed to get count: {}",
+                   res.result_->error);
+        return res.result_->value.u32._0;
     }
 
  public:
     template <typename T>
-    RustArrayWrapper
-    term_query(T term) {
+    void
+    term_query(T term, void* bitset) {
         auto array = [&]() {
             if constexpr (std::is_same_v<T, bool>) {
-                return tantivy_term_query_bool(reader_, term);
+                return tantivy_term_query_bool(reader_, term, bitset);
             }
 
             if constexpr (std::is_integral_v<T>) {
-                return tantivy_term_query_i64(reader_,
-                                              static_cast<int64_t>(term));
+                return tantivy_term_query_i64(
+                    reader_, static_cast<int64_t>(term), bitset);
             }
 
             if constexpr (std::is_floating_point_v<T>) {
-                return tantivy_term_query_f64(reader_,
-                                              static_cast<double>(term));
+                return tantivy_term_query_f64(
+                    reader_, static_cast<double>(term), bitset);
             }
 
             if constexpr (std::is_same_v<T, std::string>) {
                 return tantivy_term_query_keyword(
-                    reader_, static_cast<std::string>(term).c_str());
+                    reader_, static_cast<std::string>(term).c_str(), bitset);
             }
 
             throw fmt::format(
                 "InvertedIndex.term_query: unsupported data type: {}",
                 typeid(T).name());
         }();
-        return RustArrayWrapper(array);
+
+        auto res = RustResultWrapper(array);
+        AssertInfo(res.result_->success,
+                   "TantivyIndexWrapper.term_query: {}",
+                   res.result_->error);
+        AssertInfo(res.result_->value.tag == Value::Tag::None,
+                   "TantivyIndexWrapper.term_query: invalid result type");
+    }
+
+    RustArrayI64Wrapper
+    term_query_i64(std::string term) {
+        auto array = [&]() {
+            return tantivy_term_query_keyword_i64(reader_, term.c_str());
+        }();
+
+        auto res = RustResultWrapper(array);
+        AssertInfo(res.result_->success,
+                   "TantivyIndexWrapper.term_query_i64: {}",
+                   res.result_->error);
+        AssertInfo(res.result_->value.tag == Value::Tag::RustArrayI64,
+                   "TantivyIndexWrapper.term_query_i64: invalid result type");
+        return RustArrayI64Wrapper(
+            std::move(res.result_->value.rust_array_i64._0));
     }
 
     template <typename T>
-    RustArrayWrapper
-    lower_bound_range_query(T lower_bound, bool inclusive) {
+    void
+    lower_bound_range_query(T lower_bound, bool inclusive, void* bitset) {
         auto array = [&]() {
+            if constexpr (std::is_same_v<T, bool>) {
+                return tantivy_lower_bound_range_query_bool(
+                    reader_, static_cast<bool>(lower_bound), inclusive, bitset);
+            }
+
             if constexpr (std::is_integral_v<T>) {
                 return tantivy_lower_bound_range_query_i64(
-                    reader_, static_cast<int64_t>(lower_bound), inclusive);
+                    reader_,
+                    static_cast<int64_t>(lower_bound),
+                    inclusive,
+                    bitset);
             }
 
             if constexpr (std::is_floating_point_v<T>) {
                 return tantivy_lower_bound_range_query_f64(
-                    reader_, static_cast<double>(lower_bound), inclusive);
+                    reader_,
+                    static_cast<double>(lower_bound),
+                    inclusive,
+                    bitset);
             }
 
             if constexpr (std::is_same_v<T, std::string>) {
                 return tantivy_lower_bound_range_query_keyword(
                     reader_,
                     static_cast<std::string>(lower_bound).c_str(),
-                    inclusive);
+                    inclusive,
+                    bitset);
             }
 
             throw fmt::format(
@@ -314,28 +716,47 @@ struct TantivyIndexWrapper {
                 "{}",
                 typeid(T).name());
         }();
-        return RustArrayWrapper(array);
+        auto res = RustResultWrapper(array);
+        AssertInfo(res.result_->success,
+                   "TantivyIndexWrapper.lower_bound_range_query: {}",
+                   res.result_->error);
+        AssertInfo(
+            res.result_->value.tag == Value::Tag::None,
+            "TantivyIndexWrapper.lower_bound_range_query: invalid result "
+            "type");
     }
 
     template <typename T>
-    RustArrayWrapper
-    upper_bound_range_query(T upper_bound, bool inclusive) {
+    void
+    upper_bound_range_query(T upper_bound, bool inclusive, void* bitset) {
         auto array = [&]() {
+            if constexpr (std::is_same_v<T, bool>) {
+                return tantivy_upper_bound_range_query_bool(
+                    reader_, static_cast<bool>(upper_bound), inclusive, bitset);
+            }
+
             if constexpr (std::is_integral_v<T>) {
                 return tantivy_upper_bound_range_query_i64(
-                    reader_, static_cast<int64_t>(upper_bound), inclusive);
+                    reader_,
+                    static_cast<int64_t>(upper_bound),
+                    inclusive,
+                    bitset);
             }
 
             if constexpr (std::is_floating_point_v<T>) {
                 return tantivy_upper_bound_range_query_f64(
-                    reader_, static_cast<double>(upper_bound), inclusive);
+                    reader_,
+                    static_cast<double>(upper_bound),
+                    inclusive,
+                    bitset);
             }
 
             if constexpr (std::is_same_v<T, std::string>) {
                 return tantivy_upper_bound_range_query_keyword(
                     reader_,
                     static_cast<std::string>(upper_bound).c_str(),
-                    inclusive);
+                    inclusive,
+                    bitset);
             }
 
             throw fmt::format(
@@ -343,23 +764,41 @@ struct TantivyIndexWrapper {
                 "{}",
                 typeid(T).name());
         }();
-        return RustArrayWrapper(array);
+        auto res = RustResultWrapper(array);
+        AssertInfo(res.result_->success,
+                   "TantivyIndexWrapper.upper_bound_range_query: {}",
+                   res.result_->error);
+        AssertInfo(
+            res.result_->value.tag == Value::Tag::None,
+            "TantivyIndexWrapper.upper_bound_range_query: invalid result "
+            "type");
     }
 
     template <typename T>
-    RustArrayWrapper
+    void
     range_query(T lower_bound,
                 T upper_bound,
                 bool lb_inclusive,
-                bool ub_inclusive) {
+                bool ub_inclusive,
+                void* bitset) {
         auto array = [&]() {
+            if constexpr (std::is_same_v<T, bool>) {
+                return tantivy_range_query_bool(reader_,
+                                                static_cast<bool>(lower_bound),
+                                                static_cast<bool>(upper_bound),
+                                                lb_inclusive,
+                                                ub_inclusive,
+                                                bitset);
+            }
+
             if constexpr (std::is_integral_v<T>) {
                 return tantivy_range_query_i64(
                     reader_,
                     static_cast<int64_t>(lower_bound),
                     static_cast<int64_t>(upper_bound),
                     lb_inclusive,
-                    ub_inclusive);
+                    ub_inclusive,
+                    bitset);
             }
 
             if constexpr (std::is_floating_point_v<T>) {
@@ -367,7 +806,8 @@ struct TantivyIndexWrapper {
                                                static_cast<double>(lower_bound),
                                                static_cast<double>(upper_bound),
                                                lb_inclusive,
-                                               ub_inclusive);
+                                               ub_inclusive,
+                                               bitset);
             }
 
             if constexpr (std::is_same_v<T, std::string>) {
@@ -376,26 +816,67 @@ struct TantivyIndexWrapper {
                     static_cast<std::string>(lower_bound).c_str(),
                     static_cast<std::string>(upper_bound).c_str(),
                     lb_inclusive,
-                    ub_inclusive);
+                    ub_inclusive,
+                    bitset);
             }
 
             throw fmt::format(
                 "InvertedIndex.range_query: unsupported data type: {}",
                 typeid(T).name());
         }();
-        return RustArrayWrapper(array);
+        auto res = RustResultWrapper(array);
+        AssertInfo(res.result_->success,
+                   "TantivyIndexWrapper.range_query: {}",
+                   res.result_->error);
+        AssertInfo(res.result_->value.tag == Value::Tag::None,
+                   "TantivyIndexWrapper.range_query: invalid result type");
     }
 
-    RustArrayWrapper
-    prefix_query(const std::string& prefix) {
-        auto array = tantivy_prefix_query_keyword(reader_, prefix.c_str());
-        return RustArrayWrapper(array);
+    void
+    prefix_query(const std::string& prefix, void* bitset) {
+        auto array =
+            tantivy_prefix_query_keyword(reader_, prefix.c_str(), bitset);
+        auto res = RustResultWrapper(array);
+        AssertInfo(res.result_->success,
+                   "TantivyIndexWrapper.prefix_query: {}",
+                   res.result_->error);
+        AssertInfo(res.result_->value.tag == Value::Tag::None,
+                   "TantivyIndexWrapper.prefix_query: invalid result type");
     }
 
-    RustArrayWrapper
-    regex_query(const std::string& pattern) {
-        auto array = tantivy_regex_query(reader_, pattern.c_str());
-        return RustArrayWrapper(array);
+    void
+    regex_query(const std::string& pattern, void* bitset) {
+        auto array = tantivy_regex_query(reader_, pattern.c_str(), bitset);
+        auto res = RustResultWrapper(array);
+        AssertInfo(res.result_->success,
+                   "TantivyIndexWrapper.regex_query: {}",
+                   res.result_->error);
+        AssertInfo(res.result_->value.tag == Value::Tag::None,
+                   "TantivyIndexWrapper.regex_query: invalid result type");
+    }
+
+    void
+    match_query(const std::string& query, void* bitset) {
+        auto array = tantivy_match_query(reader_, query.c_str(), bitset);
+        auto res = RustResultWrapper(array);
+        AssertInfo(res.result_->success,
+                   "TantivyIndexWrapper.match_query: {}",
+                   res.result_->error);
+        AssertInfo(res.result_->value.tag == Value::Tag::None,
+                   "TantivyIndexWrapper.match_query: invalid result type");
+    }
+
+    void
+    phrase_match_query(const std::string& query, uint32_t slop, void* bitset) {
+        auto array =
+            tantivy_phrase_match_query(reader_, query.c_str(), slop, bitset);
+        auto res = RustResultWrapper(array);
+        AssertInfo(res.result_->success,
+                   "TantivyIndexWrapper.phrase_match_query: {}",
+                   res.result_->error);
+        AssertInfo(
+            res.result_->value.tag == Value::Tag::None,
+            "TantivyIndexWrapper.phrase_match_query: invalid result type");
     }
 
  public:
@@ -409,21 +890,23 @@ struct TantivyIndexWrapper {
         return reader_;
     }
 
- private:
-    void
-    check_search() {
-        // TODO
-    }
-
     void
     free() {
         if (writer_ != nullptr) {
             tantivy_free_index_writer(writer_);
+            writer_ = nullptr;
         }
 
         if (reader_ != nullptr) {
             tantivy_free_index_reader(reader_);
+            reader_ = nullptr;
         }
+    }
+
+ private:
+    void
+    check_search() {
+        // TODO
     }
 
  private:

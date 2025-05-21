@@ -25,8 +25,8 @@ import (
 
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	"github.com/milvus-io/milvus/internal/querycoordv2/params"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/syncutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/syncutil"
 )
 
 // ResourceObserver is used to observe resource group status.
@@ -36,7 +36,8 @@ type ResourceObserver struct {
 	wg     sync.WaitGroup
 	meta   *meta.Meta
 
-	stopOnce sync.Once
+	startOnce sync.Once
+	stopOnce  sync.Once
 }
 
 func NewResourceObserver(meta *meta.Meta) *ResourceObserver {
@@ -46,11 +47,13 @@ func NewResourceObserver(meta *meta.Meta) *ResourceObserver {
 }
 
 func (ob *ResourceObserver) Start() {
-	ctx, cancel := context.WithCancel(context.Background())
-	ob.cancel = cancel
+	ob.startOnce.Do(func() {
+		ctx, cancel := context.WithCancel(context.Background())
+		ob.cancel = cancel
 
-	ob.wg.Add(1)
-	go ob.schedule(ctx)
+		ob.wg.Add(1)
+		go ob.schedule(ctx)
+	})
 }
 
 func (ob *ResourceObserver) Stop() {
@@ -66,7 +69,7 @@ func (ob *ResourceObserver) schedule(ctx context.Context) {
 	defer ob.wg.Done()
 	log.Info("Start check resource group loop")
 
-	listener := ob.meta.ResourceManager.ListenResourceGroupChanged()
+	listener := ob.meta.ResourceManager.ListenResourceGroupChanged(ctx)
 	for {
 		ob.waitRGChangedOrTimeout(ctx, listener)
 		// stop if the context is canceled.
@@ -76,7 +79,7 @@ func (ob *ResourceObserver) schedule(ctx context.Context) {
 		}
 
 		// do check once.
-		ob.checkAndRecoverResourceGroup()
+		ob.checkAndRecoverResourceGroup(ctx)
 	}
 }
 
@@ -86,29 +89,30 @@ func (ob *ResourceObserver) waitRGChangedOrTimeout(ctx context.Context, listener
 	listener.Wait(ctxWithTimeout)
 }
 
-func (ob *ResourceObserver) checkAndRecoverResourceGroup() {
+func (ob *ResourceObserver) checkAndRecoverResourceGroup(ctx context.Context) {
 	manager := ob.meta.ResourceManager
-	rgNames := manager.ListResourceGroups()
+	rgNames := manager.ListResourceGroups(ctx)
 	enableRGAutoRecover := params.Params.QueryCoordCfg.EnableRGAutoRecover.GetAsBool()
+	log := log.Ctx(ctx)
 	log.Debug("start to check resource group", zap.Bool("enableRGAutoRecover", enableRGAutoRecover), zap.Int("resourceGroupNum", len(rgNames)))
 
 	// Check if there is any incoming node.
-	if manager.CheckIncomingNodeNum() > 0 {
-		log.Info("new incoming node is ready to be assigned...", zap.Int("incomingNodeNum", manager.CheckIncomingNodeNum()))
-		manager.AssignPendingIncomingNode()
+	if manager.CheckIncomingNodeNum(ctx) > 0 {
+		log.Info("new incoming node is ready to be assigned...", zap.Int("incomingNodeNum", manager.CheckIncomingNodeNum(ctx)))
+		manager.AssignPendingIncomingNode(ctx)
 	}
 
 	log.Debug("recover resource groups...")
 	// Recover all resource group into expected configuration.
 	for _, rgName := range rgNames {
-		if err := manager.MeetRequirement(rgName); err != nil {
+		if err := manager.MeetRequirement(ctx, rgName); err != nil {
 			log.Info("found resource group need to be recovered",
 				zap.String("rgName", rgName),
 				zap.String("reason", err.Error()),
 			)
 
 			if enableRGAutoRecover {
-				err := manager.AutoRecoverResourceGroup(rgName)
+				err := manager.AutoRecoverResourceGroup(ctx, rgName)
 				if err != nil {
 					log.Warn("failed to recover resource group",
 						zap.String("rgName", rgName),

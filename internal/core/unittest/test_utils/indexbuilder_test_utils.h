@@ -25,8 +25,10 @@
 #include "indexbuilder/ScalarIndexCreator.h"
 #include "indexbuilder/VecIndexCreator.h"
 #include "indexbuilder/index_c.h"
+#include "knowhere/comp/index_param.h"
 #include "pb/index_cgo_msg.pb.h"
 #include "storage/Types.h"
+#include "knowhere/comp/index_param.h"
 
 constexpr int64_t DIM = 16;
 constexpr int64_t NQ = 10;
@@ -58,7 +60,8 @@ generate_build_conf(const milvus::IndexType& index_type,
             {knowhere::indexparam::M, "4"},
             {knowhere::indexparam::NBITS, "8"},
         };
-    } else if (index_type == knowhere::IndexEnum::INDEX_FAISS_IVFFLAT) {
+    } else if (index_type == knowhere::IndexEnum::INDEX_FAISS_IVFFLAT ||
+               index_type == knowhere::IndexEnum::INDEX_FAISS_IVFFLAT_CC) {
         return knowhere::Json{
             {knowhere::meta::METRIC_TYPE, metric_type},
             {knowhere::meta::DIM, std::to_string(DIM)},
@@ -100,9 +103,23 @@ generate_build_conf(const milvus::IndexType& index_type,
         };
     } else if (index_type == knowhere::IndexEnum::INDEX_SPARSE_INVERTED_INDEX ||
                index_type == knowhere::IndexEnum::INDEX_SPARSE_WAND) {
+        if (metric_type == knowhere::metric::BM25) {
+            return knowhere::Json{
+                {knowhere::meta::METRIC_TYPE, metric_type},
+                {knowhere::indexparam::DROP_RATIO_BUILD, "0.1"},
+                {knowhere::meta::BM25_K1, "1.2"},
+                {knowhere::meta::BM25_B, "0.75"},
+                {knowhere::meta::BM25_AVGDL, "100"}};
+        }
         return knowhere::Json{
             {knowhere::meta::METRIC_TYPE, metric_type},
             {knowhere::indexparam::DROP_RATIO_BUILD, "0.1"},
+        };
+    } else if (index_type == knowhere::IndexEnum::INDEX_FAISS_SCANN ||
+               index_type == knowhere::IndexEnum::INDEX_FAISS_SCANN_DVR) {
+        return knowhere::Json{
+            {knowhere::meta::METRIC_TYPE, metric_type},
+            {knowhere::meta::DIM, std::to_string(DIM)},
         };
     }
     return knowhere::Json();
@@ -209,49 +226,17 @@ generate_params(const knowhere::IndexType& index_type,
 }
 
 auto
-GenDataset(int64_t N,
-           const knowhere::MetricType& metric_type,
-           bool is_binary,
-           int64_t dim = DIM) {
+GenFieldData(int64_t N,
+             const knowhere::MetricType& metric_type,
+             milvus::DataType data_type = milvus::DataType::VECTOR_FLOAT,
+             int64_t dim = DIM) {
     auto schema = std::make_shared<milvus::Schema>();
-    if (!is_binary) {
-        schema->AddDebugField(
-            "fakevec", milvus::DataType::VECTOR_FLOAT, dim, metric_type);
-        return milvus::segcore::DataGen(schema, N);
-    } else {
-        schema->AddDebugField(
-            "fakebinvec", milvus::DataType::VECTOR_BINARY, dim, metric_type);
-        return milvus::segcore::DataGen(schema, N);
-    }
-}
-
-auto
-GenDatasetWithDataType(int64_t N,
-                       const knowhere::MetricType& metric_type,
-                       milvus::DataType data_type,
-                       int64_t dim = DIM) {
-    auto schema = std::make_shared<milvus::Schema>();
-    if (data_type == milvus::DataType::VECTOR_FLOAT16) {
-        schema->AddDebugField(
-            "fakevec", milvus::DataType::VECTOR_FLOAT16, dim, metric_type);
-        return milvus::segcore::DataGen(schema, N);
-    } else if (data_type == milvus::DataType::VECTOR_BFLOAT16) {
-        schema->AddDebugField(
-            "fakevec", milvus::DataType::VECTOR_BFLOAT16, dim, metric_type);
-        return milvus::segcore::DataGen(schema, N);
-    } else if (data_type == milvus::DataType::VECTOR_FLOAT) {
-        schema->AddDebugField(
-            "fakevec", milvus::DataType::VECTOR_FLOAT, dim, metric_type);
-        return milvus::segcore::DataGen(schema, N);
-    } else if (data_type == milvus::DataType::VECTOR_SPARSE_FLOAT) {
-        schema->AddDebugField(
-            "fakevec", milvus::DataType::VECTOR_SPARSE_FLOAT, 0, metric_type);
-        return milvus::segcore::DataGen(schema, N);
-    } else {
-        schema->AddDebugField(
-            "fakebinvec", milvus::DataType::VECTOR_BINARY, dim, metric_type);
-        return milvus::segcore::DataGen(schema, N);
-    }
+    schema->AddDebugField(
+        "fakevec",
+        data_type,
+        (data_type != milvus::DataType::VECTOR_SPARSE_FLOAT ? dim : 0),
+        metric_type);
+    return milvus::segcore::DataGen(schema, N);
 }
 
 using QueryResultPtr = std::unique_ptr<milvus::SearchResult>;

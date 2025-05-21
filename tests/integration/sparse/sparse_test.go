@@ -22,18 +22,18 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/stretchr/testify/suite"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/util/metric"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/metric"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 	"github.com/milvus-io/milvus/tests/integration"
 )
 
@@ -183,7 +183,7 @@ func (s *SparseTestSuite) TestSparse_invalid_insert() {
 	s.NotEqual(insertResult.GetStatus().GetErrorCode(), commonpb.ErrorCode_Success)
 	sparseVecs.Contents[0] = sparseVecs.Contents[0][:len(sparseVecs.Contents[0])-4]
 
-	// empty row is not allowed
+	// empty row is allowed
 	sparseVecs.Contents[0] = []byte{}
 	insertResult, err = c.Proxy.Insert(ctx, &milvuspb.InsertRequest{
 		DbName:         dbName,
@@ -193,7 +193,7 @@ func (s *SparseTestSuite) TestSparse_invalid_insert() {
 		NumRows:        uint32(rowNum),
 	})
 	s.NoError(err)
-	s.NotEqual(insertResult.GetStatus().GetErrorCode(), commonpb.ErrorCode_Success)
+	s.Equal(insertResult.GetStatus().GetErrorCode(), commonpb.ErrorCode_Success)
 
 	// unsorted column index is not allowed
 	sparseVecs.Contents[0] = make([]byte, 16)

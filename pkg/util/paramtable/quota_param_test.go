@@ -17,7 +17,6 @@
 package paramtable
 
 import (
-	"math"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -36,6 +35,24 @@ func TestQuotaParam(t *testing.T) {
 		assert.Equal(t, false, qc.DDLLimitEnabled.GetAsBool())
 		assert.Equal(t, defaultMax, qc.DDLCollectionRate.GetAsFloat())
 		assert.Equal(t, defaultMax, qc.DDLPartitionRate.GetAsFloat())
+	})
+
+	t.Run("test deny all ddl", func(t *testing.T) {
+		params.Init(NewBaseTable(SkipRemote(true)))
+		qc := &params.QuotaConfig
+		assert.Equal(t, false, qc.ForceDenyAllDDL.GetAsBool())
+		params.Save(params.QuotaConfig.ForceDenyAllDDL.Key, "true")
+		defer params.Reset(params.QuotaConfig.ForceDenyAllDDL.Key)
+		assert.Equal(t, true, qc.ForceDenyAllDDL.GetAsBool())
+		assert.EqualValues(t, 0, qc.DDLCollectionRate.GetAsFloat())
+		assert.EqualValues(t, 0, qc.DDLCollectionRatePerDB.GetAsFloat())
+		assert.EqualValues(t, 0, qc.DDLPartitionRate.GetAsFloat())
+		assert.EqualValues(t, 0, qc.DDLPartitionRatePerDB.GetAsFloat())
+		assert.EqualValues(t, 0, qc.MaxIndexRate.GetAsFloat())
+		assert.EqualValues(t, 0, qc.MaxIndexRatePerDB.GetAsFloat())
+		assert.EqualValues(t, 0, qc.MaxCompactionRate.GetAsFloat())
+		assert.EqualValues(t, 0, qc.MaxCompactionRatePerDB.GetAsFloat())
+		assert.EqualValues(t, 0, qc.MaxDBRate.GetAsFloat())
 	})
 
 	t.Run("test functional params", func(t *testing.T) {
@@ -190,7 +207,7 @@ func TestQuotaParam(t *testing.T) {
 	t.Run("test limit writing", func(t *testing.T) {
 		assert.False(t, qc.ForceDenyWriting.GetAsBool())
 		assert.Equal(t, false, qc.TtProtectionEnabled.GetAsBool())
-		assert.Equal(t, math.MaxInt64, qc.MaxTimeTickDelay.GetAsInt())
+		assert.Equal(t, 300, qc.MaxTimeTickDelay.GetAsInt())
 		assert.Equal(t, defaultLowWaterLevel, qc.DataNodeMemoryLowWaterLevel.GetAsFloat())
 		assert.Equal(t, defaultHighWaterLevel, qc.DataNodeMemoryHighWaterLevel.GetAsFloat())
 		assert.Equal(t, defaultLowWaterLevel, qc.QueryNodeMemoryLowWaterLevel.GetAsFloat())
@@ -206,12 +223,6 @@ func TestQuotaParam(t *testing.T) {
 
 	t.Run("test limit reading", func(t *testing.T) {
 		assert.False(t, qc.ForceDenyReading.GetAsBool())
-		assert.Equal(t, false, qc.QueueProtectionEnabled.GetAsBool())
-		assert.Equal(t, int64(math.MaxInt64), qc.NQInQueueThreshold.GetAsInt64())
-		assert.Equal(t, defaultMax, qc.QueueLatencyThreshold.GetAsFloat())
-		assert.Equal(t, false, qc.ResultProtectionEnabled.GetAsBool())
-		assert.Equal(t, defaultMax, qc.MaxReadResultRate.GetAsFloat())
-		assert.Equal(t, 0.9, qc.CoolOffSpeed.GetAsFloat())
 	})
 
 	t.Run("test disk quota", func(t *testing.T) {

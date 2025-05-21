@@ -208,6 +208,8 @@ class TestPartitionParams(TestcaseBase):
         """
         if partition_name == "12name":
             pytest.skip(reason="won't fix issue #32998")
+        if partition_name == "n-ame":
+            pytest.skip(reason="https://github.com/milvus-io/milvus/issues/39432")
         # create collection
         collection_w = self.init_collection_wrap()
 
@@ -232,7 +234,7 @@ class TestPartitionParams(TestcaseBase):
         self.partition_wrap.init_partition(collection=None, name=partition_name,
                                            check_task=CheckTasks.err_res,
                                            check_items={ct.err_code: 1,
-                                                        ct.err_msg: "must be pymilvus.Collection"})
+                                                        ct.err_msg: "Collection must be of type pymilvus.Collection or String"})
 
     @pytest.mark.tags(CaseLabel.L1)
     def test_partition_drop(self):
@@ -369,7 +371,8 @@ class TestPartitionParams(TestcaseBase):
 
         # load with 2 replicas
         error = {ct.err_code: 65535,
-                 ct.err_msg: "failed to load partitions: failed to spawn replica for collection: nodes not enough"}
+                 ct.err_msg: "when load 3 replica count: service resource insufficient"
+                             "[currentStreamingNode=2][expectedStreamingNode=3]"}
         collection_w.create_index(ct.default_float_vec_field_name, index_params=ct.default_flat_index)
         partition_w.load(replica_number=3, check_task=CheckTasks.err_res, check_items=error)
 
@@ -394,16 +397,20 @@ class TestPartitionParams(TestcaseBase):
         collection_w.create_index(ct.default_float_vec_field_name, ct.default_index)
 
         partition_w.load(replica_number=1)
-        collection_w.query(expr=f"{ct.default_int64_field_name} in [0]", check_task=CheckTasks.check_query_results,
-                           check_items={'exp_res': [{'int64': 0}]})
-        error = {ct.err_code: 1100, ct.err_msg: "failed to load partitions: can't change the replica number for "
-                                                "loaded partitions: expected=1, actual=2: invalid parameter"}
+        collection_w.query(expr=f"{ct.default_int64_field_name} in [0]",
+                           check_task=CheckTasks.check_query_results,
+                           check_items={'exp_res': [{'int64': 0}],
+                                        "pk_name": collection_w.primary_field.name})
+        error = {ct.err_code: 1100, ct.err_msg: "can't change the replica number for loaded partitions: "
+                                                "invalid parameter[expected=1][actual=2]"}
         partition_w.load(replica_number=2, check_task=CheckTasks.err_res, check_items=error)
 
         partition_w.release()
         partition_w.load(replica_number=2)
-        collection_w.query(expr=f"{ct.default_int64_field_name} in [0]", check_task=CheckTasks.check_query_results,
-                           check_items={'exp_res': [{'int64': 0}]})
+        collection_w.query(expr=f"{ct.default_int64_field_name} in [0]",
+                           check_task=CheckTasks.check_query_results,
+                           check_items={'exp_res': [{'int64': 0}],
+                                        "pk_name": collection_w.primary_field.name})
 
         two_replicas, _ = collection_w.get_replicas()
         assert len(two_replicas.groups) == 2
@@ -763,9 +770,7 @@ class TestPartitionOperations(TestcaseBase):
         assert not collection_w.has_partition(partition_name)[0]
 
     @pytest.mark.tags(CaseLabel.L2)
-    @pytest.mark.parametrize("data", [cf.gen_default_list_data(nb=3000)])
-    @pytest.mark.parametrize("index_param", cf.gen_simple_index())
-    def test_partition_drop_indexed_partition(self, data, index_param):
+    def test_partition_drop_indexed_partition(self):
         """
         target: verify drop an indexed partition
         method: 1. create a partition
@@ -783,11 +788,14 @@ class TestPartitionOperations(TestcaseBase):
         assert collection_w.has_partition(partition_name)[0]
 
         # insert data to partition
+        data = cf.gen_default_list_data(nb=3000)
         ins_res, _ = partition_w.insert(data)
         assert len(ins_res.primary_keys) == len(data[0])
 
         # create index of collection
-        collection_w.create_index(ct.default_float_vec_field_name, index_param)
+        params = cf.get_index_params_params("IVF_SQ8")
+        index_params = {"index_type": "IVF_SQ8", "metric_type": "L2", "params": params}
+        collection_w.create_index(ct.default_float_vec_field_name, index_params)
 
         # drop partition
         partition_w.drop()
@@ -1002,8 +1010,10 @@ class TestPartitionOperations(TestcaseBase):
 
         data = cf.gen_default_list_data(nb=10, dim=dim)
         # insert data to partition
+        # TODO: update the assert error msg as #37543 fixed
         partition_w.insert(data, check_task=CheckTasks.err_res,
-                           check_items={ct.err_code: 65535, ct.err_msg: "but entities field dim"})
+                           check_items={ct.err_code: 65535,
+                                        ct.err_msg: f"float data should divide the dim({ct.default_dim})"})
 
     @pytest.mark.tags(CaseLabel.L1)
     @pytest.mark.parametrize("sync", [True, False])
@@ -1017,9 +1027,7 @@ class TestPartitionOperations(TestcaseBase):
         pass
 
     @pytest.mark.tags(CaseLabel.L1)
-    @pytest.mark.parametrize("data", [cf.gen_default_list_data(nb=3000)])
-    @pytest.mark.parametrize("index_param", cf.gen_simple_index())
-    def test_partition_delete_indexed_data(self, data, index_param):
+    def test_partition_delete_indexed_data(self):
         """
         target: verify delete entities with an expression condition from an indexed partition
         method: 1. create collection
@@ -1034,7 +1042,9 @@ class TestPartitionOperations(TestcaseBase):
         collection_w = self.init_collection_wrap()
 
         # create index of collection
-        collection_w.create_index(ct.default_float_vec_field_name, index_param)
+        params = cf.get_index_params_params("IVF_SQ8")
+        index_params = {"index_type": "IVF_SQ8", "metric_type": "L2", "params": params}
+        collection_w.create_index(ct.default_float_vec_field_name, index_params)
 
         # create partition
         partition_name = cf.gen_unique_str(prefix)
@@ -1042,6 +1052,7 @@ class TestPartitionOperations(TestcaseBase):
         assert collection_w.has_partition(partition_name)[0]
 
         # insert data to partition
+        data = cf.gen_default_list_data(nb=3000)
         ins_res, _ = partition_w.insert(data)
         assert len(ins_res.primary_keys) == len(data[0])
 
@@ -1108,10 +1119,12 @@ class TestPartitionOperations(TestcaseBase):
 
         # upsert mismatched data
         upsert_data = cf.gen_default_data_for_upsert(dim=ct.default_dim-1)[0]
-        error = {ct.err_code: 65535, ct.err_msg: "Collection field dim is 128, but entities field dim is 127"}
+        # TODO: update the assert error msg as #37543 fixed
+        error = {ct.err_code: 65535, ct.err_msg: f"float data should divide the dim({ct.default_dim})"}
         partition_w.upsert(upsert_data, check_task=CheckTasks.err_res, check_items=error)
 
     @pytest.mark.tags(CaseLabel.L2)
+    @pytest.mark.skip(reason="smellthemoon: behavior changed")
     def test_partition_upsert_with_auto_id(self):
         """
         target: test upsert data in partition when auto_id=True

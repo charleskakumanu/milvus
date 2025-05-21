@@ -18,18 +18,18 @@ package proxy
 
 import (
 	"context"
-	"fmt"
 	"math/rand"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 )
 
 type mockDataCoord struct {
@@ -237,7 +237,7 @@ func (mockD *mockDataCoord5) AssignSegmentID(ctx context.Context, req *datapb.As
 			ErrorCode: commonpb.ErrorCode_UnexpectedError,
 			Reason:    "Just For Test",
 		},
-	}, fmt.Errorf("just for test")
+	}, errors.New("just for test")
 }
 
 func TestSegmentAllocator5(t *testing.T) {

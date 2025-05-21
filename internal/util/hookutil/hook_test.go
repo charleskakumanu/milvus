@@ -24,7 +24,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 func TestInitHook(t *testing.T) {
@@ -32,7 +32,7 @@ func TestInitHook(t *testing.T) {
 	Params := paramtable.Get()
 	paramtable.Get().Save(Params.ProxyCfg.SoPath.Key, "")
 	initHook()
-	assert.IsType(t, DefaultHook{}, Hoo)
+	assert.IsType(t, DefaultHook{}, GetHook())
 
 	paramtable.Get().Save(Params.ProxyCfg.SoPath.Key, "/a/b/hook.so")
 	err := initHook()

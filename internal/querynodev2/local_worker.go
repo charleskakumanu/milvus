@@ -19,11 +19,12 @@ package querynodev2
 import (
 	"context"
 
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus/internal/querynodev2/cluster"
 	"github.com/milvus-io/milvus/internal/util/streamrpc"
-	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 )
 
 var _ cluster.Worker = &LocalWorker{}
@@ -53,6 +54,10 @@ func (w *LocalWorker) Delete(ctx context.Context, req *querypb.DeleteRequest) er
 	return merr.CheckRPCCall(status, err)
 }
 
+func (w *LocalWorker) DeleteBatch(ctx context.Context, req *querypb.DeleteBatchRequest) (*querypb.DeleteBatchResponse, error) {
+	return w.node.DeleteBatch(ctx, req)
+}
+
 func (w *LocalWorker) SearchSegments(ctx context.Context, req *querypb.SearchRequest) (*internalpb.SearchResults, error) {
 	return w.node.SearchSegments(ctx, req)
 }
@@ -67,6 +72,10 @@ func (w *LocalWorker) QuerySegments(ctx context.Context, req *querypb.QueryReque
 
 func (w *LocalWorker) GetStatistics(ctx context.Context, req *querypb.GetStatisticsRequest) (*internalpb.GetStatisticsResponse, error) {
 	return w.node.GetStatistics(ctx, req)
+}
+
+func (w *LocalWorker) UpdateSchema(ctx context.Context, req *querypb.UpdateSchemaRequest) (*commonpb.Status, error) {
+	return w.node.UpdateSchema(ctx, req)
 }
 
 func (w *LocalWorker) IsHealthy() bool {

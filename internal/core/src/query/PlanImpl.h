@@ -22,6 +22,7 @@
 #include "common/EasyAssert.h"
 #include "common/Json.h"
 #include "common/Consts.h"
+#include "common/Schema.h"
 
 namespace milvus::query {
 
@@ -35,7 +36,10 @@ struct ExtractedPlanInfo {
     void
     add_involved_field(FieldId field_id) {
         auto pos = field_id.get() - START_USER_FIELDID;
-        AssertInfo(pos >= 0, "invalid field id");
+        AssertInfo(0 <= pos && pos < involved_fields_.size(),
+                   "invalid field id, field_id:{}, schema size:{}",
+                   field_id.get(),
+                   involved_fields_.size());
         involved_fields_.set(pos);
     }
 
@@ -53,6 +57,7 @@ struct Plan {
     std::unique_ptr<VectorPlanNode> plan_node_;
     std::map<std::string, FieldId> tag2field_;  // PlaceholderName -> FieldId
     std::vector<FieldId> target_entries_;
+    std::vector<std::string> target_dynamic_fields_;
     void
     check_identical(Plan& other);
 
@@ -100,6 +105,7 @@ struct RetrievePlan {
     const Schema& schema_;
     std::unique_ptr<RetrievePlanNode> plan_node_;
     std::vector<FieldId> field_ids_;
+    std::vector<std::string> target_dynamic_fields_;
 };
 
 using PlanPtr = std::unique_ptr<Plan>;

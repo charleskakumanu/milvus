@@ -18,12 +18,13 @@ package rootcoord
 
 import (
 	"context"
-	"fmt"
+
+	"github.com/cockroachdb/errors"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus/internal/util/proxyutil"
-	"github.com/milvus-io/milvus/pkg/util"
+	"github.com/milvus-io/milvus/pkg/v2/util"
 )
 
 type dropDatabaseTask struct {
@@ -33,22 +34,34 @@ type dropDatabaseTask struct {
 
 func (t *dropDatabaseTask) Prepare(ctx context.Context) error {
 	if t.Req.GetDbName() == util.DefaultDBName {
-		return fmt.Errorf("can not drop default database")
+		return errors.New("can not drop default database")
 	}
 	return nil
 }
 
 func (t *dropDatabaseTask) Execute(ctx context.Context) error {
-	redoTask := newBaseRedoTask(t.core.stepExecutor)
 	dbName := t.Req.GetDbName()
 	ts := t.GetTs()
+	return executeDropDatabaseTaskSteps(ctx, t.core, dbName, ts)
+}
+
+func (t *dropDatabaseTask) GetLockerKey() LockerKey {
+	return NewLockerKeyChain(NewClusterLockerKey(true))
+}
+
+func executeDropDatabaseTaskSteps(ctx context.Context,
+	core *Core,
+	dbName string,
+	ts Timestamp,
+) error {
+	redoTask := newBaseRedoTask(core.stepExecutor)
 	redoTask.AddSyncStep(&deleteDatabaseMetaStep{
-		baseStep:     baseStep{core: t.core},
+		baseStep:     baseStep{core: core},
 		databaseName: dbName,
 		ts:           ts,
 	})
-	redoTask.AddAsyncStep(&expireCacheStep{
-		baseStep: baseStep{core: t.core},
+	redoTask.AddSyncStep(&expireCacheStep{
+		baseStep: baseStep{core: core},
 		dbName:   dbName,
 		ts:       ts,
 		// make sure to send the "expire cache" request

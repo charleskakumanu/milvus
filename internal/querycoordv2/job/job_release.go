@@ -23,13 +23,16 @@ import (
 	"github.com/samber/lo"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/internal/proto/querypb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus/internal/querycoordv2/checkers"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	"github.com/milvus-io/milvus/internal/querycoordv2/observers"
 	"github.com/milvus-io/milvus/internal/querycoordv2/session"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/metrics"
+	"github.com/milvus-io/milvus/internal/util/proxyutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/metrics"
+	"github.com/milvus-io/milvus/pkg/v2/proto/proxypb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
 )
 
 type ReleaseCollectionJob struct {
@@ -39,9 +42,10 @@ type ReleaseCollectionJob struct {
 	meta              *meta.Meta
 	broker            meta.Broker
 	cluster           session.Cluster
-	targetMgr         *meta.TargetManager
+	targetMgr         meta.TargetManagerInterface
 	targetObserver    *observers.TargetObserver
 	checkerController *checkers.CheckerController
+	proxyManager      proxyutil.ProxyClientManagerInterface
 }
 
 func NewReleaseCollectionJob(ctx context.Context,
@@ -49,10 +53,10 @@ func NewReleaseCollectionJob(ctx context.Context,
 	dist *meta.DistributionManager,
 	meta *meta.Meta,
 	broker meta.Broker,
-	cluster session.Cluster,
-	targetMgr *meta.TargetManager,
+	targetMgr meta.TargetManagerInterface,
 	targetObserver *observers.TargetObserver,
 	checkerController *checkers.CheckerController,
+	proxyManager proxyutil.ProxyClientManagerInterface,
 ) *ReleaseCollectionJob {
 	return &ReleaseCollectionJob{
 		BaseJob:           NewBaseJob(ctx, req.Base.GetMsgID(), req.GetCollectionID()),
@@ -60,10 +64,10 @@ func NewReleaseCollectionJob(ctx context.Context,
 		dist:              dist,
 		meta:              meta,
 		broker:            broker,
-		cluster:           cluster,
 		targetMgr:         targetMgr,
 		targetObserver:    targetObserver,
 		checkerController: checkerController,
+		proxyManager:      proxyManager,
 	}
 }
 
@@ -71,35 +75,40 @@ func (job *ReleaseCollectionJob) Execute() error {
 	req := job.req
 	log := log.Ctx(job.ctx).With(zap.Int64("collectionID", req.GetCollectionID()))
 
-	if !job.meta.CollectionManager.Exist(req.GetCollectionID()) {
+	if !job.meta.CollectionManager.Exist(job.ctx, req.GetCollectionID()) {
 		log.Info("release collection end, the collection has not been loaded into QueryNode")
 		return nil
 	}
 
-	loadedPartitions := job.meta.CollectionManager.GetPartitionsByCollection(req.GetCollectionID())
-	toRelease := lo.Map(loadedPartitions, func(partition *meta.Partition, _ int) int64 {
-		return partition.GetPartitionID()
-	})
-	releasePartitions(job.ctx, job.meta, job.cluster, req.GetCollectionID(), toRelease...)
-
-	err := job.meta.CollectionManager.RemoveCollection(req.GetCollectionID())
+	err := job.meta.CollectionManager.RemoveCollection(job.ctx, req.GetCollectionID())
 	if err != nil {
 		msg := "failed to remove collection"
 		log.Warn(msg, zap.Error(err))
 		return errors.Wrap(err, msg)
 	}
 
-	err = job.meta.ReplicaManager.RemoveCollection(req.GetCollectionID())
+	err = job.meta.ReplicaManager.RemoveCollection(job.ctx, req.GetCollectionID())
 	if err != nil {
 		msg := "failed to remove replicas"
 		log.Warn(msg, zap.Error(err))
 	}
 
-	job.targetMgr.RemoveCollection(req.GetCollectionID())
 	job.targetObserver.ReleaseCollection(req.GetCollectionID())
+
+	// try best discard cache
+	// shall not affect releasing if failed
+	job.proxyManager.InvalidateCollectionMetaCache(job.ctx,
+		&proxypb.InvalidateCollMetaCacheRequest{
+			CollectionID: req.GetCollectionID(),
+		},
+		proxyutil.SetMsgType(commonpb.MsgType_ReleaseCollection))
+
+	// try best clean shard leader cache
+	job.proxyManager.InvalidateShardLeaderCache(job.ctx, &proxypb.InvalidateShardLeaderCacheRequest{
+		CollectionIDs: []int64{req.GetCollectionID()},
+	})
+
 	waitCollectionReleased(job.dist, job.checkerController, req.GetCollectionID())
-	metrics.QueryCoordNumCollections.WithLabelValues().Dec()
-	metrics.QueryCoordNumPartitions.WithLabelValues().Sub(float64(len(toRelease)))
 	metrics.QueryCoordReleaseCount.WithLabelValues(metrics.TotalLabel).Inc()
 	metrics.QueryCoordReleaseCount.WithLabelValues(metrics.SuccessLabel).Inc()
 	return nil
@@ -114,9 +123,10 @@ type ReleasePartitionJob struct {
 	meta              *meta.Meta
 	broker            meta.Broker
 	cluster           session.Cluster
-	targetMgr         *meta.TargetManager
+	targetMgr         meta.TargetManagerInterface
 	targetObserver    *observers.TargetObserver
 	checkerController *checkers.CheckerController
+	proxyManager      proxyutil.ProxyClientManagerInterface
 }
 
 func NewReleasePartitionJob(ctx context.Context,
@@ -124,10 +134,10 @@ func NewReleasePartitionJob(ctx context.Context,
 	dist *meta.DistributionManager,
 	meta *meta.Meta,
 	broker meta.Broker,
-	cluster session.Cluster,
-	targetMgr *meta.TargetManager,
+	targetMgr meta.TargetManagerInterface,
 	targetObserver *observers.TargetObserver,
 	checkerController *checkers.CheckerController,
+	proxyManager proxyutil.ProxyClientManagerInterface,
 ) *ReleasePartitionJob {
 	return &ReleasePartitionJob{
 		BaseJob:           NewBaseJob(ctx, req.Base.GetMsgID(), req.GetCollectionID()),
@@ -135,10 +145,10 @@ func NewReleasePartitionJob(ctx context.Context,
 		dist:              dist,
 		meta:              meta,
 		broker:            broker,
-		cluster:           cluster,
 		targetMgr:         targetMgr,
 		targetObserver:    targetObserver,
 		checkerController: checkerController,
+		proxyManager:      proxyManager,
 	}
 }
 
@@ -149,12 +159,12 @@ func (job *ReleasePartitionJob) Execute() error {
 		zap.Int64s("partitionIDs", req.GetPartitionIDs()),
 	)
 
-	if !job.meta.CollectionManager.Exist(req.GetCollectionID()) {
+	if !job.meta.CollectionManager.Exist(job.ctx, req.GetCollectionID()) {
 		log.Info("release collection end, the collection has not been loaded into QueryNode")
 		return nil
 	}
 
-	loadedPartitions := job.meta.CollectionManager.GetPartitionsByCollection(req.GetCollectionID())
+	loadedPartitions := job.meta.CollectionManager.GetPartitionsByCollection(job.ctx, req.GetCollectionID())
 	toRelease := lo.FilterMap(loadedPartitions, func(partition *meta.Partition, _ int) (int64, bool) {
 		return partition.GetPartitionID(), lo.Contains(req.GetPartitionIDs(), partition.GetPartitionID())
 	})
@@ -163,35 +173,45 @@ func (job *ReleasePartitionJob) Execute() error {
 		log.Warn("releasing partition(s) not loaded")
 		return nil
 	}
-	releasePartitions(job.ctx, job.meta, job.cluster, req.GetCollectionID(), toRelease...)
 
 	// If all partitions are released, clear all
 	if len(toRelease) == len(loadedPartitions) {
 		log.Info("release partitions covers all partitions, will remove the whole collection")
-		err := job.meta.CollectionManager.RemoveCollection(req.GetCollectionID())
+		err := job.meta.CollectionManager.RemoveCollection(job.ctx, req.GetCollectionID())
 		if err != nil {
 			msg := "failed to release partitions from store"
 			log.Warn(msg, zap.Error(err))
 			return errors.Wrap(err, msg)
 		}
-		err = job.meta.ReplicaManager.RemoveCollection(req.GetCollectionID())
+		err = job.meta.ReplicaManager.RemoveCollection(job.ctx, req.GetCollectionID())
 		if err != nil {
 			log.Warn("failed to remove replicas", zap.Error(err))
 		}
-		job.targetMgr.RemoveCollection(req.GetCollectionID())
 		job.targetObserver.ReleaseCollection(req.GetCollectionID())
-		metrics.QueryCoordNumCollections.WithLabelValues().Dec()
+		// try best discard cache
+		// shall not affect releasing if failed
+		job.proxyManager.InvalidateCollectionMetaCache(job.ctx,
+			&proxypb.InvalidateCollMetaCacheRequest{
+				CollectionID: req.GetCollectionID(),
+			},
+			proxyutil.SetMsgType(commonpb.MsgType_ReleaseCollection))
+		// try best clean shard leader cache
+		job.proxyManager.InvalidateShardLeaderCache(job.ctx, &proxypb.InvalidateShardLeaderCacheRequest{
+			CollectionIDs: []int64{req.GetCollectionID()},
+		})
+
 		waitCollectionReleased(job.dist, job.checkerController, req.GetCollectionID())
 	} else {
-		err := job.meta.CollectionManager.RemovePartition(req.GetCollectionID(), toRelease...)
+		err := job.meta.CollectionManager.RemovePartition(job.ctx, req.GetCollectionID(), toRelease...)
 		if err != nil {
 			msg := "failed to release partitions from store"
 			log.Warn(msg, zap.Error(err))
 			return errors.Wrap(err, msg)
 		}
-		job.targetMgr.RemovePartition(req.GetCollectionID(), toRelease...)
+		job.targetObserver.ReleasePartition(req.GetCollectionID(), toRelease...)
+		// wait current target updated, so following querys will act as expected
+		waitCurrentTargetUpdated(job.ctx, job.targetObserver, job.req.GetCollectionID())
 		waitCollectionReleased(job.dist, job.checkerController, req.GetCollectionID(), toRelease...)
 	}
-	metrics.QueryCoordNumPartitions.WithLabelValues().Sub(float64(len(toRelease)))
 	return nil
 }

@@ -7,8 +7,8 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/util/metric"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/util/metric"
 )
 
 const (
@@ -89,6 +89,13 @@ func generateBFloat16VectorTestCases() []vecTestCase {
 		{IndexFaissIVFPQ, metric.IP, false, schemapb.DataType_BFloat16Vector},
 		{IndexFaissIVFSQ8, metric.L2, false, schemapb.DataType_BFloat16Vector},
 		{IndexFaissIVFSQ8, metric.IP, false, schemapb.DataType_BFloat16Vector},
+	}
+}
+
+func generateInt8VectorTestCases() []vecTestCase {
+	return []vecTestCase{
+		{IndexHNSW, metric.L2, false, schemapb.DataType_Int8Vector},
+		{IndexHNSW, metric.IP, false, schemapb.DataType_Int8Vector},
 	}
 }
 
@@ -218,6 +225,23 @@ func TestCIndex_BuildBinaryVecIndex(t *testing.T) {
 	}
 }
 
+func TestCIndex_BuildInt8VecIndex(t *testing.T) {
+	for _, c := range generateInt8VectorTestCases() {
+		typeParams, indexParams := generateParams(c.indexType, c.metricType)
+
+		index, err := NewCgoIndex(c.dtype, typeParams, indexParams)
+		assert.Equal(t, err, nil)
+		assert.NotEqual(t, index, nil)
+
+		vectors := generateInt8Vectors(nb, dim)
+		err = index.Build(GenInt8VecDataset(vectors))
+		assert.Equal(t, err, nil)
+
+		err = index.Delete()
+		assert.Equal(t, err, nil)
+	}
+}
+
 func TestCIndex_Codec(t *testing.T) {
 	for _, c := range generateTestCases() {
 		typeParams, indexParams := generateParams(c.indexType, c.metricType)
@@ -303,6 +327,12 @@ func TestCIndex_Error(t *testing.T) {
 	t.Run("BuildBinaryVecIndexWithoutIds error", func(t *testing.T) {
 		binaryVectors := []byte("binaryVectors")
 		err = indexPtr.Build(GenBinaryVecDataset(binaryVectors))
+		assert.Error(t, err)
+	})
+
+	t.Run("BuildInt8VecIndexWithoutIds error", func(t *testing.T) {
+		int8Vectors := []int8{11, 22, 33, 44}
+		err = indexPtr.Build(GenInt8VecDataset(int8Vectors))
 		assert.Error(t, err)
 	})
 }

@@ -17,8 +17,7 @@
 package entity
 
 import (
-	"encoding/binary"
-	"math"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 // Vector interface vector used int search
@@ -44,16 +43,20 @@ func (fv FloatVector) FieldType() FieldType {
 // Serialize serializes vector into byte slice, used in search placeholder
 // LittleEndian is used for convention
 func (fv FloatVector) Serialize() []byte {
-	data := make([]byte, 0, 4*len(fv)) // float32 occupies 4 bytes
-	buf := make([]byte, 4)
-	for _, f := range fv {
-		binary.LittleEndian.PutUint32(buf, math.Float32bits(f))
-		data = append(data, buf...)
-	}
-	return data
+	return typeutil.Float32ArrayToBytes(fv)
 }
 
-// FloatVector float32 vector wrapper.
+func (fv FloatVector) ToFloat16Vector() Float16Vector {
+	return typeutil.Float32ArrayToFloat16Bytes(fv)
+}
+
+// SerializeToBFloat16Bytes serializes vector into bfloat16 byte slice,
+// used in search placeholder
+func (fv FloatVector) ToBFloat16Vector() BFloat16Vector {
+	return typeutil.Float32ArrayToBFloat16Bytes(fv)
+}
+
+// Float16Vector float16 vector wrapper.
 type Float16Vector []byte
 
 // Dim returns vector dimension.
@@ -70,7 +73,11 @@ func (fv Float16Vector) Serialize() []byte {
 	return fv
 }
 
-// FloatVector float32 vector wrapper.
+func (fv Float16Vector) ToFloat32Vector() FloatVector {
+	return typeutil.Float16BytesToFloat32Vector(fv)
+}
+
+// BFloat16Vector bfloat16 vector wrapper.
 type BFloat16Vector []byte
 
 // Dim returns vector dimension.
@@ -85,6 +92,10 @@ func (fv BFloat16Vector) FieldType() FieldType {
 
 func (fv BFloat16Vector) Serialize() []byte {
 	return fv
+}
+
+func (fv BFloat16Vector) ToFloat32Vector() FloatVector {
+	return typeutil.BFloat16BytesToFloat32Vector(fv)
 }
 
 // BinaryVector []byte vector wrapper
@@ -103,4 +114,38 @@ func (bv BinaryVector) Serialize() []byte {
 // entity.FieldType returns coresponding field type.
 func (bv BinaryVector) FieldType() FieldType {
 	return FieldTypeBinaryVector
+}
+
+type Text string
+
+// Dim returns vector dimension.
+func (t Text) Dim() int {
+	return 0
+}
+
+// entity.FieldType returns coresponding field type.
+func (t Text) FieldType() FieldType {
+	return FieldTypeVarChar
+}
+
+func (t Text) Serialize() []byte {
+	return []byte(t)
+}
+
+// Int8Vector []int8 vector wrapper
+type Int8Vector []int8
+
+// Dim return vector dimension
+func (iv Int8Vector) Dim() int {
+	return len(iv)
+}
+
+// Serialize just return bytes
+func (iv Int8Vector) Serialize() []byte {
+	return typeutil.Int8ArrayToBytes(iv)
+}
+
+// entity.FieldType returns coresponding field type.
+func (iv Int8Vector) FieldType() FieldType {
+	return FieldTypeInt8Vector
 }

@@ -19,15 +19,17 @@ package datacoord
 import (
 	"time"
 
-	"github.com/golang/protobuf/proto"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/tsoutil"
+	"github.com/milvus-io/milvus/internal/util/importutilv2"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v2/util/timerecord"
+	"github.com/milvus-io/milvus/pkg/v2/util/tsoutil"
 )
 
 type ImportJobFilter func(job ImportJob) bool
@@ -35,6 +37,34 @@ type ImportJobFilter func(job ImportJob) bool
 func WithCollectionID(collectionID int64) ImportJobFilter {
 	return func(job ImportJob) bool {
 		return job.GetCollectionID() == collectionID
+	}
+}
+
+func WithJobStates(states ...internalpb.ImportJobState) ImportJobFilter {
+	return func(job ImportJob) bool {
+		for _, state := range states {
+			if job.GetState() == state {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+func WithoutJobStates(states ...internalpb.ImportJobState) ImportJobFilter {
+	return func(job ImportJob) bool {
+		for _, state := range states {
+			if job.GetState() == state {
+				return false
+			}
+		}
+		return true
+	}
+}
+
+func WithoutL0Job() ImportJobFilter {
+	return func(job ImportJob) bool {
+		return !importutilv2.IsL0Import(job.GetOptions())
 	}
 }
 
@@ -81,6 +111,7 @@ type ImportJob interface {
 	GetCollectionName() string
 	GetPartitionIDs() []int64
 	GetVchannels() []string
+	GetReadyVchannels() []string
 	GetSchema() *schemapb.CollectionSchema
 	GetTimeoutTs() uint64
 	GetCleanupTs() uint64
@@ -91,15 +122,24 @@ type ImportJob interface {
 	GetCompleteTime() string
 	GetFiles() []*internalpb.ImportFile
 	GetOptions() []*commonpb.KeyValuePair
+	GetTR() *timerecord.TimeRecorder
+	GetDataTs() uint64
 	Clone() ImportJob
 }
 
 type importJob struct {
 	*datapb.ImportJob
+
+	tr *timerecord.TimeRecorder
+}
+
+func (j *importJob) GetTR() *timerecord.TimeRecorder {
+	return j.tr
 }
 
 func (j *importJob) Clone() ImportJob {
 	return &importJob{
 		ImportJob: proto.Clone(j.ImportJob).(*datapb.ImportJob),
+		tr:        j.tr,
 	}
 }

@@ -3,7 +3,7 @@ package kafka
 import (
 	"github.com/confluentinc/confluent-kafka-go/kafka"
 
-	"github.com/milvus-io/milvus/pkg/mq/common"
+	"github.com/milvus-io/milvus/pkg/v2/mq/common"
 )
 
 type kafkaMessage struct {
@@ -27,6 +27,6 @@ func (km *kafkaMessage) Payload() []byte {
 }
 
 func (km *kafkaMessage) ID() common.MessageID {
-	kid := &kafkaID{messageID: int64(km.msg.TopicPartition.Offset)}
+	kid := &KafkaID{MessageID: int64(km.msg.TopicPartition.Offset)}
 	return kid
 }

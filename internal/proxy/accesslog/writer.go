@@ -26,10 +26,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 const megabyte = 1024 * 1024
@@ -78,7 +79,7 @@ func (l *CacheWriter) Write(p []byte) (n int, err error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.closed {
-		return 0, fmt.Errorf("write to closed writer")
+		return 0, errors.New("write to closed writer")
 	}
 
 	return l.writer.Write(p)
@@ -197,7 +198,7 @@ func (l *RotateWriter) Write(p []byte) (n int, err error) {
 	defer l.mu.Unlock()
 
 	if l.closed {
-		return 0, fmt.Errorf("write to closed writer")
+		return 0, errors.New("write to closed writer")
 	}
 
 	writeLen := int64(len(p))
@@ -247,6 +248,10 @@ func (l *RotateWriter) Rotate() error {
 }
 
 func (l *RotateWriter) rotate() error {
+	if l.size == 0 {
+		return nil
+	}
+
 	if err := l.closeFile(); err != nil {
 		return err
 	}
@@ -330,7 +335,7 @@ func (l *RotateWriter) millRunOnce() error {
 	}
 
 	if l.maxBackups >= 0 && l.maxBackups < len(files) {
-		for _, f := range files[l.maxBackups:] {
+		for _, f := range files[:len(files)-l.maxBackups] {
 			errRemove := os.Remove(path.Join(l.dir(), f.fileName))
 			if err == nil && errRemove != nil {
 				err = errRemove
@@ -436,7 +441,6 @@ func (l *RotateWriter) oldLogFiles() ([]logInfo, error) {
 		}
 		if t, err := timeFromName(f.Name(), prefix, ext); err == nil {
 			logFiles = append(logFiles, logInfo{t, f.Name()})
-			continue
 		}
 	}
 

@@ -1,13 +1,18 @@
-// Copyright (C) 2019-2020 Zilliz. All rights reserved.
-//
-// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
 // with the License. You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed under the License
-// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
-// or implied. See the License for the specific language governing permissions and limitations under the License.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package paramtable
 
@@ -21,10 +26,10 @@ import (
 
 	"go.uber.org/zap"
 
-	config "github.com/milvus-io/milvus/pkg/config"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/etcd"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/config"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/etcd"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 // UniqueID is type alias of typeutil.UniqueID
@@ -56,12 +61,13 @@ const (
 
 // Const of Global Config List
 func globalConfigPrefixs() []string {
-	return []string{"metastore", "localStorage", "etcd", "tikv", "minio", "pulsar", "kafka", "rocksmq", "log", "grpc", "common", "quotaAndLimits"}
+	return []string{"metastore", "localStorage", "etcd", "tikv", "minio", "pulsar", "kafka", "rocksmq", "log", "grpc", "common", "quotaAndLimits", "trace"}
 }
 
-// support read "milvus.yaml", "default.yaml", "user.yaml" as this order.
-// order: milvus.yaml < default.yaml < user.yaml, do not change the order below
-var defaultYaml = []string{"milvus.yaml", "default.yaml", "user.yaml"}
+// support read "milvus.yaml", "_test.yaml", "default.yaml", "user.yaml" as this order.
+// order: milvus.yaml < _test.yaml < default.yaml < user.yaml, do not change the order below.
+// Use _test.yaml only for test related purpose.
+var defaultYaml = []string{"milvus.yaml", "_test.yaml", "default.yaml", "user.yaml"}
 
 // BaseTable the basics of paramtable
 type BaseTable struct {
@@ -98,7 +104,7 @@ func SkipRemote(skip bool) Option {
 	}
 }
 
-func skipEnv(skip bool) Option {
+func SkipEnv(skip bool) Option {
 	return func(bt *baseTableConfig) {
 		bt.skipEnv = skip
 	}
@@ -107,7 +113,7 @@ func skipEnv(skip bool) Option {
 // NewBaseTableFromYamlOnly only used in migration tool.
 // Maybe we shouldn't limit the configDir internally.
 func NewBaseTableFromYamlOnly(yaml string) *BaseTable {
-	return NewBaseTable(Files([]string{yaml}), SkipRemote(true), skipEnv(true))
+	return NewBaseTable(Files([]string{yaml}), SkipRemote(true), SkipEnv(true))
 }
 
 func NewBaseTable(opts ...Option) *BaseTable {
@@ -246,7 +252,8 @@ func (bt *BaseTable) UpdateSourceOptions(opts ...config.Option) {
 
 // Load loads an object with @key.
 func (bt *BaseTable) Load(key string) (string, error) {
-	return bt.mgr.GetConfig(key)
+	_, v, err := bt.mgr.GetConfig(key)
+	return v, err
 }
 
 func (bt *BaseTable) Get(key string) string {
@@ -259,7 +266,7 @@ func (bt *BaseTable) GetWithDefault(key, defaultValue string) string {
 		return defaultValue
 	}
 
-	str, err := bt.mgr.GetConfig(key)
+	_, str, err := bt.mgr.GetConfig(key)
 	if err != nil {
 		return defaultValue
 	}
@@ -292,4 +299,8 @@ func (bt *BaseTable) Reset(key string) error {
 	bt.mgr.ResetConfig(key)
 	bt.mgr.EvictCachedValue(key)
 	return nil
+}
+
+func (bt *BaseTable) Manager() *config.Manager {
+	return bt.mgr
 }

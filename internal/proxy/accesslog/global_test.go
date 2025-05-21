@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
@@ -32,8 +33,8 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus/internal/proxy/accesslog/info"
-	"github.com/milvus-io/milvus/pkg/util/etcd"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/etcd"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 func TestMain(m *testing.M) {
@@ -94,7 +95,7 @@ func TestAccessLogger_DynamicEnable(t *testing.T) {
 	ok := _globalL.Write(accessInfo)
 	assert.False(t, ok)
 
-	etcdCli, _ := etcd.GetEtcdClient(
+	etcdCli, err := etcd.GetEtcdClient(
 		Params.EtcdCfg.UseEmbedEtcd.GetAsBool(),
 		Params.EtcdCfg.EtcdUseSSL.GetAsBool(),
 		Params.EtcdCfg.Endpoints.GetAsStrings(),
@@ -102,6 +103,7 @@ func TestAccessLogger_DynamicEnable(t *testing.T) {
 		Params.EtcdCfg.EtcdTLSKey.GetValue(),
 		Params.EtcdCfg.EtcdTLSCACert.GetValue(),
 		Params.EtcdCfg.EtcdTLSMinVersion.GetValue())
+	require.NoError(t, err)
 
 	// enable access log
 	ctx, cancel := context.WithCancel(context.Background())

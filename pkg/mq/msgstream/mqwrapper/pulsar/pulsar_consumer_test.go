@@ -27,8 +27,8 @@ import (
 	"github.com/streamnative/pulsarctl/pkg/pulsar/utils"
 	"github.com/stretchr/testify/assert"
 
-	"github.com/milvus-io/milvus/pkg/common"
-	mqcommon "github.com/milvus-io/milvus/pkg/mq/common"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	mqcommon "github.com/milvus-io/milvus/pkg/v2/mq/common"
 )
 
 func TestPulsarConsumer_Subscription(t *testing.T) {
@@ -80,9 +80,9 @@ func TestComsumeCompressedMessage(t *testing.T) {
 	assert.NoError(t, err)
 	defer consumer.Close()
 
-	producer, err := pc.CreateProducer(mqcommon.ProducerOptions{Topic: "TestTopics"})
+	producer, err := pc.CreateProducer(context.TODO(), mqcommon.ProducerOptions{Topic: "TestTopics"})
 	assert.NoError(t, err)
-	compressProducer, err := pc.CreateProducer(mqcommon.ProducerOptions{Topic: "TestTopics", EnableCompression: true})
+	compressProducer, err := pc.CreateProducer(context.TODO(), mqcommon.ProducerOptions{Topic: "TestTopics", EnableCompression: true})
 	assert.NoError(t, err)
 
 	msg := []byte("test message")

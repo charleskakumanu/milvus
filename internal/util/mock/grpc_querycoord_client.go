@@ -23,8 +23,8 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
 )
 
 // Check if GrpcQueryCoordClient implements proto.GrpcQueryCoordClient
@@ -50,11 +50,11 @@ func (m *GrpcQueryCoordClient) GetStatisticsChannel(ctx context.Context, in *int
 	return &milvuspb.StringResponse{}, m.Err
 }
 
-func (m *GrpcQueryCoordClient) ShowCollections(ctx context.Context, in *querypb.ShowCollectionsRequest, opts ...grpc.CallOption) (*querypb.ShowCollectionsResponse, error) {
+func (m *GrpcQueryCoordClient) ShowLoadCollections(ctx context.Context, in *querypb.ShowCollectionsRequest, opts ...grpc.CallOption) (*querypb.ShowCollectionsResponse, error) {
 	return &querypb.ShowCollectionsResponse{}, m.Err
 }
 
-func (m *GrpcQueryCoordClient) ShowPartitions(ctx context.Context, in *querypb.ShowPartitionsRequest, opts ...grpc.CallOption) (*querypb.ShowPartitionsResponse, error) {
+func (m *GrpcQueryCoordClient) ShowLoadPartitions(ctx context.Context, in *querypb.ShowPartitionsRequest, opts ...grpc.CallOption) (*querypb.ShowPartitionsResponse, error) {
 	return &querypb.ShowPartitionsResponse{}, m.Err
 }
 
@@ -78,7 +78,7 @@ func (m *GrpcQueryCoordClient) GetPartitionStates(ctx context.Context, in *query
 	return &querypb.GetPartitionStatesResponse{}, m.Err
 }
 
-func (m *GrpcQueryCoordClient) GetSegmentInfo(ctx context.Context, in *querypb.GetSegmentInfoRequest, opts ...grpc.CallOption) (*querypb.GetSegmentInfoResponse, error) {
+func (m *GrpcQueryCoordClient) GetLoadSegmentInfo(ctx context.Context, in *querypb.GetSegmentInfoRequest, opts ...grpc.CallOption) (*querypb.GetSegmentInfoResponse, error) {
 	return &querypb.GetSegmentInfoResponse{}, m.Err
 }
 
@@ -162,6 +162,10 @@ func (m *GrpcQueryCoordClient) ResumeBalance(ctx context.Context, req *querypb.R
 	return &commonpb.Status{}, m.Err
 }
 
+func (m *GrpcQueryCoordClient) CheckBalanceStatus(ctx context.Context, req *querypb.CheckBalanceStatusRequest, opts ...grpc.CallOption) (*querypb.CheckBalanceStatusResponse, error) {
+	return &querypb.CheckBalanceStatusResponse{}, m.Err
+}
+
 func (m *GrpcQueryCoordClient) SuspendNode(ctx context.Context, req *querypb.SuspendNodeRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	return &commonpb.Status{}, m.Err
 }
@@ -179,5 +183,9 @@ func (m *GrpcQueryCoordClient) TransferChannel(ctx context.Context, req *querypb
 }
 
 func (m *GrpcQueryCoordClient) CheckQueryNodeDistribution(ctx context.Context, req *querypb.CheckQueryNodeDistributionRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+	return &commonpb.Status{}, m.Err
+}
+
+func (m *GrpcQueryCoordClient) UpdateLoadConfig(ctx context.Context, req *querypb.UpdateLoadConfigRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	return &commonpb.Status{}, m.Err
 }

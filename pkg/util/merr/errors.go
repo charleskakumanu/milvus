@@ -26,6 +26,22 @@ const (
 	TimeoutCode  int32 = 10001
 )
 
+type ErrorType int32
+
+const (
+	SystemError ErrorType = 0
+	InputError  ErrorType = 1
+)
+
+var ErrorTypeName = map[ErrorType]string{
+	SystemError: "system_error",
+	InputError:  "input_error",
+}
+
+func (err ErrorType) String() string {
+	return ErrorTypeName[err]
+}
+
 // Define leaf errors here,
 // WARN: take care to add new error,
 // check whether you can use the errors below before adding a new one.
@@ -35,7 +51,7 @@ var (
 	ErrServiceNotReady             = newMilvusError("service not ready", 1, true) // This indicates the service is still in init
 	ErrServiceUnavailable          = newMilvusError("service unavailable", 2, true)
 	ErrServiceMemoryLimitExceeded  = newMilvusError("memory limit exceeded", 3, false)
-	ErrServiceRequestLimitExceeded = newMilvusError("request limit exceeded", 4, true)
+	ErrServiceTooManyRequests      = newMilvusError("too many concurrent requests, queue is full", 4, true)
 	ErrServiceInternal             = newMilvusError("service internal error", 5, false) // Never return this error out of Milvus
 	ErrServiceCrossClusterRouting  = newMilvusError("cross cluster routing", 6, false)
 	ErrServiceDiskLimitExceeded    = newMilvusError("disk limit exceeded", 7, false)
@@ -54,7 +70,8 @@ var (
 	ErrCollectionIllegalSchema                 = newMilvusError("illegal collection schema", 105, false)
 	ErrCollectionOnRecovering                  = newMilvusError("collection on recovering", 106, true)
 	ErrCollectionVectorClusteringKeyNotAllowed = newMilvusError("vector clustering key not allowed", 107, false)
-
+	ErrCollectionReplicateMode                 = newMilvusError("can't operate on the collection under standby mode", 108, false)
+	ErrCollectionSchemaMismatch                = newMilvusError("collection schema mismatch", 109, false)
 	// Partition related
 	ErrPartitionNotFound       = newMilvusError("partition not found", 200, false)
 	ErrPartitionNotLoaded      = newMilvusError("partition not loaded", 201, false)
@@ -77,10 +94,11 @@ var (
 	ErrReplicaNotAvailable = newMilvusError("replica not available", 401, false)
 
 	// Channel & Delegator related
-	ErrChannelNotFound     = newMilvusError("channel not found", 500, false)
-	ErrChannelLack         = newMilvusError("channel lacks", 501, false)
-	ErrChannelReduplicate  = newMilvusError("channel reduplicates", 502, false)
-	ErrChannelNotAvailable = newMilvusError("channel not available", 503, false)
+	ErrChannelNotFound         = newMilvusError("channel not found", 500, false)
+	ErrChannelLack             = newMilvusError("channel lacks", 501, false)
+	ErrChannelReduplicate      = newMilvusError("channel reduplicates", 502, false)
+	ErrChannelNotAvailable     = newMilvusError("channel not available", 503, false)
+	ErrChannelCPExceededMaxLag = newMilvusError("channel checkpoint exceed max lag", 504, false)
 
 	// Segment related
 	ErrSegmentNotFound    = newMilvusError("segment not found", 600, false)
@@ -93,6 +111,7 @@ var (
 	ErrIndexNotFound     = newMilvusError("index not found", 700, false)
 	ErrIndexNotSupported = newMilvusError("index type not supported", 701, false)
 	ErrIndexDuplicate    = newMilvusError("index duplicates", 702, false)
+	ErrTaskDuplicate     = newMilvusError("task duplicates", 703, false)
 
 	// Database related
 	ErrDatabaseNotFound         = newMilvusError("database not found", 800, false)
@@ -130,7 +149,8 @@ var (
 	// this operation is denied because the user not authorized, user need to login in first
 	ErrPrivilegeNotAuthenticated = newMilvusError("not authenticated", 1400, false)
 	// this operation is denied because the user has no permission to do this, user need higher privilege
-	ErrPrivilegeNotPermitted = newMilvusError("privilege not permitted", 1401, false)
+	ErrPrivilegeNotPermitted     = newMilvusError("privilege not permitted", 1401, false)
+	ErrPrivilegeGroupInvalidName = newMilvusError("invalid privilege group name", 1402, false)
 
 	// Alias related
 	ErrAliasNotFound               = newMilvusError("alias not found", 1600, false)
@@ -150,6 +170,7 @@ var (
 	ErrInvalidInsertData         = newMilvusError("fail to deal the insert data", 1804, false)
 	ErrInvalidSearchResult       = newMilvusError("fail to parse search result", 1805, false)
 	ErrCheckPrimaryKey           = newMilvusError("please check the primary key and its' type can only in [int, string]", 1806, false)
+	ErrHTTPRateLimit             = newMilvusError("request is rejected by limiter", 1807, true)
 
 	// replicate related
 	ErrDenyReplicateMessage = newMilvusError("deny to use the replicate message in the normal instance", 1900, false)
@@ -161,8 +182,11 @@ var (
 	ErrSegcore                    = newMilvusError("segcore error", 2000, false)
 	ErrSegcoreUnsupported         = newMilvusError("segcore unsupported error", 2001, false)
 	ErrSegcorePretendFinished     = newMilvusError("segcore pretend finished", 2002, false)
-	ErrSegcoreFollyOtherException = newMilvusError("segcore folly other exception", 2200, false) // throw from segcore.
-	ErrSegcoreFollyCancel         = newMilvusError("segcore Future was canceled", 2201, false)   // throw from segcore.
+	ErrSegcoreFollyOtherException = newMilvusError("segcore folly other exception", 2037, false) // throw from segcore.
+	ErrSegcoreFollyCancel         = newMilvusError("segcore Future was canceled", 2038, false)   // throw from segcore.
+	ErrSegcoreOutOfRange          = newMilvusError("segcore out of range", 2039, false)          // throw from segcore.
+	ErrSegcoreGCPNativeError      = newMilvusError("segcore GCP native error", 2040, false)      // throw from segcore.
+	KnowhereError                 = newMilvusError("knowhere error", 2099, false)                // throw from segcore.
 
 	// Do NOT export this,
 	// never allow programmer using this, keep only for converting unknown error to milvusError
@@ -186,34 +210,55 @@ var (
 	ErrClusteringCompactionMetaError              = newMilvusError("fail to update meta in clustering compaction", 2308, true)
 	ErrClusteringCompactionGetCollectionFail      = newMilvusError("fail to get collection in compaction", 2309, true)
 	ErrCompactionResultNotFound                   = newMilvusError("compaction result not found", 2310, false)
+	ErrAnalyzeTaskNotFound                        = newMilvusError("analyze task not found", 2311, true)
+	ErrBuildCompactionRequestFail                 = newMilvusError("fail to build CompactionRequest", 2312, true)
+	ErrGetCompactionPlanResultFail                = newMilvusError("fail to get compaction plan", 2313, true)
+	ErrCompactionResult                           = newMilvusError("illegal compaction results", 2314, false)
+	ErrDuplicatedCompactionTask                   = newMilvusError("duplicated compaction task", 2315, false)
+	ErrCleanPartitionStatsFail                    = newMilvusError("fail to clean partition Stats", 2316, true)
+
+	ErrDataNodeSlotExhausted = newMilvusError("datanode slot exhausted", 2401, false)
 
 	// General
 	ErrOperationNotSupported = newMilvusError("unsupported operation", 3000, false)
+
+	ErrOldSessionExists = newMilvusError("old session exists", 3001, false)
 )
+
+type errorOption func(*milvusError)
+
+func WithDetail(detail string) errorOption {
+	return func(err *milvusError) {
+		err.detail = detail
+	}
+}
+
+func WithErrorType(etype ErrorType) errorOption {
+	return func(err *milvusError) {
+		err.errType = etype
+	}
+}
 
 type milvusError struct {
 	msg       string
 	detail    string
 	retriable bool
 	errCode   int32
+	errType   ErrorType
 }
 
-func newMilvusError(msg string, code int32, retriable bool) milvusError {
-	return milvusError{
+func newMilvusError(msg string, code int32, retriable bool, options ...errorOption) milvusError {
+	err := milvusError{
 		msg:       msg,
 		detail:    msg,
 		retriable: retriable,
 		errCode:   code,
 	}
-}
 
-func newMilvusErrorWithDetail(msg string, detail string, code int32, retriable bool) milvusError {
-	return milvusError{
-		msg:       msg,
-		detail:    detail,
-		retriable: retriable,
-		errCode:   code,
+	for _, option := range options {
+		option(&err)
 	}
+	return err
 }
 
 func (e milvusError) code() int32 {

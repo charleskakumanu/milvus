@@ -26,9 +26,9 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	grpcdatanode "github.com/milvus-io/milvus/internal/distributed/datanode"
 	"github.com/milvus-io/milvus/internal/util/dependency"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 // DataNode implements DataNode grpc server
@@ -50,13 +50,17 @@ func NewDataNode(ctx context.Context, factory dependency.Factory) (*DataNode, er
 	}, nil
 }
 
+func (d *DataNode) Prepare() error {
+	return d.svr.Prepare()
+}
+
 // Run starts service
 func (d *DataNode) Run() error {
 	if err := d.svr.Run(); err != nil {
-		log.Error("DataNode starts error", zap.Error(err))
+		log.Ctx(d.ctx).Error("DataNode starts error", zap.Error(err))
 		return err
 	}
-	log.Debug("Datanode successfully started")
+	log.Ctx(d.ctx).Info("Datanode successfully started")
 	return nil
 }
 

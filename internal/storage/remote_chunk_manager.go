@@ -20,29 +20,24 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net/http"
 	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/cockroachdb/errors"
-	minio "github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7"
 	"go.uber.org/zap"
 	"golang.org/x/exp/mmap"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/api/googleapi"
 
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/metrics"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/retry"
-	"github.com/milvus-io/milvus/pkg/util/timerecord"
-)
-
-const (
-	CloudProviderGCP     = "gcp"
-	CloudProviderAWS     = "aws"
-	CloudProviderAliyun  = "aliyun"
-	CloudProviderAzure   = "azure"
-	CloudProviderTencent = "tencent"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/metrics"
+	"github.com/milvus-io/milvus/pkg/v2/objectstorage"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/retry"
+	"github.com/milvus-io/milvus/pkg/v2/util/timerecord"
 )
 
 // ChunkObjectWalkFunc is the callback function for walking objects.
@@ -62,7 +57,7 @@ type ObjectStorage interface {
 	RemoveObject(ctx context.Context, bucketName, objectName string) error
 }
 
-// RemoteChunkManager is responsible for read and write data stored in minio.
+// RemoteChunkManager is responsible for read and write data stored in mminio.
 type RemoteChunkManager struct {
 	client ObjectStorage
 
@@ -73,11 +68,13 @@ type RemoteChunkManager struct {
 
 var _ ChunkManager = (*RemoteChunkManager)(nil)
 
-func NewRemoteChunkManager(ctx context.Context, c *config) (*RemoteChunkManager, error) {
+func NewRemoteChunkManager(ctx context.Context, c *objectstorage.Config) (*RemoteChunkManager, error) {
 	var client ObjectStorage
 	var err error
-	if c.cloudProvider == CloudProviderAzure {
+	if c.CloudProvider == objectstorage.CloudProviderAzure {
 		client, err = newAzureObjectStorageWithConfig(ctx, c)
+	} else if c.CloudProvider == objectstorage.CloudProviderGCPNative {
+		client, err = newGcpNativeObjectStorageWithConfig(ctx, c)
 	} else {
 		client, err = newMinioObjectStorageWithConfig(ctx, c)
 	}
@@ -86,10 +83,10 @@ func NewRemoteChunkManager(ctx context.Context, c *config) (*RemoteChunkManager,
 	}
 	mcm := &RemoteChunkManager{
 		client:     client,
-		bucketName: c.bucketName,
-		rootPath:   strings.TrimLeft(c.rootPath, "/"),
+		bucketName: c.BucketName,
+		rootPath:   strings.TrimLeft(c.RootPath, "/"),
 	}
-	log.Info("remote chunk manager init success.", zap.String("remote", c.cloudProvider), zap.String("bucketname", c.bucketName), zap.String("root", mcm.RootPath()))
+	log.Info("remote chunk manager init success.", zap.String("remote", c.CloudProvider), zap.String("bucketname", c.BucketName), zap.String("root", mcm.RootPath()))
 	return mcm, nil
 }
 
@@ -333,7 +330,11 @@ func (mcm *RemoteChunkManager) getObject(ctx context.Context, bucketName, object
 	if err == nil && reader != nil {
 		metrics.PersistentDataOpCounter.WithLabelValues(metrics.DataGetLabel, metrics.SuccessLabel).Inc()
 	} else {
-		metrics.PersistentDataOpCounter.WithLabelValues(metrics.DataGetLabel, metrics.FailLabel).Inc()
+		if errors.Is(err, context.Canceled) {
+			metrics.PersistentDataOpCounter.WithLabelValues(metrics.DataGetLabel, metrics.CancelLabel).Inc()
+		} else {
+			metrics.PersistentDataOpCounter.WithLabelValues(metrics.DataGetLabel, metrics.FailLabel).Inc()
+		}
 	}
 
 	return reader, err
@@ -349,7 +350,11 @@ func (mcm *RemoteChunkManager) putObject(ctx context.Context, bucketName, object
 			Observe(float64(start.ElapseSpan().Milliseconds()))
 		metrics.PersistentDataOpCounter.WithLabelValues(metrics.MetaPutLabel, metrics.SuccessLabel).Inc()
 	} else {
-		metrics.PersistentDataOpCounter.WithLabelValues(metrics.MetaPutLabel, metrics.FailLabel).Inc()
+		if errors.Is(err, context.Canceled) {
+			metrics.PersistentDataOpCounter.WithLabelValues(metrics.MetaPutLabel, metrics.CancelLabel).Inc()
+		} else {
+			metrics.PersistentDataOpCounter.WithLabelValues(metrics.MetaPutLabel, metrics.FailLabel).Inc()
+		}
 	}
 
 	return err
@@ -365,7 +370,11 @@ func (mcm *RemoteChunkManager) getObjectSize(ctx context.Context, bucketName, ob
 			Observe(float64(start.ElapseSpan().Milliseconds()))
 		metrics.PersistentDataOpCounter.WithLabelValues(metrics.DataStatLabel, metrics.SuccessLabel).Inc()
 	} else {
-		metrics.PersistentDataOpCounter.WithLabelValues(metrics.DataStatLabel, metrics.FailLabel).Inc()
+		if errors.Is(err, context.Canceled) {
+			metrics.PersistentDataOpCounter.WithLabelValues(metrics.DataStatLabel, metrics.CancelLabel).Inc()
+		} else {
+			metrics.PersistentDataOpCounter.WithLabelValues(metrics.DataStatLabel, metrics.FailLabel).Inc()
+		}
 	}
 
 	return info, err
@@ -381,7 +390,11 @@ func (mcm *RemoteChunkManager) removeObject(ctx context.Context, bucketName, obj
 			Observe(float64(start.ElapseSpan().Milliseconds()))
 		metrics.PersistentDataOpCounter.WithLabelValues(metrics.DataRemoveLabel, metrics.SuccessLabel).Inc()
 	} else {
-		metrics.PersistentDataOpCounter.WithLabelValues(metrics.DataRemoveLabel, metrics.FailLabel).Inc()
+		if errors.Is(err, context.Canceled) {
+			metrics.PersistentDataOpCounter.WithLabelValues(metrics.DataRemoveLabel, metrics.CancelLabel).Inc()
+		} else {
+			metrics.PersistentDataOpCounter.WithLabelValues(metrics.DataRemoveLabel, metrics.FailLabel).Inc()
+		}
 	}
 
 	return err
@@ -400,6 +413,11 @@ func checkObjectStorageError(fileName string, err error) error {
 		return merr.WrapErrIoFailed(fileName, err)
 	case minio.ErrorResponse:
 		if err.Code == "NoSuchKey" {
+			return merr.WrapErrIoKeyNotFound(fileName, err.Error())
+		}
+		return merr.WrapErrIoFailed(fileName, err)
+	case *googleapi.Error:
+		if err.Code == http.StatusNotFound {
 			return merr.WrapErrIoKeyNotFound(fileName, err.Error())
 		}
 		return merr.WrapErrIoFailed(fileName, err)

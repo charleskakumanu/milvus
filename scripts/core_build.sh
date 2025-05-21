@@ -100,9 +100,12 @@ BUILD_DISK_ANN="OFF"
 USE_ASAN="OFF"
 USE_DYNAMIC_SIMD="ON"
 USE_OPENDAL="OFF"
+TANTIVY_FEATURES=""
 INDEX_ENGINE="KNOWHERE"
+ENABLE_AZURE_FS="OFF"
+: "${ENABLE_GCP_NATIVE:="OFF"}"
 
-while getopts "p:d:t:s:f:n:i:y:a:x:o:ulrcghzmebZ" arg; do
+while getopts "p:t:s:n:a:y:x:o:f:ulcgbZh" arg; do
   case $arg in
   p)
     INSTALL_PREFIX=$OPTARG
@@ -137,7 +140,6 @@ while getopts "p:d:t:s:f:n:i:y:a:x:o:ulrcghzmebZ" arg; do
     if [[ ${ENV_VAL} == 'ON' ]]; then
         echo "Set USE_ASAN to ON"
         USE_ASAN="ON"
-        BUILD_TYPE=Debug
     fi
     ;;
   y)
@@ -151,6 +153,9 @@ while getopts "p:d:t:s:f:n:i:y:a:x:o:ulrcghzmebZ" arg; do
     ;;
   o)
     USE_OPENDAL=$OPTARG
+    ;;
+  f)
+    TANTIVY_FEATURES=$OPTARG
     ;;
   h) # help
     echo "
@@ -169,10 +174,11 @@ parameter:
 -a: build milvus with AddressSanitizer(default: false)
 -Z: build milvus without azure-sdk-for-cpp, so cannot use azure blob
 -o: build milvus with opendal(default: false)
+-f: build milvus with tantivy features(default: '')
 -h: help
 
 usage:
-./core_build.sh -p \${INSTALL_PREFIX} -t \${BUILD_TYPE} -s \${CUDA_ARCH} [-u] [-l] [-r] [-c] [-z] [-g] [-m] [-e] [-h] [-b] [-o]
+./core_build.sh -p \${INSTALL_PREFIX} -t \${BUILD_TYPE} -s \${CUDA_ARCH} -f \${TANTIVY_FEATURES} [-u] [-l] [-r] [-c] [-z] [-g] [-m] [-e] [-h] [-b] [-o]
                 "
     exit 0
     ;;
@@ -222,8 +228,12 @@ source ${ROOT_DIR}/scripts/setenv.sh
 
 CMAKE_GENERATOR="Unix Makefiles"
 
-# UBUNTU system build diskann index
-if [ "$OS_NAME" == "ubuntu20.04" ] ; then
+# build with diskann index if OS is ubuntu or rocky or amzn
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    OS=$ID
+fi
+if [ "$OS" = "ubuntu" ] || [ "$OS" = "rocky" ] || [ "$OS" = "amzn" ]; then
   BUILD_DISK_ANN=ON
 fi
 
@@ -252,7 +262,10 @@ ${CMAKE_EXTRA_ARGS} \
 -DUSE_DYNAMIC_SIMD=${USE_DYNAMIC_SIMD} \
 -DCPU_ARCH=${CPU_ARCH} \
 -DUSE_OPENDAL=${USE_OPENDAL} \
--DINDEX_ENGINE=${INDEX_ENGINE} "
+-DINDEX_ENGINE=${INDEX_ENGINE} \
+-DTANTIVY_FEATURES_LIST=${TANTIVY_FEATURES} \
+-DENABLE_GCP_NATIVE=${ENABLE_GCP_NATIVE} \
+-DENABLE_AZURE_FS=${ENABLE_AZURE_FS} "
 if [ -z "$BUILD_WITHOUT_AZURE" ]; then
 CMAKE_CMD=${CMAKE_CMD}"-DAZURE_BUILD_DIR=${AZURE_BUILD_DIR} \
 -DVCPKG_TARGET_TRIPLET=${VCPKG_TARGET_TRIPLET} "

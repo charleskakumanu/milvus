@@ -33,6 +33,29 @@ func NewFlatIndex(metricType MetricType) Index {
 	return flatIndex{
 		baseIndex: baseIndex{
 			metricType: metricType,
+			indexType:  Flat,
+		},
+	}
+}
+
+var _ Index = binFlatIndex{}
+
+type binFlatIndex struct {
+	baseIndex
+}
+
+func (idx binFlatIndex) Params() map[string]string {
+	return map[string]string{
+		MetricTypeKey: string(idx.metricType),
+		IndexTypeKey:  string(BinFlat),
+	}
+}
+
+func NewBinFlatIndex(metricType MetricType) Index {
+	return binFlatIndex{
+		baseIndex: baseIndex{
+			metricType: metricType,
+			indexType:  BinFlat,
 		},
 	}
 }

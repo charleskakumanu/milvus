@@ -19,6 +19,7 @@ package importv2
 import (
 	"context"
 	"io"
+	"math"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -26,16 +27,18 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/internal/datanode/metacache"
-	"github.com/milvus-io/milvus/internal/datanode/syncmgr"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
+	"github.com/milvus-io/milvus/internal/allocator"
+	"github.com/milvus-io/milvus/internal/flushcommon/metacache"
+	"github.com/milvus-io/milvus/internal/flushcommon/syncmgr"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/util/importutilv2"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/conc"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v2/util/conc"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 type ImportTask struct {
@@ -45,6 +48,7 @@ type ImportTask struct {
 	segmentsInfo map[int64]*datapb.ImportSegmentInfo
 	req          *datapb.ImportRequest
 
+	allocator  allocator.Interface
 	manager    TaskManager
 	syncMgr    syncmgr.SyncManager
 	cm         storage.ChunkManager
@@ -62,6 +66,8 @@ func NewImportTask(req *datapb.ImportRequest,
 	if importutilv2.IsBackup(req.GetOptions()) {
 		UnsetAutoID(req.GetSchema())
 	}
+	// Setting end as math.MaxInt64 to incrementally allocate logID.
+	alloc := allocator.NewLocalAllocator(req.GetIDRange().GetBegin(), math.MaxInt64)
 	task := &ImportTask{
 		ImportTaskV2: &datapb.ImportTaskV2{
 			JobID:        req.GetJobID(),
@@ -73,6 +79,7 @@ func NewImportTask(req *datapb.ImportRequest,
 		cancel:       cancel,
 		segmentsInfo: make(map[int64]*datapb.ImportSegmentInfo),
 		req:          req,
+		allocator:    alloc,
 		manager:      manager,
 		syncMgr:      syncMgr,
 		cm:           cm,
@@ -95,6 +102,17 @@ func (t *ImportTask) GetVchannels() []string {
 
 func (t *ImportTask) GetSchema() *schemapb.CollectionSchema {
 	return t.req.GetSchema()
+}
+
+func (t *ImportTask) GetSlots() int64 {
+	// Consider the following two scenarios:
+	// 1. Importing a large number of small files results in
+	//    a small total data size, making file count unsuitable as a slot number.
+	// 2. Importing a file with many shards number results in many segments and a small total data size,
+	//    making segment count unsuitable as a slot number.
+	// Taking these factors into account, we've decided to use the
+	// minimum value between segment count and file count as the slot number.
+	return int64(funcutil.Min(len(t.GetFileStats()), len(t.GetSegmentIDs()), paramtable.Get().DataNodeCfg.MaxTaskSlotNum.GetAsInt()))
 }
 
 func (t *ImportTask) Cancel() {
@@ -131,7 +149,7 @@ func (t *ImportTask) Execute() []*conc.Future[any] {
 	req := t.req
 
 	fn := func(file *internalpb.ImportFile) error {
-		reader, err := importutilv2.NewReader(t.ctx, t.cm, t.GetSchema(), file, t.req.GetOptions(), bufferSize)
+		reader, err := importutilv2.NewReader(t.ctx, t.cm, t.GetSchema(), file, req.GetOptions(), bufferSize)
 		if err != nil {
 			log.Warn("new reader failed", WrapLogFields(t, zap.String("file", file.String()), zap.Error(err))...)
 			t.manager.Update(t.GetTaskID(), UpdateState(datapb.ImportTaskStateV2_Failed), UpdateReason(err.Error()))
@@ -139,7 +157,7 @@ func (t *ImportTask) Execute() []*conc.Future[any] {
 		}
 		defer reader.Close()
 		start := time.Now()
-		err = t.importFile(reader, t)
+		err = t.importFile(reader)
 		if err != nil {
 			log.Warn("do import failed", WrapLogFields(t, zap.String("file", file.String()), zap.Error(err))...)
 			t.manager.Update(t.GetTaskID(), UpdateState(datapb.ImportTaskStateV2_Failed), UpdateReason(err.Error()))
@@ -162,8 +180,7 @@ func (t *ImportTask) Execute() []*conc.Future[any] {
 	return futures
 }
 
-func (t *ImportTask) importFile(reader importutilv2.Reader, task Task) error {
-	iTask := task.(*ImportTask)
+func (t *ImportTask) importFile(reader importutilv2.Reader) error {
 	syncFutures := make([]*conc.Future[struct{}], 0)
 	syncTasks := make([]syncmgr.Task, 0)
 	for {
@@ -174,15 +191,26 @@ func (t *ImportTask) importFile(reader importutilv2.Reader, task Task) error {
 			}
 			return err
 		}
-		err = AppendSystemFieldsData(iTask, data)
+		rowNum := GetInsertDataRowCount(data, t.GetSchema())
+		if rowNum == 0 {
+			log.Info("0 row was imported, the data may have been deleted", WrapLogFields(t)...)
+			continue
+		}
+		err = AppendSystemFieldsData(t, data, rowNum)
 		if err != nil {
 			return err
 		}
-		hashedData, err := HashData(iTask, data)
+		if !importutilv2.IsBackup(t.req.GetOptions()) {
+			err = RunEmbeddingFunction(t, data)
+			if err != nil {
+				return err
+			}
+		}
+		hashedData, err := HashData(t, data)
 		if err != nil {
 			return err
 		}
-		fs, sts, err := t.sync(iTask, hashedData)
+		fs, sts, err := t.sync(hashedData)
 		if err != nil {
 			return err
 		}
@@ -194,34 +222,50 @@ func (t *ImportTask) importFile(reader importutilv2.Reader, task Task) error {
 		return err
 	}
 	for _, syncTask := range syncTasks {
-		segmentInfo, err := NewImportSegmentInfo(syncTask, iTask.metaCaches)
+		segmentInfo, err := NewImportSegmentInfo(syncTask, t.metaCaches)
 		if err != nil {
 			return err
 		}
-		t.manager.Update(task.GetTaskID(), UpdateSegmentInfo(segmentInfo))
-		log.Info("sync import data done", WrapLogFields(task, zap.Any("segmentInfo", segmentInfo))...)
+		t.manager.Update(t.GetTaskID(), UpdateSegmentInfo(segmentInfo))
+		log.Info("sync import data done", WrapLogFields(t, zap.Any("segmentInfo", segmentInfo))...)
 	}
 	return nil
 }
 
-func (t *ImportTask) sync(task *ImportTask, hashedData HashedData) ([]*conc.Future[struct{}], []syncmgr.Task, error) {
-	log.Info("start to sync import data", WrapLogFields(task)...)
+func (t *ImportTask) sync(hashedData HashedData) ([]*conc.Future[struct{}], []syncmgr.Task, error) {
+	log.Ctx(context.TODO()).Info("start to sync import data", WrapLogFields(t)...)
 	futures := make([]*conc.Future[struct{}], 0)
 	syncTasks := make([]syncmgr.Task, 0)
 	for channelIdx, datas := range hashedData {
-		channel := task.GetVchannels()[channelIdx]
+		channel := t.GetVchannels()[channelIdx]
 		for partitionIdx, data := range datas {
 			if data.GetRowNum() == 0 {
 				continue
 			}
-			partitionID := task.GetPartitionIDs()[partitionIdx]
-			segmentID := PickSegment(task.req.GetRequestSegments(), channel, partitionID)
-			syncTask, err := NewSyncTask(task.ctx, task.metaCaches, task.req.GetTs(),
-				segmentID, partitionID, task.GetCollectionID(), channel, data, nil)
+			partitionID := t.GetPartitionIDs()[partitionIdx]
+			segmentID, err := PickSegment(t.req.GetRequestSegments(), channel, partitionID)
 			if err != nil {
 				return nil, nil, err
 			}
-			future := t.syncMgr.SyncData(task.ctx, syncTask)
+			bm25Stats := make(map[int64]*storage.BM25Stats)
+			for _, fn := range t.req.GetSchema().GetFunctions() {
+				if fn.GetType() == schemapb.FunctionType_BM25 {
+					// BM25 function guarantees single output field
+					outputSparseFieldId := fn.GetOutputFieldIds()[0]
+					bm25Stats[outputSparseFieldId] = storage.NewBM25Stats()
+					bm25Stats[outputSparseFieldId].AppendFieldData(data.Data[outputSparseFieldId].(*storage.SparseFloatVectorFieldData))
+				}
+			}
+			syncTask, err := NewSyncTask(t.ctx, t.allocator, t.metaCaches, t.req.GetTs(),
+				segmentID, partitionID, t.GetCollectionID(), channel, data, nil, bm25Stats)
+			if err != nil {
+				return nil, nil, err
+			}
+			future, err := t.syncMgr.SyncData(t.ctx, syncTask)
+			if err != nil {
+				log.Ctx(context.TODO()).Error("sync data failed", WrapLogFields(t, zap.Error(err))...)
+				return nil, nil, err
+			}
 			futures = append(futures, future)
 			syncTasks = append(syncTasks, syncTask)
 		}

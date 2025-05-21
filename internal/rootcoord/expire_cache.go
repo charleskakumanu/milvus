@@ -19,10 +19,10 @@ package rootcoord
 import (
 	"context"
 
-	"github.com/milvus-io/milvus/internal/proto/proxypb"
 	"github.com/milvus-io/milvus/internal/util/proxyutil"
-	"github.com/milvus-io/milvus/pkg/util/commonpbutil"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/proto/proxypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 // ExpireMetaCache will call invalidate collection meta cache
@@ -32,7 +32,7 @@ func (c *Core) ExpireMetaCache(ctx context.Context, dbName string, collNames []s
 		req := proxypb.InvalidateCollMetaCacheRequest{
 			Base: commonpbutil.NewMsgBase(
 				commonpbutil.WithTimeStamp(ts),
-				commonpbutil.WithSourceID(c.session.ServerID),
+				commonpbutil.WithSourceID(c.session.GetServerID()),
 			),
 			DbName:         dbName,
 			CollectionName: collName,

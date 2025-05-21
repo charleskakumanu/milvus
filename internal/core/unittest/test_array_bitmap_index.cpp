@@ -162,6 +162,7 @@ class ArrayBitmapIndexTest : public testing::Test {
          int64_t index_version) {
         proto::schema::FieldSchema field_schema;
         field_schema.set_data_type(proto::schema::DataType::Array);
+        field_schema.set_nullable(nullable_);
         proto::schema::DataType element_type;
         if constexpr (std::is_same_v<int8_t, T>) {
             element_type = proto::schema::DataType::Int8;
@@ -185,17 +186,36 @@ class ArrayBitmapIndexTest : public testing::Test {
             segment_id, field_id, index_build_id, index_version};
 
         data_ = GenerateArrayData(element_type, cardinality_, nb_, 10);
-
-        auto field_data = storage::CreateFieldData(DataType::ARRAY);
-        field_data->FillFieldData(data_.data(), data_.size());
-        storage::InsertData insert_data(field_data);
+        auto field_data = storage::CreateFieldData(DataType::ARRAY, nullable_);
+        if (nullable_) {
+            valid_data_.reserve(nb_);
+            uint8_t* ptr = new uint8_t[(nb_ + 7) / 8];
+            for (int i = 0; i < nb_; i++) {
+                int byteIndex = i / 8;
+                int bitIndex = i % 8;
+                if (i % 2 == 0) {
+                    valid_data_.push_back(true);
+                    ptr[byteIndex] |= (1 << bitIndex);
+                } else {
+                    valid_data_.push_back(false);
+                    ptr[byteIndex] &= ~(1 << bitIndex);
+                }
+            }
+            field_data->FillFieldData(data_.data(), ptr, data_.size());
+            delete[] ptr;
+        } else {
+            field_data->FillFieldData(data_.data(), data_.size());
+        }
+        auto payload_reader =
+            std::make_shared<milvus::storage::PayloadReader>(field_data);
+        storage::InsertData insert_data(payload_reader);
         insert_data.SetFieldDataMeta(field_meta);
         insert_data.SetTimestamps(0, 100);
 
         auto serialized_bytes = insert_data.Serialize(storage::Remote);
 
-        auto log_path = fmt::format("{}/{}/{}/{}/{}/{}",
-                                    "test_array_bitmap",
+        auto log_path = fmt::format("/{}/{}/{}/{}/{}/{}",
+                                    "/tmp/test_array_bitmap",
                                     collection_id,
                                     partition_id,
                                     segment_id,
@@ -208,36 +228,51 @@ class ArrayBitmapIndexTest : public testing::Test {
         std::vector<std::string> index_files;
 
         Config config;
-        config["index_type"] = milvus::index::BITMAP_INDEX_TYPE;
-        config["insert_files"] = std::vector<std::string>{log_path};
-        config["bitmap_cardinality_limit"] = "1000";
+        config["index_type"] = milvus::index::HYBRID_INDEX_TYPE;
+        config[INSERT_FILES_KEY] = std::vector<std::string>{log_path};
+        config["bitmap_cardinality_limit"] = "100";
+        if (has_lack_binlog_row_) {
+            config["lack_binlog_rows"] = lack_binlog_row_;
+        }
 
-        auto build_index =
-            indexbuilder::IndexFactory::GetInstance().CreateIndex(
-                DataType::ARRAY, config, ctx);
-        build_index->Build();
+        {
+            auto build_index =
+                indexbuilder::IndexFactory::GetInstance().CreateIndex(
+                    DataType::ARRAY, config, ctx);
+            build_index->Build();
 
-        auto binary_set = build_index->Upload();
-        for (const auto& [key, _] : binary_set.binary_map_) {
-            index_files.push_back(key);
+            auto create_index_result = build_index->Upload();
+            auto memSize = create_index_result->GetMemSize();
+            auto serializedSize = create_index_result->GetSerializedSize();
+            ASSERT_GT(memSize, 0);
+            ASSERT_GT(serializedSize, 0);
+            index_files = create_index_result->GetIndexFiles();
         }
 
         index::CreateIndexInfo index_info{};
-        index_info.index_type = milvus::index::BITMAP_INDEX_TYPE;
+        index_info.index_type = milvus::index::HYBRID_INDEX_TYPE;
         index_info.field_type = DataType::ARRAY;
 
         config["index_files"] = index_files;
 
+        ctx.set_for_loading_index(true);
         index_ =
             index::IndexFactory::GetInstance().CreateIndex(index_info, ctx);
         index_->Load(milvus::tracer::TraceContext{}, config);
     }
 
-    void
-    SetUp() override {
+    virtual void
+    SetParam() {
         nb_ = 10000;
         cardinality_ = 30;
+        nullable_ = false;
+        index_build_id_ = 2001;
+        index_version_ = 2001;
+    }
 
+    void
+    SetUp() override {
+        SetParam();
         // if constexpr (std::is_same_v<T, int8_t>) {
         //     type_ = DataType::INT8;
         // } else if constexpr (std::is_same_v<T, int16_t>) {
@@ -253,8 +288,6 @@ class ArrayBitmapIndexTest : public testing::Test {
         int64_t partition_id = 2;
         int64_t segment_id = 3;
         int64_t field_id = 101;
-        int64_t index_build_id = 1000;
-        int64_t index_version = 10000;
         std::string root_path = "/tmp/test-bitmap-index/";
 
         storage::StorageConfig storage_config;
@@ -266,8 +299,8 @@ class ArrayBitmapIndexTest : public testing::Test {
              partition_id,
              segment_id,
              field_id,
-             index_build_id,
-             index_version);
+             index_build_id_,
+             index_version_);
     }
 
     virtual ~ArrayBitmapIndexTest() override {
@@ -286,9 +319,20 @@ class ArrayBitmapIndexTest : public testing::Test {
         }
         auto index_ptr = dynamic_cast<index::ScalarIndex<T>*>(index_.get());
         auto bitset = index_ptr->In(test_data.size(), test_data.data());
-        for (size_t i = 0; i < bitset.size(); i++) {
+        size_t start = 0;
+        if (has_lack_binlog_row_) {
+            // all null here
+            for (int i = 0; i < lack_binlog_row_; i++) {
+                ASSERT_EQ(bitset[i], false);
+            }
+            start += lack_binlog_row_;
+        }
+        for (size_t i = start; i < bitset.size(); i++) {
             auto ref = [&]() -> bool {
-                milvus::Array array = data_[i];
+                milvus::Array array = data_[i - start];
+                if (nullable_ && !valid_data_[i - start]) {
+                    return false;
+                }
                 for (size_t j = 0; j < array.length(); ++j) {
                     auto val = array.template get_data<T>(j);
                     if (s.find(val) != s.end()) {
@@ -309,7 +353,13 @@ class ArrayBitmapIndexTest : public testing::Test {
     IndexBasePtr index_;
     size_t nb_;
     size_t cardinality_;
+    bool nullable_;
     std::vector<milvus::Array> data_;
+    FixedVector<bool> valid_data_;
+    int index_version_;
+    int index_build_id_;
+    bool has_lack_binlog_row_{false};
+    size_t lack_binlog_row_{100};
 };
 
 TYPED_TEST_SUITE_P(ArrayBitmapIndexTest);
@@ -338,3 +388,95 @@ REGISTER_TYPED_TEST_SUITE_P(ArrayBitmapIndexTest,
 INSTANTIATE_TYPED_TEST_SUITE_P(ArrayBitmapE2ECheck,
                                ArrayBitmapIndexTest,
                                BitmapType);
+
+template <typename T>
+class ArrayBitmapIndexTestV1 : public ArrayBitmapIndexTest<T> {
+ public:
+    virtual void
+    SetParam() override {
+        this->nb_ = 10000;
+        this->cardinality_ = 200;
+        this->nullable_ = false;
+        this->index_build_id_ = 2002;
+        this->index_version_ = 2002;
+    }
+
+    virtual ~ArrayBitmapIndexTestV1() {
+    }
+};
+
+TYPED_TEST_SUITE_P(ArrayBitmapIndexTestV1);
+
+TYPED_TEST_P(ArrayBitmapIndexTestV1, CountFuncTest) {
+    auto count = this->index_->Count();
+    EXPECT_EQ(count, this->nb_);
+}
+
+template <typename T>
+class ArrayBitmapIndexTestNullable : public ArrayBitmapIndexTest<T> {
+ public:
+    virtual void
+    SetParam() override {
+        this->nb_ = 10000;
+        this->cardinality_ = 30;
+        this->nullable_ = true;
+        this->index_version_ = 2003;
+        this->index_build_id_ = 2003;
+    }
+
+    virtual ~ArrayBitmapIndexTestNullable() {
+    }
+};
+
+TYPED_TEST_SUITE_P(ArrayBitmapIndexTestNullable);
+
+TYPED_TEST_P(ArrayBitmapIndexTestNullable, CountFuncTest) {
+    auto count = this->index_->Count();
+    EXPECT_EQ(count, this->nb_);
+}
+
+template <typename T>
+class ArrayBitmapIndexTestV2 : public ArrayBitmapIndexTest<T> {
+ public:
+    virtual void
+    SetParam() override {
+        this->nb_ = 10000;
+        this->cardinality_ = 30;
+        this->nullable_ = true;
+        this->index_version_ = 2003;
+        this->index_build_id_ = 2003;
+        this->has_lack_binlog_row_ = true;
+    }
+
+    virtual ~ArrayBitmapIndexTestV2() {
+    }
+};
+
+TYPED_TEST_SUITE_P(ArrayBitmapIndexTestV2);
+
+TYPED_TEST_P(ArrayBitmapIndexTestV2, CountFuncTest) {
+    auto count = this->index_->Count();
+    if (this->has_lack_binlog_row_) {
+        EXPECT_EQ(count, this->nb_ + this->lack_binlog_row_);
+    } else {
+        EXPECT_EQ(count, this->nb_);
+    }
+}
+
+using BitmapTypeV1 = testing::Types<int32_t, int64_t, std::string>;
+
+REGISTER_TYPED_TEST_SUITE_P(ArrayBitmapIndexTestV1, CountFuncTest);
+REGISTER_TYPED_TEST_SUITE_P(ArrayBitmapIndexTestNullable, CountFuncTest);
+REGISTER_TYPED_TEST_SUITE_P(ArrayBitmapIndexTestV2, CountFuncTest);
+
+INSTANTIATE_TYPED_TEST_SUITE_P(ArrayBitmapE2ECheckV1,
+                               ArrayBitmapIndexTestV1,
+                               BitmapTypeV1);
+
+INSTANTIATE_TYPED_TEST_SUITE_P(ArrayBitmapE2ECheckV1,
+                               ArrayBitmapIndexTestNullable,
+                               BitmapTypeV1);
+
+INSTANTIATE_TYPED_TEST_SUITE_P(ArrayBitmapE2ECheckV1,
+                               ArrayBitmapIndexTestV2,
+                               BitmapTypeV1);

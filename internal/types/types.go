@@ -22,15 +22,17 @@ import (
 
 	"github.com/tikv/client-go/v2/txnkv"
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"google.golang.org/grpc"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/indexpb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/proxypb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
-	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/proxypb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/rootcoordpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/workerpb"
 )
 
 // Limiter defines the interface to perform request rate limiting.
@@ -53,12 +55,14 @@ type Component interface {
 type DataNodeClient interface {
 	io.Closer
 	datapb.DataNodeClient
+	workerpb.IndexNodeClient
 }
 
 // DataNode is the interface `datanode` package implements
 type DataNode interface {
 	Component
 	datapb.DataNodeServer
+	workerpb.IndexNodeServer
 }
 
 // DataNodeComponent is used by grpc server of DataNode
@@ -81,29 +85,21 @@ type DataNodeComponent interface {
 	// SetEtcdClient set etcd client for DataNode
 	SetEtcdClient(etcdClient *clientv3.Client)
 
-	// SetRootCoordClient set SetRootCoordClient for DataNode
-	// `rootCoord` is a client of root coordinator.
+	// SetMixCoordClient set SetMixCoordClient for DataNode
+	// `mixCoord` is a client of root coordinator.
 	//
 	// Return a generic error in status:
-	//     If the rootCoord is nil or the rootCoord has been set before.
+	//     If the mixCoord is nil or the mixCoord has been set before.
 	// Return nil in status:
-	//     The rootCoord is not nil.
-	SetRootCoordClient(rootCoord RootCoordClient) error
-
-	// SetDataCoordClient set DataCoord for DataNode
-	// `dataCoord` is a client of data coordinator.
-	//
-	// Return a generic error in status:
-	//     If the dataCoord is nil or the dataCoord has been set before.
-	// Return nil in status:
-	//     The dataCoord is not nil.
-	SetDataCoordClient(dataCoord DataCoordClient) error
+	//     The mixCoord is not nil.
+	SetMixCoordClient(mixCoord MixCoordClient) error
 }
 
 // DataCoordClient is the client interface for datacoord server
 type DataCoordClient interface {
 	io.Closer
 	datapb.DataCoordClient
+	indexpb.IndexCoordClient
 }
 
 // DataCoord is the interface `datacoord` package implements
@@ -126,39 +122,10 @@ type DataCoordComponent interface {
 	// SetTiKVClient set TiKV client for QueryNode
 	SetTiKVClient(client *txnkv.Client)
 
-	SetRootCoordClient(rootCoord RootCoordClient)
+	SetMixCoord(mixCoord MixCoord)
 
 	// SetDataNodeCreator set DataNode client creator func for DataCoord
 	SetDataNodeCreator(func(context.Context, string, int64) (DataNodeClient, error))
-
-	// SetIndexNodeCreator set Index client creator func for DataCoord
-	SetIndexNodeCreator(func(context.Context, string, int64) (IndexNodeClient, error))
-}
-
-// IndexNodeClient is the client interface for indexnode server
-type IndexNodeClient interface {
-	io.Closer
-	indexpb.IndexNodeClient
-}
-
-// IndexNode is the interface `indexnode` package implements
-type IndexNode interface {
-	Component
-	indexpb.IndexNodeServer
-}
-
-// IndexNodeComponent is used by grpc server of IndexNode
-type IndexNodeComponent interface {
-	IndexNode
-
-	SetAddress(address string)
-	GetAddress() string
-	// SetEtcdClient set etcd client for IndexNodeComponent
-	SetEtcdClient(etcdClient *clientv3.Client)
-
-	// UpdateStateCode updates state code for IndexNodeComponent
-	//  `stateCode` is current statement of this QueryCoord, indicating whether it's healthy.
-	UpdateStateCode(stateCode commonpb.StateCode)
 }
 
 // RootCoordClient is the client interface for rootcoord server
@@ -191,17 +158,11 @@ type RootCoordComponent interface {
 	// State includes: Initializing, Healthy and Abnormal
 	UpdateStateCode(commonpb.StateCode)
 
-	// SetDataCoordClient set SetDataCoordClient for RootCoord
+	// SetMixCoord set SetMixCoord for RootCoord
 	// `dataCoord` is a client of data coordinator.
 	//
 	// Always return nil.
-	SetDataCoordClient(dataCoord DataCoordClient) error
-
-	// SetQueryCoord set QueryCoord for RootCoord
-	//  `queryCoord` is a client of query coordinator.
-	//
-	// Always return nil.
-	SetQueryCoordClient(queryCoord QueryCoordClient) error
+	SetMixCoord(mixCoord MixCoord) error
 
 	// SetProxyCreator set Proxy client creator func for RootCoord
 	SetProxyCreator(func(ctx context.Context, addr string, nodeID int64) (ProxyClient, error))
@@ -239,21 +200,9 @@ type ProxyComponent interface {
 	// `etcdClient` is a client of etcd
 	SetEtcdClient(etcdClient *clientv3.Client)
 
-	// SetRootCoordClient set RootCoord for Proxy
-	// `rootCoord` is a client of root coordinator.
-	SetRootCoordClient(rootCoord RootCoordClient)
-
-	// SetDataCoordClient set DataCoord for Proxy
-	// `dataCoord` is a client of data coordinator.
-	SetDataCoordClient(dataCoord DataCoordClient)
-
-	// SetIndexCoordClient set IndexCoord for Proxy
-	//  `indexCoord` is a client of index coordinator.
-	// SetIndexCoordClient(indexCoord IndexCoord)
-
-	// SetQueryCoordClient set QueryCoord for Proxy
-	//  `queryCoord` is a client of query coordinator.
-	SetQueryCoordClient(queryCoord QueryCoordClient)
+	// SetMixCoordClient set MixCoord for Proxy
+	// `mixCoord` is a client of mix coordinator.
+	SetMixCoordClient(rootCoord MixCoordClient)
 
 	// SetQueryNodeCreator set QueryNode client creator func for Proxy
 	SetQueryNodeCreator(func(ctx context.Context, addr string, nodeID int64) (QueryNodeClient, error))
@@ -325,24 +274,59 @@ type QueryCoordComponent interface {
 	//  `stateCode` is current statement of this QueryCoord, indicating whether it's healthy.
 	UpdateStateCode(stateCode commonpb.StateCode)
 
-	// SetDataCoordClient set SetDataCoordClient for QueryCoord
-	// `dataCoord` is a client of data coordinator.
-	//
-	// Return a generic error in status:
-	//     If the dataCoord is nil.
-	// Return nil in status:
-	//     The dataCoord is not nil.
-	SetDataCoordClient(dataCoord DataCoordClient) error
-
-	// SetRootCoordClient set SetRootCoordClient for QueryCoord
-	// `rootCoord` is a client of root coordinator.
-	//
-	// Return a generic error in status:
-	//     If the rootCoord is nil.
-	// Return nil in status:
-	//     The rootCoord is not nil.
-	SetRootCoordClient(rootCoord RootCoordClient) error
-
 	// SetQueryNodeCreator set QueryNode client creator func for QueryCoord
 	SetQueryNodeCreator(func(ctx context.Context, addr string, nodeID int64) (QueryNodeClient, error))
+
+	SetMixCoord(mixCoord MixCoord)
+}
+
+// MixCoordClient is the client interface for mixcoord server
+type MixCoordClient interface {
+	io.Closer
+	rootcoordpb.RootCoordClient
+	querypb.QueryCoordClient
+	datapb.DataCoordClient
+	indexpb.IndexCoordClient
+}
+
+// MixCoord is the interface `MixCoord` package implements
+//
+//go:generate mockery --name=MixCoord  --output=../mocks --filename=mock_mixcoord.go --with-expecter
+type MixCoord interface {
+	Component
+	rootcoordpb.RootCoordServer
+	querypb.QueryCoordServer
+	datapb.DataCoordServer
+
+	// GetMetrics notifies MixCoordComponent to collect metrics for specified component
+	GetDcMetrics(ctx context.Context, req *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error)
+
+	// GetMetrics notifies MixCoordComponent to collect metrics for specified component
+	GetQcMetrics(ctx context.Context, req *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error)
+}
+
+// MixCoordComponent is used by grpc server of MixCoord
+type MixCoordComponent interface {
+	MixCoord
+
+	SetAddress(address string)
+	// SetEtcdClient set EtcdClient for MixCoord
+	// `etcdClient` is a client of etcd
+	SetEtcdClient(etcdClient *clientv3.Client)
+
+	// SetTiKVClient set TiKV client for MixCoord
+	SetTiKVClient(client *txnkv.Client)
+
+	// UpdateStateCode updates state code for MixCoord
+	// State includes: Initializing, Healthy and Abnormal
+	UpdateStateCode(commonpb.StateCode)
+
+	// GetMetrics notifies MixCoordComponent to collect metrics for specified component
+	GetMetrics(ctx context.Context, req *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error)
+
+	RegisterStreamingCoordGRPCService(server *grpc.Server)
+
+	GracefulStop()
+
+	SetMixCoordClient(client MixCoordClient)
 }

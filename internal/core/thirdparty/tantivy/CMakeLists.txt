@@ -1,3 +1,6 @@
+set(TANTIVY_FEATURES_LIST "" CACHE STRING "List of Cargo features to enable")
+string(REPLACE ";" "," TANTIVY_FEATURES "${TANTIVY_FEATURES_LIST}")
+
 if (CMAKE_BUILD_TYPE STREQUAL "Debug")
     set(CARGO_CMD cargo build)
     set(TARGET_DIR "debug")
@@ -5,6 +8,11 @@ else ()
     set(CARGO_CMD cargo build --release)
     set(TARGET_DIR "release")
 endif ()
+
+if (TANTIVY_FEATURES)
+    set(CARGO_CMD ${CARGO_CMD} --features ${TANTIVY_FEATURES})
+endif ()
+message("Cargo command: ${CARGO_CMD}")
 
 set(TANTIVY_LIB_DIR "${CMAKE_INSTALL_PREFIX}/lib")
 set(TANTIVY_INCLUDE_DIR "${CMAKE_INSTALL_PREFIX}/include")
@@ -34,7 +42,7 @@ add_custom_target(tantivy_binding_target DEPENDS compile_tantivy ls_cargo_target
 
 set(INSTALL_COMMAND
         cp ${LIB_HEADER_FOLDER}/tantivy-binding.h ${TANTIVY_INCLUDE_DIR}/ &&
-        cp ${CMAKE_CURRENT_SOURCE_DIR}/tantivy-wrapper.h ${TANTIVY_INCLUDE_DIR}/ &&
+        cp ${CMAKE_CURRENT_SOURCE_DIR}/*.h ${TANTIVY_INCLUDE_DIR}/ &&
         cp ${LIB_FILE} ${TANTIVY_LIB_DIR}/)
 add_custom_command(OUTPUT install_tantivy
         COMMENT "Install tantivy target ${LIB_FILE} to ${TANTIVY_LIB_DIR}"
@@ -58,22 +66,51 @@ if (CMAKE_BUILD_TYPE STREQUAL "Debug")
         add_link_options(-fno-stack-protector -fno-omit-frame-pointer -fno-var-tracking -fsanitize=address)
 endif()
 
-add_executable(test_tantivy test.cpp)
-target_link_libraries(test_tantivy
-        tantivy_binding
-        boost_filesystem
-        dl
+# TODO: move these below tests to ut.
+
+option(BUILD_TANTIVY_WITH_UT "compile tantivy with ut" OFF)
+
+if (BUILD_TANTIVY_WITH_UT)
+    message(STATUS "compile tantivy with ut")
+
+    add_executable(test_tantivy test.cpp)
+    target_link_libraries(test_tantivy
+            tantivy_binding
+            boost_filesystem
+            dl
+            )
+
+    add_executable(bench_tantivy bench.cpp)
+    target_link_libraries(bench_tantivy
+            tantivy_binding
+            boost_filesystem
+            dl
+            )
+
+    add_executable(ffi_demo ffi_demo.cpp)
+    target_link_libraries(ffi_demo
+            tantivy_binding
+            dl
+            )
+
+    add_executable(tokenizer_demo tokenizer_demo.cpp)
+    target_link_libraries(tokenizer_demo
+            tantivy_binding
+            dl
+            )
+
+    add_executable(text_demo text_demo.cpp)
+    target_link_libraries(text_demo
+            tantivy_binding
+            dl
         )
 
-add_executable(bench_tantivy bench.cpp)
-target_link_libraries(bench_tantivy
-        tantivy_binding
-        boost_filesystem
-        dl
+    add_executable(jieba_demo jieba_demo.cpp)
+    target_link_libraries(jieba_demo
+            tantivy_binding
+            dl
         )
-
-add_executable(ffi_demo ffi_demo.cpp)
-target_link_libraries(ffi_demo
-        tantivy_binding
-        dl
-        )
+else ()
+endif ()
+        
+set( TANTIVY_INCLUDE_DIR ${LIB_HEADER_FOLDER};${CMAKE_CURRENT_SOURCE_DIR} CACHE INTERNAL "Path to tantivy include directory" )

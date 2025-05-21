@@ -19,6 +19,7 @@ proxy:
     limits:
       cpu: "1"
 rootCoordinator:
+  enabled: false
   resources:
     requests:
       cpu: "0.2"
@@ -26,6 +27,7 @@ rootCoordinator:
     limits:
       cpu: "1"
 queryCoordinator:
+  enabled: false
   resources:
     requests:
       cpu: "0.2"
@@ -40,6 +42,7 @@ queryNode:
     limits:
       cpu: "2"
 indexCoordinator:
+  enabled: "false"
   resources:
     requests:
       cpu: "0.1"
@@ -47,6 +50,7 @@ indexCoordinator:
     limits:
       cpu: "1"
 indexNode:
+  enabled: "false"
   resources:
     requests:
       cpu: "0.5"
@@ -54,6 +58,7 @@ indexNode:
     limits:
       cpu: "2"
 dataCoordinator:
+  enabled: false
   resources:
     requests:
       cpu: "0.1"

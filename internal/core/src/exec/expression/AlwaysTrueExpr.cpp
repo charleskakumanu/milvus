@@ -21,20 +21,28 @@ namespace exec {
 
 void
 PhyAlwaysTrueExpr::Eval(EvalCtx& context, VectorPtr& result) {
-    int64_t real_batch_size = current_pos_ + batch_size_ >= active_count_
-                                  ? active_count_ - current_pos_
-                                  : batch_size_;
+    auto input = context.get_offset_input();
+    has_offset_input_ = (input != nullptr);
+    int64_t real_batch_size = (has_offset_input_)
+                                  ? input->size()
+                                  : (current_pos_ + batch_size_ >= active_count_
+                                         ? active_count_ - current_pos_
+                                         : batch_size_);
 
+    // always true no need to skip null
     if (real_batch_size == 0) {
         result = nullptr;
         return;
     }
 
     auto res_vec =
-        std::make_shared<ColumnVector>(TargetBitmap(real_batch_size));
+        std::make_shared<ColumnVector>(TargetBitmap(real_batch_size, false),
+                                       TargetBitmap(real_batch_size, true));
     TargetBitmapView res(res_vec->GetRawData(), real_batch_size);
+    TargetBitmapView valid_res(res_vec->GetValidRawData(), real_batch_size);
 
     res.set();
+    valid_res.set();
 
     result = res_vec;
     current_pos_ += real_batch_size;

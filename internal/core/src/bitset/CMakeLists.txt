@@ -13,6 +13,8 @@ set(BITSET_SRCS
     detail/platform/dynamic.cpp
 )
 
+
+
 if (${CMAKE_SYSTEM_PROCESSOR} STREQUAL "x86_64")
     list(APPEND BITSET_SRCS
         detail/platform/x86/avx2-inst.cpp
@@ -20,8 +22,8 @@ if (${CMAKE_SYSTEM_PROCESSOR} STREQUAL "x86_64")
         detail/platform/x86/instruction_set.cpp
     )
 
-    set_source_files_properties(detail/platform/x86/avx512-inst.cpp PROPERTIES COMPILE_FLAGS "-mavx512f -mavx512bw -mavx512vl -mavx512dq")
-    set_source_files_properties(detail/platform/x86/avx2-inst.cpp PROPERTIES COMPILE_FLAGS "-mavx2 -mavx -mfma")
+    set_source_files_properties(detail/platform/x86/avx512-inst.cpp PROPERTIES COMPILE_FLAGS "-mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512cd -mbmi")
+    set_source_files_properties(detail/platform/x86/avx2-inst.cpp PROPERTIES COMPILE_FLAGS "-mavx2 -mavx -mfma -mbmi")
 
     # set_source_files_properties(detail/platform/dynamic.cpp PROPERTIES COMPILE_FLAGS "-mavx512f -mavx512bw -mavx512vl -mavx512dq")
     # set_source_files_properties(detail/platform/dynamic.cpp PROPERTIES COMPILE_FLAGS "-mavx2 -mavx -mfma")
@@ -38,4 +40,4 @@ elseif (${CMAKE_SYSTEM_PROCESSOR} MATCHES "arm*")
     #set_source_files_properties(detail/platform/arm/sve-inst.cpp PROPERTIES COMPILE_FLAGS "-mcpu=neoverse-v1")
 endif()
 
-add_library(milvus_bitset ${BITSET_SRCS})
+add_library(milvus_bitset OBJECT ${BITSET_SRCS})

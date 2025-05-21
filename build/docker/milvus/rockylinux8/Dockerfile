@@ -13,6 +13,7 @@
 FROM rockylinux/rockylinux:8
 
 ARG TARGETARCH
+ARG MILVUS_ASAN_LIB
 
 RUN dnf install -y wget libgomp libaio libatomic
 
@@ -21,7 +22,12 @@ RUN dnf -y install dnf-plugins-core && \
     dnf config-manager --set-enabled powertools && \
     dnf -y install openblas-devel
 
-COPY ./bin/ /milvus/bin/
+# Add Tini
+RUN curl -L -o /tini https://github.com/krallin/tini/releases/download/v0.19.0/tini-$TARGETARCH && \
+    chmod +x /tini
+
+RUN mkdir -p /milvus/bin
+COPY ./bin/milvus /milvus/bin/milvus
 
 COPY ./configs/ /milvus/configs/
 
@@ -29,12 +35,9 @@ COPY ./lib/ /milvus/lib/
 
 ENV PATH=/milvus/bin:$PATH
 ENV LD_LIBRARY_PATH=/milvus/lib:$LD_LIBRARY_PATH:/usr/lib
-ENV LD_PRELOAD=/milvus/lib/libjemalloc.so
+ENV LD_PRELOAD=${MILVUS_ASAN_LIB}:/milvus/lib/libjemalloc.so
 ENV MALLOC_CONF=background_thread:true
 
-# Add Tini
-ADD https://github.com/krallin/tini/releases/download/v0.19.0/tini-$TARGETARCH /tini
-RUN chmod +x /tini
 ENTRYPOINT ["/tini", "--"]
 
 WORKDIR /milvus

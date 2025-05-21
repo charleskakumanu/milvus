@@ -34,6 +34,7 @@ var MetricFuncMap = map[string]getMetricFunc{
 	"$response_size":     getResponseSize,
 	"$error_code":        getErrorCode,
 	"$error_msg":         getErrorMsg,
+	"$error_type":        getErrorType,
 	"$database_name":     getDbName,
 	"$collection_name":   getCollectionName,
 	"$partition_name":    getPartitionName,
@@ -46,6 +47,10 @@ var MetricFuncMap = map[string]getMetricFunc{
 	"$sdk_version":       getSdkVersion,
 	"$cluster_prefix":    getClusterPrefix,
 	"$consistency_level": getConsistencyLevel,
+	"$anns_field":        getAnnsField,
+	"$nq":                getNq,
+	"$search_params":     getSearchParams,
+	"$query_params":      getQueryParams,
 }
 
 type AccessInfo interface {
@@ -61,13 +66,18 @@ type AccessInfo interface {
 	ResponseSize() string
 	ErrorCode() string
 	ErrorMsg() string
+	ErrorType() string
 	DbName() string
+	AnnsField() string
 	CollectionName() string
 	PartitionName() string
 	Expression() string
 	OutputFields() string
 	SdkVersion() string
 	ConsistencyLevel() string
+	NQ() string
+	SearchParams() string
+	QueryParams() string
 }
 
 func Get(i AccessInfo, keys ...string) []any {
@@ -115,6 +125,10 @@ func getErrorMsg(i AccessInfo) string {
 	return i.ErrorMsg()
 }
 
+func getErrorType(i AccessInfo) string {
+	return i.ErrorType()
+}
+
 func getDbName(i AccessInfo) string {
 	return i.DbName()
 }
@@ -159,6 +173,22 @@ func getConsistencyLevel(i AccessInfo) string {
 	return i.ConsistencyLevel()
 }
 
+func getAnnsField(i AccessInfo) string {
+	return i.AnnsField()
+}
+
 func getClusterPrefix(i AccessInfo) string {
 	return ClusterPrefix.Load()
+}
+
+func getNq(i AccessInfo) string {
+	return i.NQ()
+}
+
+func getSearchParams(i AccessInfo) string {
+	return i.SearchParams()
+}
+
+func getQueryParams(i AccessInfo) string {
+	return i.QueryParams()
 }

@@ -19,17 +19,18 @@ package ratelimitutil
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/proxypb"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/ratelimitutil"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/proxypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/ratelimitutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 func TestRateLimiterNode_AddAndGetChild(t *testing.T) {
@@ -130,7 +131,7 @@ func TestRateLimiterNodeGetQuotaExceededError(t *testing.T) {
 		err := limitNode.GetQuotaExceededError(internalpb.RateType_DMLInsert)
 		assert.True(t, errors.Is(err, merr.ErrServiceQuotaExceeded))
 		// reference: ratelimitutil.GetQuotaErrorString(errCode)
-		assert.True(t, strings.Contains(err.Error(), "deactivated"))
+		assert.True(t, strings.Contains(err.Error(), "disabled"))
 	})
 
 	t.Run("read", func(t *testing.T) {
@@ -139,7 +140,16 @@ func TestRateLimiterNodeGetQuotaExceededError(t *testing.T) {
 		err := limitNode.GetQuotaExceededError(internalpb.RateType_DQLSearch)
 		assert.True(t, errors.Is(err, merr.ErrServiceQuotaExceeded))
 		// reference: ratelimitutil.GetQuotaErrorString(errCode)
-		assert.True(t, strings.Contains(err.Error(), "deactivated"))
+		assert.True(t, strings.Contains(err.Error(), "disabled"))
+	})
+
+	t.Run("ddl", func(t *testing.T) {
+		limitNode := NewRateLimiterNode(internalpb.RateScope_Database)
+		limitNode.quotaStates.Insert(milvuspb.QuotaState_DenyToDDL, commonpb.ErrorCode_ForceDeny)
+		err := limitNode.GetQuotaExceededError(internalpb.RateType_DDLCollection)
+		assert.True(t, errors.Is(err, merr.ErrServiceQuotaExceeded))
+		// reference: ratelimitutil.GetQuotaErrorString(errCode)
+		assert.True(t, strings.Contains(err.Error(), "disabled"))
 	})
 
 	t.Run("unknown", func(t *testing.T) {
@@ -153,6 +163,7 @@ func TestRateLimiterNodeGetQuotaExceededError(t *testing.T) {
 func TestRateLimiterTreeClearInvalidLimiterNode(t *testing.T) {
 	root := NewRateLimiterNode(internalpb.RateScope_Cluster)
 	tree := NewRateLimiterTree(root)
+	tree.lastClearTime = time.Now().Add(-1 * clearInvalidNodeInterval * 2)
 
 	generateNodeFFunc := func(level internalpb.RateScope) func() *RateLimiterNode {
 		return func() *RateLimiterNode {

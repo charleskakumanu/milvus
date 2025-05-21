@@ -27,45 +27,48 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/milvus-io/milvus/pkg/mq/common"
-	client3 "github.com/milvus-io/milvus/pkg/mq/mqimpl/rocksmq/client"
-	server2 "github.com/milvus-io/milvus/pkg/mq/mqimpl/rocksmq/server"
-	"github.com/milvus-io/milvus/pkg/mq/msgstream/mqwrapper"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/mq/common"
+	client3 "github.com/milvus-io/milvus/pkg/v2/mq/mqimpl/rocksmq/client"
+	server2 "github.com/milvus-io/milvus/pkg/v2/mq/mqimpl/rocksmq/server"
+	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream/mqwrapper"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 func TestMain(m *testing.M) {
-	paramtable.Init()
-	pt := paramtable.Get()
-	pt.Save(pt.ServiceParam.MQCfg.EnablePursuitMode.Key, "false")
+	exitCode := func() int {
+		paramtable.Init()
+		pt := paramtable.Get()
+		pt.Save(pt.ServiceParam.MQCfg.EnablePursuitMode.Key, "false")
 
-	rand.Seed(time.Now().UnixNano())
-	path := "/tmp/milvus/rdb_data"
-	defer os.RemoveAll(path)
-	paramtable.Get().Save("rocksmq.compressionTypes", "0,0,0,0,0")
-	_ = server2.InitRocksMQ(path)
-	exitCode := m.Run()
-	defer server2.CloseRocksMQ()
+		rand.Seed(time.Now().UnixNano())
+		path := "/tmp/milvus/rdb_data"
+		defer os.RemoveAll(path)
+		paramtable.Get().Save("rocksmq.compressionTypes", "0,0,0,0,0")
+		_ = server2.InitRocksMQ(path)
+		defer server2.CloseRocksMQ()
+		return m.Run()
+	}()
+
 	os.Exit(exitCode)
 }
 
 func Test_NewRmqClient(t *testing.T) {
 	client, err := createRmqClient()
-	defer client.Close()
 	assert.NoError(t, err)
 	assert.NotNil(t, client)
+	client.Close()
 }
 
 func TestRmqClient_CreateProducer(t *testing.T) {
 	opts := client3.Options{}
 	client, err := NewClient(opts)
-	defer client.Close()
 	assert.NoError(t, err)
 	assert.NotNil(t, client)
+	defer client.Close()
 
 	topic := "TestRmqClient_CreateProducer"
 	proOpts := common.ProducerOptions{Topic: topic}
-	producer, err := client.CreateProducer(proOpts)
+	producer, err := client.CreateProducer(context.TODO(), proOpts)
 	assert.NoError(t, err)
 	assert.NotNil(t, producer)
 
@@ -83,7 +86,7 @@ func TestRmqClient_CreateProducer(t *testing.T) {
 	assert.NoError(t, err)
 
 	invalidOpts := common.ProducerOptions{Topic: ""}
-	producer, e := client.CreateProducer(invalidOpts)
+	producer, e := client.CreateProducer(context.TODO(), invalidOpts)
 	assert.Nil(t, producer)
 	assert.Error(t, e)
 }
@@ -95,7 +98,7 @@ func TestRmqClient_GetLatestMsg(t *testing.T) {
 
 	topic := fmt.Sprintf("t2GetLatestMsg-%d", rand.Int())
 	proOpts := common.ProducerOptions{Topic: topic}
-	producer, err := client.CreateProducer(proOpts)
+	producer, err := client.CreateProducer(context.TODO(), proOpts)
 	assert.NoError(t, err)
 	defer producer.Close()
 
@@ -116,7 +119,7 @@ func TestRmqClient_GetLatestMsg(t *testing.T) {
 		BufSize:                     1024,
 	}
 
-	consumer, err := client.Subscribe(consumerOpts)
+	consumer, err := client.Subscribe(context.TODO(), consumerOpts)
 	assert.NoError(t, err)
 
 	expectLastMsg, err := consumer.GetLatestMsgID()
@@ -143,13 +146,13 @@ func TestRmqClient_GetLatestMsg(t *testing.T) {
 
 func TestRmqClient_Subscribe(t *testing.T) {
 	client, err := createRmqClient()
-	defer client.Close()
 	assert.NoError(t, err)
 	assert.NotNil(t, client)
+	defer client.Close()
 
 	topic := "TestRmqClient_Subscribe"
 	proOpts := common.ProducerOptions{Topic: topic}
-	producer, err := client.CreateProducer(proOpts)
+	producer, err := client.CreateProducer(context.TODO(), proOpts)
 	assert.NoError(t, err)
 	assert.NotNil(t, producer)
 	defer producer.Close()
@@ -161,7 +164,7 @@ func TestRmqClient_Subscribe(t *testing.T) {
 		SubscriptionInitialPosition: common.SubscriptionPositionEarliest,
 		BufSize:                     0,
 	}
-	consumer, err := client.Subscribe(consumerOpts)
+	consumer, err := client.Subscribe(context.TODO(), consumerOpts)
 	assert.Error(t, err)
 	assert.Nil(t, consumer)
 
@@ -172,15 +175,15 @@ func TestRmqClient_Subscribe(t *testing.T) {
 		BufSize:                     1024,
 	}
 
-	consumer, err = client.Subscribe(consumerOpts)
+	consumer, err = client.Subscribe(context.TODO(), consumerOpts)
 	assert.Error(t, err)
 	assert.Nil(t, consumer)
 
 	consumerOpts.Topic = topic
-	consumer, err = client.Subscribe(consumerOpts)
-	defer consumer.Close()
+	consumer, err = client.Subscribe(context.TODO(), consumerOpts)
 	assert.NoError(t, err)
 	assert.NotNil(t, consumer)
+	defer consumer.Close()
 	assert.Equal(t, consumer.Subscription(), subName)
 
 	msg := &common.ProducerMessage{

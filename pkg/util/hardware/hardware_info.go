@@ -17,13 +17,16 @@ import (
 	"runtime"
 	"sync"
 
+	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/errors/oserror"
 	"github.com/shirou/gopsutil/v3/cpu"
+	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/mem"
 	"go.uber.org/automaxprocs/maxprocs"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 var (
@@ -102,16 +105,31 @@ func GetFreeMemoryCount() uint64 {
 	return GetMemoryCount() - GetUsedMemoryCount()
 }
 
-// TODO(dragondriver): not accurate to calculate disk usage when we use distributed storage
-
-// GetDiskCount returns the disk count in bytes.
-func GetDiskCount() uint64 {
-	return 100 * 1024 * 1024
+// GetDiskUsage Get Disk Usage in GB
+func GetDiskUsage(path string) (float64, float64, error) {
+	diskStats, err := disk.Usage(path)
+	if err != nil {
+		// If the path does not exist, ignore the error and return 0.
+		if errors.Is(err, oserror.ErrNotExist) {
+			return 0, 0, nil
+		}
+		return 0, 0, err
+	}
+	usedGB := float64(diskStats.Used) / 1e9
+	totalGB := float64(diskStats.Total) / 1e9
+	return usedGB, totalGB, nil
 }
 
-// GetDiskUsage returns the disk usage in bytes.
-func GetDiskUsage() uint64 {
-	return 2 * 1024 * 1024
+// GetIOWait Get IO Wait Percentage
+func GetIOWait() (float64, error) {
+	cpuTimes, err := cpu.Times(false)
+	if err != nil {
+		return 0, err
+	}
+	if len(cpuTimes) > 0 {
+		return cpuTimes[0].Iowait, nil
+	}
+	return 0, nil
 }
 
 func GetMemoryUseRatio() float64 {

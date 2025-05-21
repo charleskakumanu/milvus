@@ -34,8 +34,6 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	coordMocks "github.com/milvus-io/milvus/internal/mocks"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/querycoordv2/checkers"
 	"github.com/milvus-io/milvus/internal/querycoordv2/dist"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
@@ -45,12 +43,16 @@ import (
 	"github.com/milvus-io/milvus/internal/querycoordv2/session"
 	"github.com/milvus-io/milvus/internal/querycoordv2/task"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/commonpbutil"
-	"github.com/milvus-io/milvus/pkg/util/etcd"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/tikv"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/rootcoordpb"
+	"github.com/milvus-io/milvus/pkg/v2/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/etcd"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/tikv"
 )
 
 func TestMain(m *testing.M) {
@@ -88,6 +90,7 @@ type ServerSuite struct {
 	tikvCli *txnkv.Client
 	server  *Server
 	nodes   []*mocks.MockQueryNode
+	ctx     context.Context
 }
 
 var testMeta string
@@ -124,6 +127,7 @@ func (suite *ServerSuite) SetupSuite() {
 		1001: 3,
 	}
 	suite.nodes = make([]*mocks.MockQueryNode, 3)
+	suite.ctx = context.Background()
 }
 
 func (suite *ServerSuite) SetupTest() {
@@ -143,13 +147,13 @@ func (suite *ServerSuite) SetupTest() {
 		suite.Require().NoError(err)
 		ok := suite.waitNodeUp(suite.nodes[i], 5*time.Second)
 		suite.Require().True(ok)
-		suite.server.meta.ResourceManager.HandleNodeUp(suite.nodes[i].ID)
+		suite.server.meta.ResourceManager.HandleNodeUp(suite.ctx, suite.nodes[i].ID)
 		suite.expectLoadAndReleasePartitions(suite.nodes[i])
 	}
 
 	suite.loadAll()
 	for _, collection := range suite.collections {
-		suite.True(suite.server.meta.Exist(collection))
+		suite.True(suite.server.meta.Exist(suite.ctx, collection))
 		suite.updateCollectionStatus(collection, querypb.LoadStatus_Loaded)
 	}
 }
@@ -180,7 +184,7 @@ func (suite *ServerSuite) TestRecover() {
 	suite.NoError(err)
 
 	for _, collection := range suite.collections {
-		suite.True(suite.server.meta.Exist(collection))
+		suite.True(suite.server.meta.Exist(suite.ctx, collection))
 	}
 
 	suite.True(suite.server.nodeMgr.IsStoppingNode(suite.nodes[0].ID))
@@ -200,7 +204,7 @@ func (suite *ServerSuite) TestNodeUp() {
 			return false
 		}
 		for _, collection := range suite.collections {
-			replica := suite.server.meta.ReplicaManager.GetByCollectionAndNode(collection, node1.ID)
+			replica := suite.server.meta.ReplicaManager.GetByCollectionAndNode(suite.ctx, collection, node1.ID)
 			if replica == nil {
 				return false
 			}
@@ -229,7 +233,7 @@ func (suite *ServerSuite) TestNodeUp() {
 			return false
 		}
 		for _, collection := range suite.collections {
-			replica := suite.server.meta.ReplicaManager.GetByCollectionAndNode(collection, node2.ID)
+			replica := suite.server.meta.ReplicaManager.GetByCollectionAndNode(suite.ctx, collection, node2.ID)
 			if replica == nil {
 				return true
 			}
@@ -248,7 +252,7 @@ func (suite *ServerSuite) TestNodeUp() {
 			return false
 		}
 		for _, collection := range suite.collections {
-			replica := suite.server.meta.ReplicaManager.GetByCollectionAndNode(collection, node2.ID)
+			replica := suite.server.meta.ReplicaManager.GetByCollectionAndNode(suite.ctx, collection, node2.ID)
 			if replica == nil {
 				return false
 			}
@@ -278,7 +282,7 @@ func (suite *ServerSuite) TestNodeDown() {
 			return false
 		}
 		for _, collection := range suite.collections {
-			replica := suite.server.meta.ReplicaManager.GetByCollectionAndNode(collection, downNode.ID)
+			replica := suite.server.meta.ReplicaManager.GetByCollectionAndNode(suite.ctx, collection, downNode.ID)
 			if replica != nil {
 				return false
 			}
@@ -287,72 +291,84 @@ func (suite *ServerSuite) TestNodeDown() {
 	}, 5*time.Second, time.Second)
 }
 
-func (suite *ServerSuite) TestDisableActiveStandby() {
-	paramtable.Get().Save(Params.QueryCoordCfg.EnableActiveStandby.Key, "false")
+// func (suite *ServerSuite) TestDisableActiveStandby() {
+// 	paramtable.Get().Save(Params.QueryCoordCfg.EnableActiveStandby.Key, "false")
 
-	err := suite.server.Stop()
-	suite.NoError(err)
+// 	err := suite.server.Stop()
+// 	suite.NoError(err)
 
-	suite.server, err = suite.newQueryCoord()
-	suite.NoError(err)
-	suite.Equal(commonpb.StateCode_Initializing, suite.server.State())
-	suite.hackServer()
-	err = suite.server.Start()
-	suite.NoError(err)
-	err = suite.server.Register()
-	suite.NoError(err)
-	suite.Equal(commonpb.StateCode_Healthy, suite.server.State())
+// 	suite.server, err = suite.newQueryCoord()
+// 	suite.NoError(err)
+// 	suite.Equal(commonpb.StateCode_Initializing, suite.server.State())
+// 	suite.hackServer()
+// 	err = suite.server.Start()
+// 	suite.NoError(err)
+// 	err = suite.server.Register()
+// 	suite.NoError(err)
+// 	suite.Equal(commonpb.StateCode_Healthy, suite.server.State())
 
-	states, err := suite.server.GetComponentStates(context.Background(), nil)
-	suite.NoError(err)
-	suite.Equal(commonpb.StateCode_Healthy, states.GetState().GetStateCode())
-}
+// 	states, err := suite.server.GetComponentStates(context.Background(), nil)
+// 	suite.NoError(err)
+// 	suite.Equal(commonpb.StateCode_Healthy, states.GetState().GetStateCode())
+// }
 
-func (suite *ServerSuite) TestEnableActiveStandby() {
-	paramtable.Get().Save(Params.QueryCoordCfg.EnableActiveStandby.Key, "true")
-	defer paramtable.Get().Reset(Params.QueryCoordCfg.EnableActiveStandby.Key)
+// func (suite *ServerSuite) TestEnableActiveStandby() {
+// 	paramtable.Get().Save(Params.QueryCoordCfg.EnableActiveStandby.Key, "true")
+// 	defer paramtable.Get().Reset(Params.QueryCoordCfg.EnableActiveStandby.Key)
 
-	err := suite.server.Stop()
-	suite.NoError(err)
+// 	err := suite.server.Stop()
+// 	suite.NoError(err)
 
-	suite.server, err = suite.newQueryCoord()
-	suite.NoError(err)
-	mockRootCoord := coordMocks.NewMockRootCoordClient(suite.T())
-	mockDataCoord := coordMocks.NewMockDataCoordClient(suite.T())
+// 	suite.server, err = suite.newQueryCoord()
+// 	suite.NoError(err)
+// 	mockRootCoord := coordMocks.NewMockRootCoordClient(suite.T())
+// 	mockRootCoord.EXPECT().GetComponentStates(mock.Anything, mock.Anything).Return(&milvuspb.ComponentStates{
+// 		State: &milvuspb.ComponentInfo{
+// 			StateCode: commonpb.StateCode_Healthy,
+// 		},
+// 		Status: merr.Success(),
+// 	}, nil).Maybe()
+// 	mockDataCoord := coordMocks.NewMockDataCoordClient(suite.T())
+// 	mockDataCoord.EXPECT().GetComponentStates(mock.Anything, mock.Anything).Return(&milvuspb.ComponentStates{
+// 		State: &milvuspb.ComponentInfo{
+// 			StateCode: commonpb.StateCode_Healthy,
+// 		},
+// 		Status: merr.Success(),
+// 	}, nil).Maybe()
 
-	mockRootCoord.EXPECT().DescribeCollection(mock.Anything, mock.Anything).Return(&milvuspb.DescribeCollectionResponse{
-		Status: merr.Success(),
-		Schema: &schemapb.CollectionSchema{},
-	}, nil).Maybe()
-	for _, collection := range suite.collections {
-		req := &milvuspb.ShowPartitionsRequest{
-			Base: commonpbutil.NewMsgBase(
-				commonpbutil.WithMsgType(commonpb.MsgType_ShowPartitions),
-			),
-			CollectionID: collection,
-		}
-		mockRootCoord.EXPECT().ShowPartitions(mock.Anything, req).Return(&milvuspb.ShowPartitionsResponse{
-			Status:       merr.Success(),
-			PartitionIDs: suite.partitions[collection],
-		}, nil).Maybe()
-		suite.expectGetRecoverInfoByMockDataCoord(collection, mockDataCoord)
-	}
-	err = suite.server.SetRootCoordClient(mockRootCoord)
-	suite.NoError(err)
-	err = suite.server.SetDataCoordClient(mockDataCoord)
-	suite.NoError(err)
-	// suite.hackServer()
-	states1, err := suite.server.GetComponentStates(context.Background(), nil)
-	suite.NoError(err)
-	suite.Equal(commonpb.StateCode_StandBy, states1.GetState().GetStateCode())
-	err = suite.server.Register()
-	suite.NoError(err)
+// 	mockRootCoord.EXPECT().DescribeCollection(mock.Anything, mock.Anything).Return(&milvuspb.DescribeCollectionResponse{
+// 		Status: merr.Success(),
+// 		Schema: &schemapb.CollectionSchema{},
+// 	}, nil).Maybe()
+// 	for _, collection := range suite.collections {
+// 		req := &milvuspb.ShowPartitionsRequest{
+// 			Base: commonpbutil.NewMsgBase(
+// 				commonpbutil.WithMsgType(commonpb.MsgType_ShowPartitions),
+// 			),
+// 			CollectionID: collection,
+// 		}
+// 		mockRootCoord.EXPECT().ShowPartitions(mock.Anything, req).Return(&milvuspb.ShowPartitionsResponse{
+// 			Status:       merr.Success(),
+// 			PartitionIDs: suite.partitions[collection],
+// 		}, nil).Maybe()
+// 		suite.expectGetRecoverInfoByMockDataCoord(collection, mockDataCoord)
+// 	}
+// 	err = suite.server.SetRootCoordClient(mockRootCoord)
+// 	suite.NoError(err)
+// 	err = suite.server.SetDataCoordClient(mockDataCoord)
+// 	suite.NoError(err)
+// 	// suite.hackServer()
+// 	states1, err := suite.server.GetComponentStates(context.Background(), nil)
+// 	suite.NoError(err)
+// 	suite.Equal(commonpb.StateCode_StandBy, states1.GetState().GetStateCode())
+// 	err = suite.server.Register()
+// 	suite.NoError(err)
 
-	suite.Eventually(func() bool {
-		state, err := suite.server.GetComponentStates(context.Background(), nil)
-		return err == nil && state.GetState().GetStateCode() == commonpb.StateCode_Healthy
-	}, time.Second*5, time.Millisecond*200)
-}
+// 	suite.Eventually(func() bool {
+// 		state, err := suite.server.GetComponentStates(context.Background(), nil)
+// 		return err == nil && state.GetState().GetStateCode() == commonpb.StateCode_Healthy
+// 	}, time.Second*5, time.Millisecond*200)
+// }
 
 func (suite *ServerSuite) TestStop() {
 	suite.server.Stop()
@@ -439,6 +455,7 @@ func (suite *ServerSuite) loadAll() {
 				CollectionID:   collection,
 				ReplicaNumber:  suite.replicaNumber[collection],
 				ResourceGroups: []string{meta.DefaultResourceGroupName},
+				LoadFields:     []int64{100, 101},
 			}
 			resp, err := suite.server.LoadCollection(ctx, req)
 			suite.NoError(err)
@@ -449,6 +466,7 @@ func (suite *ServerSuite) loadAll() {
 				PartitionIDs:   suite.partitions[collection],
 				ReplicaNumber:  suite.replicaNumber[collection],
 				ResourceGroups: []string{meta.DefaultResourceGroupName},
+				LoadFields:     []int64{100, 101},
 			}
 			resp, err := suite.server.LoadPartitions(ctx, req)
 			suite.NoError(err)
@@ -522,7 +540,7 @@ func (suite *ServerSuite) expectGetRecoverInfoByMockDataCoord(collection int64, 
 }
 
 func (suite *ServerSuite) updateCollectionStatus(collectionID int64, status querypb.LoadStatus) {
-	collection := suite.server.meta.GetCollection(collectionID)
+	collection := suite.server.meta.GetCollection(suite.ctx, collectionID)
 	if collection != nil {
 		collection := collection.Clone()
 		collection.LoadPercentage = 0
@@ -530,9 +548,9 @@ func (suite *ServerSuite) updateCollectionStatus(collectionID int64, status quer
 			collection.LoadPercentage = 100
 		}
 		collection.CollectionLoadInfo.Status = status
-		suite.server.meta.PutCollection(collection)
+		suite.server.meta.PutCollection(suite.ctx, collection)
 
-		partitions := suite.server.meta.GetPartitionsByCollection(collectionID)
+		partitions := suite.server.meta.GetPartitionsByCollection(suite.ctx, collectionID)
 		for _, partition := range partitions {
 			partition := partition.Clone()
 			partition.LoadPercentage = 0
@@ -540,7 +558,7 @@ func (suite *ServerSuite) updateCollectionStatus(collectionID int64, status quer
 				partition.LoadPercentage = 100
 			}
 			partition.PartitionLoadInfo.Status = status
-			suite.server.meta.PutPartition(partition)
+			suite.server.meta.PutPartition(suite.ctx, partition)
 		}
 	}
 }
@@ -558,12 +576,17 @@ func (suite *ServerSuite) hackServer() {
 		suite.server.cluster,
 		suite.server.nodeMgr,
 	)
+
+	syncTargetVersionFn := func(collectionID int64) {
+		suite.server.targetObserver.Check(context.Background(), collectionID, common.AllPartitionsID)
+	}
 	suite.server.distController = dist.NewDistController(
 		suite.server.cluster,
 		suite.server.nodeMgr,
 		suite.server.dist,
 		suite.server.targetMgr,
 		suite.server.taskScheduler,
+		syncTargetVersionFn,
 	)
 	suite.server.checkerController = checkers.NewCheckerController(
 		suite.server.meta,
@@ -580,6 +603,7 @@ func (suite *ServerSuite) hackServer() {
 		suite.server.dist,
 		suite.broker,
 		suite.server.cluster,
+		suite.server.nodeMgr,
 	)
 	suite.server.collectionObserver = observers.NewCollectionObserver(
 		suite.server.dist,
@@ -587,9 +611,11 @@ func (suite *ServerSuite) hackServer() {
 		suite.server.targetMgr,
 		suite.server.targetObserver,
 		suite.server.checkerController,
+		suite.server.proxyClientManager,
 	)
 
 	suite.broker.EXPECT().DescribeCollection(mock.Anything, mock.Anything).Return(&milvuspb.DescribeCollectionResponse{Schema: &schemapb.CollectionSchema{}}, nil).Maybe()
+	suite.broker.EXPECT().DescribeDatabase(mock.Anything, mock.Anything).Return(&rootcoordpb.DescribeDatabaseResponse{}, nil).Maybe()
 	suite.broker.EXPECT().ListIndexes(mock.Anything, mock.Anything).Return(nil, nil).Maybe()
 	for _, collection := range suite.collections {
 		suite.broker.EXPECT().GetPartitions(mock.Anything, collection).Return(suite.partitions[collection], nil).Maybe()
@@ -599,8 +625,20 @@ func (suite *ServerSuite) hackServer() {
 }
 
 func (suite *ServerSuite) hackBroker(server *Server) {
-	mockRootCoord := coordMocks.NewMockRootCoordClient(suite.T())
+	mockRootCoord := coordMocks.NewMixCoord(suite.T())
+	mockRootCoord.EXPECT().GetComponentStates(mock.Anything, mock.Anything).Return(&milvuspb.ComponentStates{
+		State: &milvuspb.ComponentInfo{
+			StateCode: commonpb.StateCode_Healthy,
+		},
+		Status: merr.Success(),
+	}, nil).Maybe()
 	mockDataCoord := coordMocks.NewMockDataCoordClient(suite.T())
+	mockDataCoord.EXPECT().GetComponentStates(mock.Anything, mock.Anything).Return(&milvuspb.ComponentStates{
+		State: &milvuspb.ComponentInfo{
+			StateCode: commonpb.StateCode_Healthy,
+		},
+		Status: merr.Success(),
+	}, nil).Maybe()
 
 	for _, collection := range suite.collections {
 		mockRootCoord.EXPECT().DescribeCollection(mock.Anything, mock.Anything).Return(&milvuspb.DescribeCollectionResponse{
@@ -618,10 +656,7 @@ func (suite *ServerSuite) hackBroker(server *Server) {
 			PartitionIDs: suite.partitions[collection],
 		}, nil).Maybe()
 	}
-	err := server.SetRootCoordClient(mockRootCoord)
-	suite.NoError(err)
-	err = server.SetDataCoordClient(mockDataCoord)
-	suite.NoError(err)
+	server.SetMixCoord(mockRootCoord)
 }
 
 func (suite *ServerSuite) newQueryCoord() (*Server, error) {

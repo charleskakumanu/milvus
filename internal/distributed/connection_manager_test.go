@@ -31,15 +31,15 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/indexpb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
-	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/etcd"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/rootcoordpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/workerpb"
+	"github.com/milvus-io/milvus/pkg/v2/util/etcd"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 func TestMain(t *testing.M) {
@@ -168,7 +168,7 @@ func TestConnectionManager(t *testing.T) {
 		indexNode := &testIndexNode{}
 		grpcServer := grpc.NewServer()
 		defer grpcServer.Stop()
-		indexpb.RegisterIndexNodeServer(grpcServer, indexNode)
+		workerpb.RegisterIndexNodeServer(grpcServer, indexNode)
 		go grpcServer.Serve(lis)
 		session.Init(typeutil.IndexNodeRole, lis.Addr().String(), true, false)
 		session.Register()
@@ -266,7 +266,7 @@ type testDataNode struct {
 }
 
 type testIndexNode struct {
-	indexpb.IndexNodeServer
+	workerpb.IndexNodeServer
 }
 
 func initSession(ctx context.Context) *sessionutil.Session {
@@ -284,8 +284,8 @@ func initSession(ctx context.Context) *sessionutil.Session {
 	endpoints := baseTable.GetWithDefault("etcd.endpoints", paramtable.DefaultEtcdEndpoints)
 	etcdEndpoints := strings.Split(endpoints, ",")
 
-	log.Debug("metaRootPath", zap.Any("metaRootPath", metaRootPath))
-	log.Debug("etcdPoints", zap.Any("etcdPoints", etcdEndpoints))
+	log.Ctx(context.TODO()).Debug("metaRootPath", zap.Any("metaRootPath", metaRootPath))
+	log.Ctx(context.TODO()).Debug("etcdPoints", zap.Any("etcdPoints", etcdEndpoints))
 
 	etcdCli, err := etcd.GetRemoteEtcdClient(etcdEndpoints)
 	if err != nil {

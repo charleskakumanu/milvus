@@ -22,19 +22,21 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/metrics"
-	"github.com/milvus-io/milvus/pkg/mq/msgstream"
-	"github.com/milvus-io/milvus/pkg/util/commonpbutil"
-	"github.com/milvus-io/milvus/pkg/util/timerecord"
-	"github.com/milvus-io/milvus/pkg/util/tsoutil"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/internal/util/streamingutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/metrics"
+	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v2/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/timerecord"
+	"github.com/milvus-io/milvus/pkg/v2/util/tsoutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 var (
@@ -112,22 +114,22 @@ func (c *chanTsMsg) getTimetick(channelName string) typeutil.Timestamp {
 	return c.defaultTs
 }
 
-func newTimeTickSync(ctx context.Context, sourceID int64, factory msgstream.Factory, chanMap map[typeutil.UniqueID][]string) *timetickSync {
+func newTimeTickSync(initCtx context.Context, parentLoopCtx context.Context, sourceID int64, factory msgstream.Factory, chanMap map[typeutil.UniqueID][]string) *timetickSync {
 	// if the old channels number used by the user is greater than the set default value currently
 	// keep the old channels
 	chanNum := getNeedChanNum(Params.RootCoordCfg.DmlChannelNum.GetAsInt(), chanMap)
 
 	// initialize dml channels used for insert
-	dmlChannels := newDmlChannels(ctx, factory, Params.CommonCfg.RootCoordDml.GetValue(), int64(chanNum))
+	dmlChannels := newDmlChannels(initCtx, factory, Params.CommonCfg.RootCoordDml.GetValue(), int64(chanNum))
 
 	// recover physical channels for all collections
 	for collID, chanNames := range chanMap {
 		dmlChannels.addChannels(chanNames...)
-		log.Info("recover physical channels", zap.Int64("collectionID", collID), zap.Strings("physical channels", chanNames))
+		log.Ctx(initCtx).Info("recover physical channels", zap.Int64("collectionID", collID), zap.Strings("physical channels", chanNames))
 	}
 
 	return &timetickSync{
-		ctx:      ctx,
+		ctx:      parentLoopCtx,
 		sourceID: sourceID,
 
 		dmlChannels: dmlChannels,
@@ -199,7 +201,7 @@ func (t *timetickSync) updateTimeTick(in *internalpb.ChannelTimeTickMsg, reason 
 		return nil
 	}
 	if len(in.Timestamps) != len(in.ChannelNames) {
-		return fmt.Errorf("invalid TimeTickMsg, timestamp and channelname size mismatch")
+		return errors.New("invalid TimeTickMsg, timestamp and channelname size mismatch")
 	}
 
 	prev, ok := t.sess2ChanTsMap[in.Base.SourceID]
@@ -319,6 +321,9 @@ func (t *timetickSync) startWatch(wg *sync.WaitGroup) {
 
 // SendTimeTickToChannel send each channel's min timetick to msg stream
 func (t *timetickSync) sendTimeTickToChannel(chanNames []string, ts typeutil.Timestamp) error {
+	if streamingutil.IsStreamingServiceEnabled() {
+		return nil
+	}
 	func() {
 		sub := tsoutil.SubByNow(ts)
 		for _, chanName := range chanNames {
@@ -327,20 +332,20 @@ func (t *timetickSync) sendTimeTickToChannel(chanNames []string, ts typeutil.Tim
 	}()
 
 	msgPack := msgstream.MsgPack{}
-	timeTickResult := msgpb.TimeTickMsg{
-		Base: commonpbutil.NewMsgBase(
-			commonpbutil.WithMsgType(commonpb.MsgType_TimeTick),
-			commonpbutil.WithTimeStamp(ts),
-			commonpbutil.WithSourceID(t.sourceID),
-		),
-	}
+
 	timeTickMsg := &msgstream.TimeTickMsg{
 		BaseMsg: msgstream.BaseMsg{
 			BeginTimestamp: ts,
 			EndTimestamp:   ts,
 			HashValues:     []uint32{0},
 		},
-		TimeTickMsg: timeTickResult,
+		TimeTickMsg: &msgpb.TimeTickMsg{
+			Base: commonpbutil.NewMsgBase(
+				commonpbutil.WithMsgType(commonpb.MsgType_TimeTick),
+				commonpbutil.WithTimeStamp(ts),
+				commonpbutil.WithSourceID(t.sourceID),
+			),
+		},
 	}
 	msgPack.Msgs = append(msgPack.Msgs, timeTickMsg)
 	if err := t.dmlChannels.broadcast(chanNames, &msgPack); err != nil {

@@ -17,10 +17,16 @@
 package importv2
 
 import (
+	"context"
+	"runtime"
 	"sync"
 
-	"github.com/milvus-io/milvus/pkg/util/conc"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus/pkg/v2/config"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/conc"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 var (
@@ -29,10 +35,32 @@ var (
 )
 
 func initExecPool() {
+	pt := paramtable.Get()
+	initPoolSize := paramtable.Get().DataNodeCfg.MaxConcurrentImportTaskNum.GetAsInt()
 	execPool = conc.NewPool[any](
-		paramtable.Get().DataNodeCfg.MaxConcurrentImportTaskNum.GetAsInt(),
-		conc.WithPreAlloc(true),
+		initPoolSize,
+		conc.WithPreAlloc(false), // pre alloc must be false to resize pool dynamically, use warmup to alloc worker here
+		conc.WithDisablePurge(true),
 	)
+	conc.WarmupPool(execPool, runtime.LockOSThread)
+
+	watchKey := pt.DataNodeCfg.MaxConcurrentImportTaskNum.Key
+	pt.Watch(watchKey, config.NewHandler(watchKey, resizeExecPool))
+	log.Info("init import execution pool done", zap.Int("size", initPoolSize))
+}
+
+func resizeExecPool(evt *config.Event) {
+	if evt.HasUpdated {
+		newSize := paramtable.Get().DataNodeCfg.MaxConcurrentImportTaskNum.GetAsInt()
+		log := log.Ctx(context.Background()).With(zap.Int("newSize", newSize))
+
+		err := GetExecPool().Resize(newSize)
+		if err != nil {
+			log.Warn("failed to resize pool", zap.Error(err))
+			return
+		}
+		log.Info("pool resize successfully")
+	}
 }
 
 func GetExecPool() *conc.Pool[any] {

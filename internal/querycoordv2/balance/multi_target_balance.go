@@ -1,6 +1,8 @@
 package balance
 
 import (
+	"context"
+	"fmt"
 	"math"
 	"math/rand"
 	"sort"
@@ -9,14 +11,14 @@ import (
 	"github.com/samber/lo"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	"github.com/milvus-io/milvus/internal/querycoordv2/params"
 	"github.com/milvus-io/milvus/internal/querycoordv2/session"
 	"github.com/milvus-io/milvus/internal/querycoordv2/task"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/internal/util/streamingutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 func init() {
@@ -270,6 +272,9 @@ func (g *rowCountBasedPlanGenerator) generatePlans() []SegmentAssignPlan {
 			})
 		}
 		maxNode, minNode := nodesWithRowCount[len(nodesWithRowCount)-1], nodesWithRowCount[0]
+		if len(maxNode.segments) == 0 {
+			break
+		}
 		segment := maxNode.segments[rand.Intn(len(maxNode.segments))]
 		plan := SegmentAssignPlan{
 			Segment: segment,
@@ -347,6 +352,9 @@ func (g *segmentCountBasedPlanGenerator) generatePlans() []SegmentAssignPlan {
 			})
 		}
 		maxNode, minNode := nodesWithSegmentCount[len(nodesWithSegmentCount)-1], nodesWithSegmentCount[0]
+		if len(maxNode.segments) == 0 {
+			break
+		}
 		segment := maxNode.segments[rand.Intn(len(maxNode.segments))]
 		plan := SegmentAssignPlan{
 			Segment: segment,
@@ -400,6 +408,9 @@ func newRandomPlanGenerator(maxSteps int) *randomPlanGenerator {
 func (g *randomPlanGenerator) generatePlans() []SegmentAssignPlan {
 	g.currClusterCost = g.calClusterCost(g.replicaNodeSegments, g.globalNodeSegments)
 	nodes := lo.Keys(g.replicaNodeSegments)
+	if len(nodes) == 0 {
+		return g.plans
+	}
 	for i := 0; i < g.maxSteps; i++ {
 		// random select two nodes and two segments
 		node1 := nodes[rand.Intn(len(nodes))]
@@ -409,6 +420,9 @@ func (g *randomPlanGenerator) generatePlans() []SegmentAssignPlan {
 		}
 		segments1 := g.replicaNodeSegments[node1]
 		segments2 := g.replicaNodeSegments[node2]
+		if len(segments1) == 0 || len(segments2) == 0 {
+			continue
+		}
 		segment1 := segments1[rand.Intn(len(segments1))]
 		segment2 := segments2[rand.Intn(len(segments2))]
 
@@ -453,33 +467,72 @@ func (g *randomPlanGenerator) generatePlans() []SegmentAssignPlan {
 type MultiTargetBalancer struct {
 	*ScoreBasedBalancer
 	dist      *meta.DistributionManager
-	targetMgr *meta.TargetManager
+	targetMgr meta.TargetManagerInterface
 }
 
-func (b *MultiTargetBalancer) BalanceReplica(replica *meta.Replica) ([]SegmentAssignPlan, []ChannelAssignPlan) {
+func (b *MultiTargetBalancer) BalanceReplica(ctx context.Context, replica *meta.Replica) (segmentPlans []SegmentAssignPlan, channelPlans []ChannelAssignPlan) {
 	log := log.With(
 		zap.Int64("collection", replica.GetCollectionID()),
 		zap.Int64("replica id", replica.GetID()),
 		zap.String("replica group", replica.GetResourceGroup()),
 	)
-	if replica.NodesCount() == 0 {
-		return nil, nil
+	br := NewBalanceReport()
+	defer func() {
+		if len(segmentPlans) == 0 && len(channelPlans) == 0 {
+			log.WithRateGroup(fmt.Sprintf("scorebasedbalance-noplan-%d", replica.GetID()), 1, 60).
+				RatedDebug(60, "no plan generated, balance report", zap.Stringers("records", br.detailRecords))
+		} else {
+			log.Info("balance plan generated", zap.Stringers("report details", br.records))
+		}
+	}()
+
+	stoppingBalance := paramtable.Get().QueryCoordCfg.EnableStoppingBalance.GetAsBool()
+
+	channelPlans = b.balanceChannels(ctx, br, replica, stoppingBalance)
+	if len(channelPlans) == 0 {
+		segmentPlans = b.balanceSegments(ctx, replica, stoppingBalance)
+	}
+	return
+}
+
+func (b *MultiTargetBalancer) balanceChannels(ctx context.Context, br *balanceReport, replica *meta.Replica, stoppingBalance bool) []ChannelAssignPlan {
+	var rwNodes, roNodes []int64
+	if streamingutil.IsStreamingServiceEnabled() {
+		rwNodes, roNodes = replica.GetRWSQNodes(), replica.GetROSQNodes()
+	} else {
+		rwNodes, roNodes = replica.GetRWNodes(), replica.GetRONodes()
 	}
 
+	if len(rwNodes) == 0 || !b.permitBalanceChannel(replica.GetCollectionID()) {
+		return nil
+	}
+
+	if len(roNodes) != 0 {
+		if !stoppingBalance {
+			log.RatedInfo(10, "stopping balance is disabled!", zap.Int64s("stoppingNode", roNodes))
+			return nil
+		}
+		return b.genStoppingChannelPlan(ctx, replica, rwNodes, roNodes)
+	}
+
+	if paramtable.Get().QueryCoordCfg.AutoBalanceChannel.GetAsBool() {
+		return b.genChannelPlan(ctx, br, replica, rwNodes)
+	}
+	return nil
+}
+
+func (b *MultiTargetBalancer) balanceSegments(ctx context.Context, replica *meta.Replica, stoppingBalance bool) []SegmentAssignPlan {
 	rwNodes := replica.GetRWNodes()
 	roNodes := replica.GetRONodes()
 
-	if len(rwNodes) == 0 {
-		// no available nodes to balance
-		return nil, nil
+	if len(rwNodes) == 0 || !b.permitBalanceSegment(replica.GetCollectionID()) {
+		return nil
 	}
-
 	// print current distribution before generating plans
-	segmentPlans, channelPlans := make([]SegmentAssignPlan, 0), make([]ChannelAssignPlan, 0)
 	if len(roNodes) != 0 {
-		if !paramtable.Get().QueryCoordCfg.EnableStoppingBalance.GetAsBool() {
+		if !stoppingBalance {
 			log.RatedInfo(10, "stopping balance is disabled!", zap.Int64s("stoppingNode", roNodes))
-			return nil, nil
+			return nil
 		}
 
 		log.Info("Handle stopping nodes",
@@ -487,33 +540,19 @@ func (b *MultiTargetBalancer) BalanceReplica(replica *meta.Replica) ([]SegmentAs
 			zap.Any("available nodes", rwNodes),
 		)
 		// handle stopped nodes here, have to assign segments on stopping nodes to nodes with the smallest score
-		channelPlans = append(channelPlans, b.genStoppingChannelPlan(replica, rwNodes, roNodes)...)
-		if len(channelPlans) == 0 {
-			segmentPlans = append(segmentPlans, b.genStoppingSegmentPlan(replica, rwNodes, roNodes)...)
-		}
-	} else {
-		if paramtable.Get().QueryCoordCfg.AutoBalanceChannel.GetAsBool() {
-			channelPlans = append(channelPlans, b.genChannelPlan(replica, rwNodes)...)
-		}
-
-		if len(channelPlans) == 0 {
-			segmentPlans = b.genSegmentPlan(replica, rwNodes)
-		}
+		return b.genStoppingSegmentPlan(ctx, replica, rwNodes, roNodes)
 	}
-
-	return segmentPlans, channelPlans
+	return b.genSegmentPlan(ctx, replica, rwNodes)
 }
 
-func (b *MultiTargetBalancer) genSegmentPlan(replica *meta.Replica, rwNodes []int64) []SegmentAssignPlan {
+func (b *MultiTargetBalancer) genSegmentPlan(ctx context.Context, replica *meta.Replica, rwNodes []int64) []SegmentAssignPlan {
 	// get segments distribution on replica level and global level
 	nodeSegments := make(map[int64][]*meta.Segment)
 	globalNodeSegments := make(map[int64][]*meta.Segment)
 	for _, node := range rwNodes {
 		dist := b.dist.SegmentDistManager.GetByFilter(meta.WithCollectionID(replica.GetCollectionID()), meta.WithNodeID(node))
 		segments := lo.Filter(dist, func(segment *meta.Segment, _ int) bool {
-			return b.targetMgr.GetSealedSegment(segment.GetCollectionID(), segment.GetID(), meta.CurrentTarget) != nil &&
-				b.targetMgr.GetSealedSegment(segment.GetCollectionID(), segment.GetID(), meta.NextTarget) != nil &&
-				segment.GetLevel() != datapb.SegmentLevel_L0
+			return b.targetMgr.CanSegmentBeMoved(ctx, segment.GetCollectionID(), segment.GetID())
 		})
 		nodeSegments[node] = segments
 		globalNodeSegments[node] = b.dist.SegmentDistManager.GetByFilter(meta.WithNodeID(node))
@@ -551,7 +590,7 @@ func (b *MultiTargetBalancer) genPlanByDistributions(nodeSegments, globalNodeSeg
 	return plans
 }
 
-func NewMultiTargetBalancer(scheduler task.Scheduler, nodeManager *session.NodeManager, dist *meta.DistributionManager, meta *meta.Meta, targetMgr *meta.TargetManager) *MultiTargetBalancer {
+func NewMultiTargetBalancer(scheduler task.Scheduler, nodeManager *session.NodeManager, dist *meta.DistributionManager, meta *meta.Meta, targetMgr meta.TargetManagerInterface) *MultiTargetBalancer {
 	return &MultiTargetBalancer{
 		ScoreBasedBalancer: NewScoreBasedBalancer(scheduler, nodeManager, dist, meta, targetMgr),
 		dist:               dist,

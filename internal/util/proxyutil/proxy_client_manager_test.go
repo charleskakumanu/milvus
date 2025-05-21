@@ -18,7 +18,6 @@ package proxyutil
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"testing"
 
@@ -29,11 +28,11 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	milvuspb "github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus/internal/mocks"
-	"github.com/milvus-io/milvus/internal/proto/proxypb"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/proto/proxypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 type UniqueID = int64
@@ -66,7 +65,7 @@ func (p *proxyMock) InvalidateCollectionMetaCache(ctx context.Context, request *
 		}, nil
 	}
 	if p.returnGrpcError {
-		return nil, fmt.Errorf("grpc error")
+		return nil, errors.New("grpc error")
 	}
 	p.collArray = append(p.collArray, request.CollectionName)
 	p.collIDs = append(p.collIDs, request.CollectionID)
@@ -95,7 +94,7 @@ func (p *proxyMock) InvalidateCredentialCache(ctx context.Context, request *prox
 		}, nil
 	}
 	if p.returnGrpcError {
-		return nil, fmt.Errorf("grpc error")
+		return nil, errors.New("grpc error")
 	}
 	return merr.Success(), nil
 }

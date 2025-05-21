@@ -12,9 +12,11 @@
 #-------------------------------------------------------------------------------
 
 # Update KNOWHERE_VERSION for the first occurrence
+milvus_add_pkg_config("knowhere")
 set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY INCLUDE_DIRECTORIES "")
-set( KNOWHERE_VERSION d69e0f33 )
+set( KNOWHERE_VERSION 8a705a0 )
 set( GIT_REPOSITORY  "https://github.com/zilliztech/knowhere.git")
+
 message(STATUS "Knowhere repo: ${GIT_REPOSITORY}")
 message(STATUS "Knowhere version: ${KNOWHERE_VERSION}")
 
@@ -34,7 +36,7 @@ else ()
 endif()
 
 if ( MILVUS_GPU_VERSION STREQUAL "ON" )
-    set(WITH_RAFT ON CACHE BOOL "" FORCE )
+    set(WITH_CUVS ON CACHE BOOL "" FORCE )
 endif ()
 
 set( CMAKE_PREFIX_PATH ${CONAN_BOOST_ROOT} )
@@ -59,3 +61,5 @@ endif()
 # get prometheus COMPILE_OPTIONS
 get_property( var DIRECTORY "${knowhere_SOURCE_DIR}" PROPERTY COMPILE_OPTIONS )
 message( STATUS "knowhere src compile options: ${var}" )
+
+set( KNOWHERE_INCLUDE_DIR ${knowhere_SOURCE_DIR}/include CACHE INTERNAL "Path to knowhere include directory" )

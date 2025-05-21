@@ -24,11 +24,12 @@ import (
 	"github.com/stretchr/testify/suite"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
+	"github.com/milvus-io/milvus/internal/mocks/util/mock_segcore"
 	storage "github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/util/initcore"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 type SearchSuite struct {
@@ -56,14 +57,16 @@ func (suite *SearchSuite) SetupTest() {
 	chunkManagerFactory := storage.NewChunkManagerFactoryWithParam(paramtable.Get())
 	suite.chunkManager, _ = chunkManagerFactory.NewPersistentStorageChunkManager(ctx)
 	initcore.InitRemoteChunkManager(paramtable.Get())
+	initcore.InitLocalChunkManager(suite.T().Name())
+	initcore.InitMmapManager(paramtable.Get())
 
 	suite.collectionID = 100
 	suite.partitionID = 10
 	suite.segmentID = 1
 
 	suite.manager = NewManager()
-	schema := GenTestCollectionSchema("test-reduce", schemapb.DataType_Int64, true)
-	indexMeta := GenTestIndexMeta(suite.collectionID, schema)
+	schema := mock_segcore.GenTestCollectionSchema("test-reduce", schemapb.DataType_Int64, true)
+	indexMeta := mock_segcore.GenTestIndexMeta(suite.collectionID, schema)
 	suite.manager.Collection.PutOrRef(suite.collectionID,
 		schema,
 		indexMeta,
@@ -90,7 +93,7 @@ func (suite *SearchSuite) SetupTest() {
 	)
 	suite.Require().NoError(err)
 
-	binlogs, _, err := SaveBinLog(ctx,
+	binlogs, _, err := mock_segcore.SaveBinLog(ctx,
 		suite.collectionID,
 		suite.partitionID,
 		suite.segmentID,
@@ -100,7 +103,7 @@ func (suite *SearchSuite) SetupTest() {
 	)
 	suite.Require().NoError(err)
 	for _, binlog := range binlogs {
-		err = suite.sealed.(*LocalSegment).LoadFieldData(ctx, binlog.FieldID, int64(msgLength), binlog, false)
+		err = suite.sealed.(*LocalSegment).LoadFieldData(ctx, binlog.FieldID, int64(msgLength), binlog)
 		suite.Require().NoError(err)
 	}
 
@@ -118,7 +121,7 @@ func (suite *SearchSuite) SetupTest() {
 	)
 	suite.Require().NoError(err)
 
-	insertMsg, err := genInsertMsg(suite.collection, suite.partitionID, suite.growing.ID(), msgLength)
+	insertMsg, err := mock_segcore.GenInsertMsg(suite.collection.GetCCollection(), suite.partitionID, suite.growing.ID(), msgLength)
 	suite.Require().NoError(err)
 	insertRecord, err := storage.TransferInsertMsgToInsertRecord(suite.collection.Schema(), insertMsg)
 	suite.Require().NoError(err)
@@ -141,7 +144,7 @@ func (suite *SearchSuite) TestSearchSealed() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	searchReq, err := genSearchPlanAndRequests(suite.collection, []int64{suite.sealed.ID()}, IndexFaissIDMap, nq)
+	searchReq, err := mock_segcore.GenSearchPlanAndRequests(suite.collection.GetCCollection(), []int64{suite.sealed.ID()}, mock_segcore.IndexFaissIDMap, nq)
 	suite.NoError(err)
 
 	_, segments, err := SearchHistorical(ctx, suite.manager, searchReq, suite.collectionID, nil, []int64{suite.sealed.ID()})
@@ -150,7 +153,7 @@ func (suite *SearchSuite) TestSearchSealed() {
 }
 
 func (suite *SearchSuite) TestSearchGrowing() {
-	searchReq, err := genSearchPlanAndRequests(suite.collection, []int64{suite.growing.ID()}, IndexFaissIDMap, 1)
+	searchReq, err := mock_segcore.GenSearchPlanAndRequests(suite.collection.GetCCollection(), []int64{suite.growing.ID()}, mock_segcore.IndexFaissIDMap, 1)
 	suite.NoError(err)
 
 	res, segments, err := SearchStreaming(context.TODO(), suite.manager, searchReq,

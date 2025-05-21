@@ -19,19 +19,22 @@ package task
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
+
+	"github.com/samber/lo"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/indexpb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	"github.com/milvus-io/milvus/internal/querycoordv2/utils"
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/util/commonpbutil"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 // idSource helper type for using id as task source
@@ -92,6 +95,8 @@ func GetTaskType(task Task) Type {
 		return TaskTypeReduce
 	case task.Actions()[0].Type() == ActionTypeUpdate:
 		return TaskTypeUpdate
+	case task.Actions()[0].Type() == ActionTypeStatsUpdate:
+		return TaskTypeStatsUpdate
 	}
 	return 0
 }
@@ -129,16 +134,20 @@ func packLoadSegmentRequest(
 		loadScope = querypb.LoadScope_Index
 	}
 
+	if action.Type() == ActionTypeStatsUpdate {
+		loadScope = querypb.LoadScope_Stats
+	}
+
 	if task.Source() == utils.LeaderChecker {
 		loadScope = querypb.LoadScope_Delta
 	}
 	// field mmap enabled if collection-level mmap enabled or the field mmap enabled
-	collectionMmapEnabled := common.IsMmapEnabled(collectionProperties...)
+	collectionMmapEnabled, exist := common.IsMmapDataEnabled(collectionProperties...)
 	for _, field := range schema.GetFields() {
-		if collectionMmapEnabled {
+		if exist {
 			field.TypeParams = append(field.TypeParams, &commonpb.KeyValuePair{
 				Key:   common.MmapEnabledKey,
-				Value: "true",
+				Value: strconv.FormatBool(collectionMmapEnabled),
 			})
 		}
 	}
@@ -174,19 +183,20 @@ func packReleaseSegmentRequest(task *SegmentTask, action *SegmentAction) *queryp
 		NodeID:       action.Node(),
 		CollectionID: task.CollectionID(),
 		SegmentIDs:   []int64{task.SegmentID()},
-		Scope:        action.Scope(),
-		Shard:        action.Shard(),
+		Scope:        action.GetScope(),
+		Shard:        action.GetShard(),
 		NeedTransfer: false,
 	}
 }
 
-func packLoadMeta(loadType querypb.LoadType, collectionID int64, databaseName string, resourceGroup string, partitions ...int64) *querypb.LoadMetaInfo {
+func packLoadMeta(loadType querypb.LoadType, collectionID int64, databaseName string, resourceGroup string, loadFields []int64, partitions ...int64) *querypb.LoadMetaInfo {
 	return &querypb.LoadMetaInfo{
 		LoadType:      loadType,
 		CollectionID:  collectionID,
 		PartitionIDs:  partitions,
 		DbName:        databaseName,
 		ResourceGroup: resourceGroup,
+		LoadFields:    loadFields,
 	}
 }
 
@@ -233,15 +243,14 @@ func fillSubChannelRequest(
 		return nil
 	}
 
-	resp, err := broker.GetSegmentInfo(ctx, segmentIDs.Collect()...)
+	segmentInfos, err := broker.GetSegmentInfo(ctx, segmentIDs.Collect()...)
 	if err != nil {
 		return err
 	}
-	segmentInfos := make(map[int64]*datapb.SegmentInfo)
-	for _, info := range resp.GetInfos() {
-		segmentInfos[info.GetID()] = info
-	}
-	req.SegmentInfos = segmentInfos
+
+	req.SegmentInfos = lo.SliceToMap(segmentInfos, func(info *datapb.SegmentInfo) (int64, *datapb.SegmentInfo) {
+		return info.GetID(), info
+	})
 	return nil
 }
 

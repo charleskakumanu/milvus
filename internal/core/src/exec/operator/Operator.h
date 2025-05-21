@@ -97,7 +97,7 @@ class Operator {
              DataType output_type,
              int32_t operator_id,
              const std::string& plannode_id,
-             const std::string& operator_type = "")
+             const std::string& operator_type)
         : operator_context_(std::make_unique<OperatorContext>(
               ctx, plannode_id, operator_id, operator_type)) {
     }
@@ -153,6 +153,11 @@ class Operator {
         return operator_context_->get_plannode_id();
     }
 
+    virtual std::string
+    ToString() const {
+        return "Base Operator";
+    }
+
  protected:
     std::unique_ptr<OperatorContext> operator_context_;
 
@@ -190,6 +195,11 @@ class SourceOperator : public Operator {
     NoMoreInput() override {
         PanicInfo(NotImplemented,
                   "SourceOperator does not support noMoreInput()");
+    }
+
+    virtual std::string
+    ToString() const override {
+        return "source operator";
     }
 };
 

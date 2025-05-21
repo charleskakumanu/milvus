@@ -24,7 +24,7 @@ import (
 
 	"github.com/cockroachdb/errors"
 
-	"github.com/milvus-io/milvus/pkg/common"
+	"github.com/milvus-io/milvus/pkg/v2/common"
 )
 
 // BinlogReader is an object to read binlog file. Binlog file's format can be
@@ -49,8 +49,11 @@ func (reader *BinlogReader) NextEventReader() (*EventReader, error) {
 	if reader.eventReader != nil {
 		reader.eventReader.Close()
 	}
-	var err error
-	reader.eventReader, err = newEventReader(reader.descriptorEvent.PayloadDataType, reader.buffer, reader.descriptorEvent.Nullable)
+	nullable, err := reader.descriptorEvent.GetNullable()
+	if err != nil {
+		return nil, err
+	}
+	reader.eventReader, err = newEventReader(reader.descriptorEvent.PayloadDataType, reader.buffer, nullable)
 	if err != nil {
 		return nil, err
 	}
@@ -103,6 +106,9 @@ func ReadDescriptorEvent(buffer io.Reader) (*descriptorEvent, error) {
 // Close closes the BinlogReader object.
 // It mainly calls the Close method of the internal events, reclaims resources, and marks itself as closed.
 func (reader *BinlogReader) Close() {
+	if reader == nil {
+		return
+	}
 	if reader.isClose {
 		return
 	}

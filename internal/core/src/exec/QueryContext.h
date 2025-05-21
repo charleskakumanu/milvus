@@ -176,6 +176,7 @@ class QueryContext : public Context {
                  const milvus::segcore::SegmentInternalInterface* segment,
                  int64_t active_count,
                  milvus::Timestamp timestamp,
+                 int32_t consistency_level = 0,
                  std::shared_ptr<QueryConfig> query_config =
                      std::make_shared<QueryConfig>(),
                  folly::Executor* executor = nullptr,
@@ -187,7 +188,8 @@ class QueryContext : public Context {
           active_count_(active_count),
           query_timestamp_(timestamp),
           query_config_(query_config),
-          executor_(executor) {
+          executor_(executor),
+          consistency_level_(consistency_level) {
     }
 
     folly::Executor*
@@ -225,6 +227,56 @@ class QueryContext : public Context {
         return active_count_;
     }
 
+    milvus::SearchInfo
+    get_search_info() {
+        return search_info_;
+    }
+
+    knowhere::MetricType
+    get_metric_type() {
+        return search_info_.metric_type_;
+    }
+
+    const query::PlaceholderGroup*
+    get_placeholder_group() {
+        return placeholder_group_;
+    }
+
+    void
+    set_search_info(const milvus::SearchInfo& search_info) {
+        search_info_ = search_info;
+    }
+
+    void
+    set_placeholder_group(const query::PlaceholderGroup* placeholder_group) {
+        placeholder_group_ = placeholder_group;
+    }
+
+    void
+    set_search_result(milvus::SearchResult&& result) {
+        search_result_ = std::move(result);
+    }
+
+    milvus::SearchResult&&
+    get_search_result() {
+        return std::move(search_result_);
+    }
+
+    void
+    set_retrieve_result(milvus::RetrieveResult&& result) {
+        retrieve_result_ = std::move(result);
+    }
+
+    milvus::RetrieveResult&&
+    get_retrieve_result() {
+        return std::move(retrieve_result_);
+    }
+
+    int32_t
+    get_consistency_level() {
+        return consistency_level_;
+    }
+
  private:
     folly::Executor* executor_;
     //folly::Executor::KeepAlive<> executor_keepalive_;
@@ -238,6 +290,16 @@ class QueryContext : public Context {
     int64_t active_count_;
     // timestamp this query generate
     milvus::Timestamp query_timestamp_;
+
+    // used for vector search
+    milvus::SearchInfo search_info_;
+    const query::PlaceholderGroup* placeholder_group_;
+
+    // used for store segment search/retrieve result
+    milvus::SearchResult search_result_;
+    milvus::RetrieveResult retrieve_result_;
+
+    int32_t consistency_level_ = 0;
 };
 
 // Represent the state of one thread of query execution.

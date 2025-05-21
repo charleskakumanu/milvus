@@ -3,8 +3,8 @@ package paramtable
 import (
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/pkg/config"
-	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/v2/config"
+	"github.com/milvus-io/milvus/pkg/v2/log"
 )
 
 const hookYamlFile = "hook.yaml"
@@ -36,4 +36,8 @@ func (h *hookConfig) init(base *BaseTable) {
 
 func (h *hookConfig) WatchHookWithPrefix(ident string, keyPrefix string, onEvent func(*config.Event)) {
 	h.hookBase.mgr.Dispatcher.RegisterForKeyPrefix(keyPrefix, config.NewHandler(ident, onEvent))
+}
+
+func (h *hookConfig) GetAll() map[string]string {
+	return h.hookBase.mgr.GetConfigs()
 }

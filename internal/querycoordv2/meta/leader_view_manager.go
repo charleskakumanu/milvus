@@ -21,8 +21,9 @@ import (
 
 	"github.com/samber/lo"
 
-	"github.com/milvus-io/milvus/internal/proto/querypb"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 type lvCriterion struct {
@@ -109,6 +110,12 @@ func WithSegment2LeaderView(segmentID int64, isGrowing bool) LeaderViewFilter {
 	})
 }
 
+func WithServiceable() LeaderViewFilter {
+	return lvFilterFunc(func(view *LeaderView) bool {
+		return view.UnServiceableError == nil
+	})
+}
+
 type LeaderView struct {
 	ID                     int64
 	CollectionID           int64
@@ -119,6 +126,7 @@ type LeaderView struct {
 	TargetVersion          int64
 	NumOfGrowingRows       int64
 	PartitionStatsVersions map[int64]int64
+	UnServiceableError     error
 }
 
 func (view *LeaderView) Clone() *LeaderView {
@@ -142,6 +150,7 @@ func (view *LeaderView) Clone() *LeaderView {
 		TargetVersion:          view.TargetVersion,
 		NumOfGrowingRows:       view.NumOfGrowingRows,
 		PartitionStatsVersions: view.PartitionStatsVersions,
+		UnServiceableError:     view.UnServiceableError,
 	}
 }
 
@@ -231,6 +240,9 @@ func (mgr *LeaderViewManager) Update(leaderID int64, views ...*LeaderView) {
 	mgr.views[leaderID] = composeNodeViews(views...)
 
 	// compute leader location change, find it's correspond collection
+	// 1. leader has been released from node
+	// 2. leader has been loaded to node
+	// 3. leader serviceable status changed
 	if mgr.notifyFunc != nil {
 		viewChanges := typeutil.NewUniqueSet()
 		for channel, oldView := range oldViews {
@@ -240,9 +252,17 @@ func (mgr *LeaderViewManager) Update(leaderID int64, views ...*LeaderView) {
 			}
 		}
 
+		serviceableChange := func(old, new *LeaderView) bool {
+			if old == nil || new == nil {
+				return true
+			}
+
+			return (old.UnServiceableError == nil) != (new.UnServiceableError == nil)
+		}
+
 		for channel, newView := range newViews {
 			// if channel loaded to current node
-			if _, ok := oldViews[channel]; !ok {
+			if oldView, ok := oldViews[channel]; !ok || serviceableChange(oldView, newView) {
 				viewChanges.Insert(newView.CollectionID)
 			}
 		}
@@ -295,4 +315,63 @@ func (mgr *LeaderViewManager) GetLatestShardLeaderByFilter(filters ...LeaderView
 	return lo.MaxBy(views, func(v1, v2 *LeaderView) bool {
 		return v1.Version > v2.Version
 	})
+}
+
+// GetLeaderView returns a slice of LeaderView objects, each representing the state of a leader node.
+// It traverses the views map, converts each LeaderView to a metricsinfo.LeaderView, and collects them into a slice.
+// The method locks the views map for reading to ensure thread safety.
+func (mgr *LeaderViewManager) GetLeaderView(collectionID int64) []*metricsinfo.LeaderView {
+	mgr.rwmutex.RLock()
+	defer mgr.rwmutex.RUnlock()
+
+	var leaderViews []*metricsinfo.LeaderView
+	for _, nodeViews := range mgr.views {
+		var filteredViews []*LeaderView
+		if collectionID > 0 {
+			if lv, ok := nodeViews.collectionViews[collectionID]; ok {
+				filteredViews = lv
+			} else {
+				// skip if collectionID is not found
+				continue
+			}
+		} else {
+			// if collectionID is not set, return all leader views
+			filteredViews = nodeViews.views
+		}
+
+		for _, lv := range filteredViews {
+			errString := ""
+			if lv.UnServiceableError != nil {
+				errString = lv.UnServiceableError.Error()
+			}
+			leaderView := &metricsinfo.LeaderView{
+				LeaderID:           lv.ID,
+				CollectionID:       lv.CollectionID,
+				Channel:            lv.Channel,
+				Version:            lv.Version,
+				SealedSegments:     make([]*metricsinfo.Segment, 0, len(lv.Segments)),
+				GrowingSegments:    make([]*metricsinfo.Segment, 0, len(lv.GrowingSegments)),
+				TargetVersion:      lv.TargetVersion,
+				NumOfGrowingRows:   lv.NumOfGrowingRows,
+				UnServiceableError: errString,
+			}
+
+			for segID, seg := range lv.Segments {
+				leaderView.SealedSegments = append(leaderView.SealedSegments, &metricsinfo.Segment{
+					SegmentID: segID,
+					NodeID:    seg.NodeID,
+				})
+			}
+
+			for _, seg := range lv.GrowingSegments {
+				leaderView.GrowingSegments = append(leaderView.GrowingSegments, &metricsinfo.Segment{
+					SegmentID: seg.ID,
+					NodeID:    seg.Node,
+				})
+			}
+
+			leaderViews = append(leaderViews, leaderView)
+		}
+	}
+	return leaderViews
 }

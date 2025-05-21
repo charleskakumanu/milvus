@@ -16,6 +16,15 @@
 
 package common
 
+import (
+	"fmt"
+
+	"github.com/cockroachdb/errors"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+)
+
 // ProducerOptions contains the options of a producer
 type ProducerOptions struct {
 	// The topic that this Producer will publish
@@ -65,3 +74,42 @@ const (
 	// SubscriptionPositionUnkown indicates we don't care about the consumer location, since we are doing another seek or only some meta api over that
 	SubscriptionPositionUnknown
 )
+
+const (
+	MsgTypeKey          = "msg_type"
+	MsgIdTypeKey        = "msg_id"
+	TimestampTypeKey    = "timestamp"
+	ChannelTypeKey      = "vchannel"
+	CollectionIDTypeKey = "collection_id"
+	ReplicateIDTypeKey  = "replicate_id"
+)
+
+// GetMsgType gets the message type from message.
+func GetMsgType(msg Message) (commonpb.MsgType, error) {
+	return GetMsgTypeFromRaw(msg.Payload(), msg.Properties())
+}
+
+// GetMsgTypeFromRaw gets the message type from payload and properties.
+func GetMsgTypeFromRaw(payload []byte, properties map[string]string) (commonpb.MsgType, error) {
+	msgType := commonpb.MsgType_Undefined
+	if properties != nil {
+		if val, ok := properties[MsgTypeKey]; ok {
+			msgType = commonpb.MsgType(commonpb.MsgType_value[val])
+		}
+	}
+	if msgType == commonpb.MsgType_Undefined {
+		header := commonpb.MsgHeader{}
+		if payload == nil {
+			return msgType, errors.New("failed to unmarshal message header, payload is empty")
+		}
+		err := proto.Unmarshal(payload, &header)
+		if err != nil {
+			return msgType, fmt.Errorf("failed to unmarshal message header, err %s", err.Error())
+		}
+		if header.Base == nil {
+			return msgType, errors.New("failed to unmarshal message, header is uncomplete")
+		}
+		msgType = header.Base.MsgType
+	}
+	return msgType, nil
+}

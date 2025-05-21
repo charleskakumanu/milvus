@@ -19,8 +19,11 @@ package deletebuffer
 import (
 	"testing"
 
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
 
+	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
+	"github.com/milvus-io/milvus/internal/querynodev2/segments"
 	"github.com/milvus-io/milvus/internal/storage"
 )
 
@@ -29,7 +32,7 @@ type ListDeleteBufferSuite struct {
 }
 
 func (s *ListDeleteBufferSuite) TestNewBuffer() {
-	buffer := NewListDeleteBuffer[*Item](10, 1000)
+	buffer := NewListDeleteBuffer[*Item](10, 1000, []string{"1", "dml-1"})
 
 	s.EqualValues(10, buffer.SafeTs())
 
@@ -39,7 +42,7 @@ func (s *ListDeleteBufferSuite) TestNewBuffer() {
 }
 
 func (s *ListDeleteBufferSuite) TestCache() {
-	buffer := NewListDeleteBuffer[*Item](10, 1000)
+	buffer := NewListDeleteBuffer[*Item](10, 1000, []string{"1", "dml-1"})
 	buffer.Put(&Item{
 		Ts: 11,
 		Data: []BufferItem{
@@ -62,10 +65,13 @@ func (s *ListDeleteBufferSuite) TestCache() {
 
 	s.Equal(2, len(buffer.ListAfter(11)))
 	s.Equal(1, len(buffer.ListAfter(12)))
+	entryNum, memorySize := buffer.Size()
+	s.EqualValues(0, entryNum)
+	s.EqualValues(192, memorySize)
 }
 
 func (s *ListDeleteBufferSuite) TestTryDiscard() {
-	buffer := NewListDeleteBuffer[*Item](10, 1)
+	buffer := NewListDeleteBuffer[*Item](10, 1, []string{"1", "dml-1"})
 	buffer.Put(&Item{
 		Ts: 10,
 		Data: []BufferItem{
@@ -95,18 +101,100 @@ func (s *ListDeleteBufferSuite) TestTryDiscard() {
 	})
 
 	s.Equal(2, len(buffer.ListAfter(10)))
+	entryNum, memorySize := buffer.Size()
+	s.EqualValues(2, entryNum)
+	s.EqualValues(240, memorySize)
 
 	buffer.TryDiscard(10)
 	s.Equal(2, len(buffer.ListAfter(10)), "equal ts shall not discard block")
+	entryNum, memorySize = buffer.Size()
+	s.EqualValues(2, entryNum)
+	s.EqualValues(240, memorySize)
 
 	buffer.TryDiscard(9)
 	s.Equal(2, len(buffer.ListAfter(10)), "history ts shall not discard any block")
+	entryNum, memorySize = buffer.Size()
+	s.EqualValues(2, entryNum)
+	s.EqualValues(240, memorySize)
 
 	buffer.TryDiscard(20)
 	s.Equal(1, len(buffer.ListAfter(10)), "first block shall be discarded")
+	entryNum, memorySize = buffer.Size()
+	s.EqualValues(1, entryNum)
+	s.EqualValues(120, memorySize)
 
 	buffer.TryDiscard(20)
 	s.Equal(1, len(buffer.ListAfter(10)), "discard will not happen if there is only one block")
+	s.EqualValues(1, entryNum)
+	s.EqualValues(120, memorySize)
+}
+
+func (s *ListDeleteBufferSuite) TestL0SegmentOperations() {
+	buffer := NewListDeleteBuffer[*Item](10, 1000, []string{"1", "dml-1"})
+
+	// Create mock segments with specific IDs
+	seg1 := segments.NewMockSegment(s.T())
+	seg1.On("ID").Return(int64(1))
+	seg1.On("Release", mock.Anything).Return()
+	seg1.On("StartPosition").Return(&msgpb.MsgPosition{
+		Timestamp: 10,
+	})
+
+	seg2 := segments.NewMockSegment(s.T())
+	seg2.On("ID").Return(int64(2))
+	seg2.On("Release", mock.Anything).Return()
+	seg2.On("StartPosition").Return(&msgpb.MsgPosition{
+		Timestamp: 20,
+	})
+
+	seg3 := segments.NewMockSegment(s.T())
+	seg3.On("ID").Return(int64(3))
+	seg3.On("Release", mock.Anything).Return()
+	seg3.On("StartPosition").Return(&msgpb.MsgPosition{
+		Timestamp: 30,
+	})
+
+	// Test RegisterL0 with multiple segments
+	buffer.RegisterL0(seg1, seg2)
+	segments := buffer.ListL0()
+	s.Equal(2, len(segments))
+
+	// Verify segment IDs by collecting them first
+	ids := make([]int64, 0, len(segments))
+	for _, seg := range segments {
+		ids = append(ids, seg.ID())
+	}
+	s.ElementsMatch([]int64{1, 2}, ids, "expected segment IDs 1 and 2 in any order")
+
+	// Test ListL0 with empty buffer
+	emptyBuffer := NewListDeleteBuffer[*Item](10, 1000, []string{})
+	s.Equal(0, len(emptyBuffer.ListL0()))
+
+	// Test UnRegister
+	buffer.UnRegister(seg1.StartPosition().GetTimestamp())
+	segments = buffer.ListL0()
+	s.Equal(2, len(segments))
+	buffer.UnRegister(seg1.StartPosition().GetTimestamp() + 1)
+	segments = buffer.ListL0()
+	s.Equal(1, len(segments))
+	s.Equal(int64(2), segments[0].ID())
+
+	// Verify Release was called on unregistered segment
+	seg1.AssertCalled(s.T(), "Release", mock.Anything)
+
+	// Test Clear
+	buffer.RegisterL0(seg3)
+	s.Equal(2, len(buffer.ListL0()))
+	buffer.Clear()
+	s.Equal(0, len(buffer.ListL0()))
+
+	// Verify Release was called on all segments
+	seg2.AssertCalled(s.T(), "Release", mock.Anything)
+	seg3.AssertCalled(s.T(), "Release", mock.Anything)
+
+	// Test RegisterL0 with nil segment (should not panic)
+	buffer.RegisterL0(nil)
+	s.Equal(0, len(buffer.ListL0()))
 }
 
 func TestListDeleteBuffer(t *testing.T) {

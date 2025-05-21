@@ -18,15 +18,17 @@
 
 #include <memory>
 #include <boost/dynamic_bitset.hpp>
+#include "cachinglayer/CacheSlot.h"
 #include "common/FieldData.h"
 #include "common/EasyAssert.h"
+#include "common/JsonCastType.h"
 #include "knowhere/comp/index_param.h"
 #include "knowhere/dataset.h"
+#include "knowhere/index/index_factory.h"
 #include "common/Tracer.h"
 #include "common/Types.h"
-
-const std::string kMmapFilepath = "mmap_filepath";
-const std::string kEnableMmap = "enable_mmap";
+#include "index/Meta.h"
+#include "index/IndexStats.h"
 
 namespace milvus::index {
 
@@ -45,12 +47,9 @@ class IndexBase {
     Load(milvus::tracer::TraceContext ctx, const Config& config = {}) = 0;
 
     virtual void
-    LoadV2(const Config& config = {}) = 0;
-
-    virtual void
-    BuildWithRawData(size_t n,
-                     const void* values,
-                     const Config& config = {}) = 0;
+    BuildWithRawDataForUT(size_t n,
+                          const void* values,
+                          const Config& config = {}) = 0;
 
     virtual void
     BuildWithDataset(const DatasetPtr& dataset, const Config& config = {}) = 0;
@@ -58,39 +57,42 @@ class IndexBase {
     virtual void
     Build(const Config& config = {}) = 0;
 
-    virtual void
-    BuildV2(const Config& Config = {}) = 0;
-
     virtual int64_t
     Count() = 0;
 
-    virtual BinarySet
+    virtual IndexStatsPtr
     Upload(const Config& config = {}) = 0;
-
-    virtual BinarySet
-    UploadV2(const Config& config = {}) = 0;
 
     virtual const bool
     HasRawData() const = 0;
 
-    bool
-    IsMmapSupported() const {
-        return index_type_ == knowhere::IndexEnum::INDEX_HNSW ||
-               index_type_ == knowhere::IndexEnum::INDEX_FAISS_IVFFLAT ||
-               index_type_ == knowhere::IndexEnum::INDEX_FAISS_IVFFLAT_CC ||
-               index_type_ == knowhere::IndexEnum::INDEX_FAISS_IVFPQ ||
-               index_type_ == knowhere::IndexEnum::INDEX_FAISS_IVFSQ8 ||
-               index_type_ == knowhere::IndexEnum::INDEX_FAISS_BIN_IVFFLAT ||
-               index_type_ == knowhere::IndexEnum::INDEX_FAISS_IDMAP ||
-               index_type_ == knowhere::IndexEnum::INDEX_FAISS_BIN_IDMAP ||
-               index_type_ ==
-                   knowhere::IndexEnum::INDEX_SPARSE_INVERTED_INDEX ||
-               index_type_ == knowhere::IndexEnum::INDEX_SPARSE_WAND;
-    }
+    virtual bool
+    IsMmapSupported() const = 0;
 
     const IndexType&
     Type() const {
         return index_type_;
+    }
+
+    virtual bool
+    IsDataTypeSupported(DataType data_type) const {
+        return true;
+    };
+
+    virtual JsonCastType
+    GetCastType() const {
+        return JsonCastType::UNKNOWN;
+    }
+
+    // TODO: how to get the cell byte size?
+    virtual size_t
+    CellByteSize() const {
+        return cell_size_;
+    }
+
+    virtual void
+    SetCellSize(size_t cell_size) {
+        cell_size_ = cell_size;
     }
 
  protected:
@@ -99,7 +101,14 @@ class IndexBase {
     }
 
     IndexType index_type_ = "";
+    size_t cell_size_ = 0;
 };
 
 using IndexBasePtr = std::unique_ptr<IndexBase>;
+
+template <typename T>
+using CacheIndexPtr = std::shared_ptr<milvus::cachinglayer::CacheSlot<T>>;
+
+using CacheIndexBasePtr = CacheIndexPtr<IndexBase>;
+
 }  // namespace milvus::index

@@ -22,9 +22,9 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/pkg/mq/msgstream"
-	"github.com/milvus-io/milvus/pkg/util/commonpbutil"
-	"github.com/milvus-io/milvus/pkg/util/testutils"
+	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/v2/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/testutils"
 )
 
 const defaultDim = 128
@@ -53,7 +53,7 @@ func buildInsertMsg(collectionID int64, partitionID int64, segmentID int64, chan
 }
 
 func emptyDeleteMsg(collectionID int64, partitionID int64, channel string) *msgstream.DeleteMsg {
-	deleteReq := msgpb.DeleteRequest{
+	deleteReq := &msgpb.DeleteRequest{
 		Base: commonpbutil.NewMsgBase(
 			commonpbutil.WithMsgType(commonpb.MsgType_Delete),
 			commonpbutil.WithTimeStamp(0),
@@ -70,7 +70,7 @@ func emptyDeleteMsg(collectionID int64, partitionID int64, channel string) *msgs
 }
 
 func emptyInsertMsg(collectionID int64, partitionID int64, segmentID int64, channel string) *msgstream.InsertMsg {
-	insertReq := msgpb.InsertRequest{
+	insertReq := &msgpb.InsertRequest{
 		Base: commonpbutil.NewMsgBase(
 			commonpbutil.WithMsgType(commonpb.MsgType_Insert),
 			commonpbutil.WithTimeStamp(0),

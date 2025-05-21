@@ -17,13 +17,14 @@
 package server
 
 import (
+	"context"
 	"os"
 	"sync"
 
 	"github.com/cockroachdb/errors"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/v2/log"
 )
 
 // Rmq is global rocksmq instance that will be initialized only once
@@ -36,7 +37,7 @@ var once sync.Once
 func InitRocksMQ(path string) error {
 	var finalErr error
 	once.Do(func() {
-		log.Debug("initializing global rmq", zap.String("path", path))
+		log.Ctx(context.TODO()).Debug("initializing global rmq", zap.String("path", path))
 		var fi os.FileInfo
 		fi, finalErr = os.Stat(path)
 		if os.IsNotExist(finalErr) {
@@ -58,7 +59,7 @@ func InitRocksMQ(path string) error {
 
 // CloseRocksMQ is used to close global rocksmq
 func CloseRocksMQ() {
-	log.Debug("Close Rocksmq!")
+	log.Ctx(context.TODO()).Debug("Close Rocksmq!")
 	if Rmq != nil && Rmq.store != nil {
 		Rmq.Close()
 	}

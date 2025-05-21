@@ -6,13 +6,14 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/parser/planparserv2"
-	"github.com/milvus-io/milvus/internal/proto/planpb"
 	"github.com/milvus-io/milvus/internal/util/testutil"
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/proto/planpb"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 func TestParsePartitionKeys(t *testing.T) {
@@ -116,7 +117,7 @@ func TestParsePartitionKeys(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			// test search plan
-			searchPlan, err := planparserv2.CreateSearchPlan(schemaHelper, tc.expr, "fvec_field", queryInfo)
+			searchPlan, err := planparserv2.CreateSearchPlan(schemaHelper, tc.expr, "fvec_field", queryInfo, nil)
 			assert.NoError(t, err)
 			expr, err := ParseExprFromPlan(searchPlan)
 			assert.NoError(t, err)
@@ -129,7 +130,7 @@ func TestParsePartitionKeys(t *testing.T) {
 			}
 
 			// test query plan
-			queryPlan, err := planparserv2.CreateRetrievePlan(schemaHelper, tc.expr)
+			queryPlan, err := planparserv2.CreateRetrievePlan(schemaHelper, tc.expr, nil)
 			assert.NoError(t, err)
 			expr, err = ParseExprFromPlan(queryPlan)
 			assert.NoError(t, err)
@@ -172,7 +173,7 @@ func TestParseIntRanges(t *testing.T) {
 	// test query plan
 	{
 		expr := "cluster_key_field > 50"
-		queryPlan, err := planparserv2.CreateRetrievePlan(schemaHelper, expr)
+		queryPlan, err := planparserv2.CreateRetrievePlan(schemaHelper, expr, nil)
 		assert.NoError(t, err)
 		planExpr, err := ParseExprFromPlan(queryPlan)
 		assert.NoError(t, err)
@@ -189,7 +190,7 @@ func TestParseIntRanges(t *testing.T) {
 	// test binary query plan
 	{
 		expr := "cluster_key_field > 50 and cluster_key_field <= 100"
-		queryPlan, err := planparserv2.CreateRetrievePlan(schemaHelper, expr)
+		queryPlan, err := planparserv2.CreateRetrievePlan(schemaHelper, expr, nil)
 		assert.NoError(t, err)
 		planExpr, err := ParseExprFromPlan(queryPlan)
 		assert.NoError(t, err)
@@ -205,7 +206,7 @@ func TestParseIntRanges(t *testing.T) {
 	// test binary query plan
 	{
 		expr := "cluster_key_field >= 50 and cluster_key_field < 100"
-		queryPlan, err := planparserv2.CreateRetrievePlan(schemaHelper, expr)
+		queryPlan, err := planparserv2.CreateRetrievePlan(schemaHelper, expr, nil)
 		assert.NoError(t, err)
 		planExpr, err := ParseExprFromPlan(queryPlan)
 		assert.NoError(t, err)
@@ -221,7 +222,7 @@ func TestParseIntRanges(t *testing.T) {
 	// test binary query plan
 	{
 		expr := "cluster_key_field in [100]"
-		queryPlan, err := planparserv2.CreateRetrievePlan(schemaHelper, expr)
+		queryPlan, err := planparserv2.CreateRetrievePlan(schemaHelper, expr, nil)
 		assert.NoError(t, err)
 		planExpr, err := ParseExprFromPlan(queryPlan)
 		assert.NoError(t, err)
@@ -263,7 +264,7 @@ func TestParseStrRanges(t *testing.T) {
 	// test query plan
 	{
 		expr := "cluster_key_field >= \"aaa\""
-		queryPlan, err := planparserv2.CreateRetrievePlan(schemaHelper, expr)
+		queryPlan, err := planparserv2.CreateRetrievePlan(schemaHelper, expr, nil)
 		assert.NoError(t, err)
 		planExpr, err := ParseExprFromPlan(queryPlan)
 		assert.NoError(t, err)
@@ -275,5 +276,216 @@ func TestParseStrRanges(t *testing.T) {
 		assert.Nil(t, range0.upper)
 		assert.Equal(t, range0.includeLower, true)
 		assert.Equal(t, range0.includeUpper, false)
+	}
+}
+
+func TestValidatePartitionKeyIsolation(t *testing.T) {
+	prefix := "TestValidatePartitionKeyIsolation"
+	collectionName := prefix + funcutil.GenRandomStr()
+
+	fieldName2Type := make(map[string]schemapb.DataType)
+	fieldName2Type["int64_field"] = schemapb.DataType_Int64
+	fieldName2Type["varChar_field"] = schemapb.DataType_VarChar
+	fieldName2Type["fvec_field"] = schemapb.DataType_FloatVector
+	schema := testutil.ConstructCollectionSchemaByDataType(collectionName, fieldName2Type,
+		"int64_field", false, 8)
+	schema.Properties = append(schema.Properties, &commonpb.KeyValuePair{
+		Key:   common.PartitionKeyIsolationKey,
+		Value: "true",
+	})
+	partitionKeyField := &schemapb.FieldSchema{
+		Name:           "key_field",
+		DataType:       schemapb.DataType_Int64,
+		IsPartitionKey: true,
+	}
+	schema.Fields = append(schema.Fields, partitionKeyField)
+	fieldID := common.StartOfUserFieldID
+	for _, field := range schema.Fields {
+		field.FieldID = int64(fieldID)
+		fieldID++
+	}
+	schemaHelper, err := typeutil.CreateSchemaHelper(schema)
+	require.NoError(t, err)
+
+	type testCase struct {
+		name                string
+		expr                string
+		expectedErrorString string
+	}
+	cases := []testCase{
+		{
+			name:                "partition key isolation equal",
+			expr:                "key_field == 10",
+			expectedErrorString: "",
+		},
+		{
+			name:                "partition key isolation equal AND with same field equal",
+			expr:                "key_field == 10 && key_field == 10",
+			expectedErrorString: "",
+		},
+		{
+			name:                "partition key isolation equal AND with same field equal diff",
+			expr:                "key_field == 10 && key_field == 20",
+			expectedErrorString: "",
+		},
+		{
+			name:                "partition key isolation equal AND with same field equal 3",
+			expr:                "key_field == 10 && key_field == 11 && key_field == 12",
+			expectedErrorString: "",
+		},
+		{
+			name:                "partition key isolation equal AND with varchar field equal",
+			expr:                "key_field == 10 && varChar_field == 'a'",
+			expectedErrorString: "",
+		},
+		{
+			name:                "partition key isolation equal AND with varchar field not equal",
+			expr:                "key_field == 10 && varChar_field != 'a'",
+			expectedErrorString: "",
+		},
+		{
+			name:                "partition key isolation equal AND with varchar field in",
+			expr:                "key_field == 10 && varChar_field in ['a', 'b']",
+			expectedErrorString: "",
+		},
+		{
+			name:                "partition key isolation equal AND with varchar field in Reversed",
+			expr:                "varChar_field in ['a', 'b'] && key_field == 10",
+			expectedErrorString: "",
+		},
+		{
+			name:                "partition key isolation equal AND with varchar field OR",
+			expr:                "key_field == 10 && (varChar_field == 'a' || varChar_field == 'b')",
+			expectedErrorString: "",
+		},
+		{
+			name:                "partition key isolation equal AND with varchar field OR Reversed",
+			expr:                "(varChar_field == 'a' || varChar_field == 'b') && key_field == 10",
+			expectedErrorString: "",
+		},
+		{
+			name:                "partition key isolation equal to arithmic operations",
+			expr:                "key_field == (1+1)",
+			expectedErrorString: "",
+		},
+		{
+			name:                "partition key isolation empty",
+			expr:                "",
+			expectedErrorString: "partition key not found in expr or the expr is invalid when validating partition key isolation",
+		},
+		{
+			name:                "partition key isolation not equal",
+			expr:                "key_field != 10",
+			expectedErrorString: "partition key isolation does not support NotEqual",
+		},
+		{
+			name:                "partition key isolation term",
+			expr:                "key_field in [10]",
+			expectedErrorString: "partition key isolation does not support IN",
+		},
+		{
+			name:                "partition key isolation term multiple",
+			expr:                "key_field in [10, 20]",
+			expectedErrorString: "partition key isolation does not support IN",
+		},
+		{
+			name:                "partition key isolation NOT term",
+			expr:                "key_field not in [10]",
+			expectedErrorString: "partition key isolation does not support IN",
+		},
+		{
+			name:                "partition key isolation less",
+			expr:                "key_field < 10",
+			expectedErrorString: "partition key isolation does not support LessThan",
+		},
+		{
+			name:                "partition key isolation less or equal",
+			expr:                "key_field <= 10",
+			expectedErrorString: "partition key isolation does not support LessEq",
+		},
+		{
+			name:                "partition key isolation greater",
+			expr:                "key_field > 10",
+			expectedErrorString: "partition key isolation does not support GreaterThan",
+		},
+		{
+			name:                "partition key isolation equal greator or equal",
+			expr:                "key_field >= 10",
+			expectedErrorString: "partition key isolation does not support GreaterEqual",
+		},
+		{
+			name:                "partition key isolation binary range",
+			expr:                "1 < key_field < 10",
+			expectedErrorString: "partition key isolation does not support BinaryRange",
+		},
+		{
+			name:                "partition key isolation NOT equal",
+			expr:                "not(key_field == 10)",
+			expectedErrorString: "partition key isolation does not support NOT",
+		},
+		{
+			name:                "partition key isolation equal AND with same field term",
+			expr:                "key_field == 10 && key_field in [10]",
+			expectedErrorString: "partition key isolation does not support IN",
+		},
+		{
+			name:                "partition key isolation equal OR with same field equal",
+			expr:                "key_field == 10 || key_field == 11",
+			expectedErrorString: "partition key isolation does not support OR",
+		},
+		{
+			name:                "partition key isolation equal OR with same field equal Reversed",
+			expr:                "key_field == 11 || key_field == 10",
+			expectedErrorString: "partition key isolation does not support OR",
+		},
+		{
+			name:                "partition key isolation equal OR with other field equal",
+			expr:                "key_field == 10 || varChar_field == 'a'",
+			expectedErrorString: "partition key isolation does not support OR",
+		},
+		{
+			name:                "partition key isolation equal OR with other field equal Reversed",
+			expr:                "varChar_field == 'a' || key_field == 10",
+			expectedErrorString: "partition key isolation does not support OR",
+		},
+		{
+			name:                "partition key isolation equal OR with other field equal",
+			expr:                "key_field == 10 || varChar_field == 'a'",
+			expectedErrorString: "partition key isolation does not support OR",
+		},
+		{
+			name:                "partition key isolation equal AND",
+			expr:                "key_field == 10 && (key_field == 10 || key_field == 11)",
+			expectedErrorString: "partition key isolation does not support OR",
+		},
+		{
+			name:                "partition key isolation other field equal",
+			expr:                "varChar_field == 'a'",
+			expectedErrorString: "partition key not found in expr or the expr is invalid when validating partition key isolation",
+		},
+		{
+			name:                "partition key isolation other field equal AND",
+			expr:                "varChar_field == 'a' && int64_field == 1",
+			expectedErrorString: "partition key not found in expr or the expr is invalid when validating partition key isolation",
+		},
+		{
+			name:                "partition key isolation complex OR",
+			expr:                "(key_field == 10 and int64_field == 11) or (key_field == 10 and varChar_field == 'a')",
+			expectedErrorString: "partition key isolation does not support OR",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			queryPlan, err := planparserv2.CreateRetrievePlan(schemaHelper, tc.expr, nil)
+			assert.NoError(t, err)
+			planExpr, err := ParseExprFromPlan(queryPlan)
+			assert.NoError(t, err)
+			if tc.expectedErrorString != "" {
+				assert.ErrorContains(t, ValidatePartitionKeyIsolation(planExpr), tc.expectedErrorString)
+			} else {
+				assert.NoError(t, ValidatePartitionKeyIsolation(planExpr))
+			}
+		})
 	}
 }

@@ -17,7 +17,6 @@
 package storage
 
 import (
-	"encoding/json"
 	"fmt"
 	"strconv"
 	"time"
@@ -26,8 +25,9 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/internal/json"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 type IndexFileBinlogCodec struct{}
@@ -221,7 +221,7 @@ func (codec *IndexFileBinlogCodec) DeserializeImpl(blobs []*Blob) (
 			switch dataType {
 			// just for backward compatibility
 			case schemapb.DataType_Int8:
-				// todo: smellthemoon, valid_data may need to check when create index
+				// todo: valid_data may need to check when create index
 				content, _, err := eventReader.GetByteFromPayload()
 				if err != nil {
 					log.Warn("failed to get byte from payload",
@@ -321,7 +321,7 @@ func (indexCodec *IndexCodec) Deserialize(blobs []*Blob) ([]*Blob, map[string]st
 		break
 	}
 	if file == nil {
-		return nil, nil, "", InvalidUniqueID, fmt.Errorf("can not find params blob")
+		return nil, nil, "", InvalidUniqueID, errors.New("can not find params blob")
 	}
 	info := struct {
 		Params    map[string]string

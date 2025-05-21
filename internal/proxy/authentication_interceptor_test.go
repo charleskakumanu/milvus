@@ -9,11 +9,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc/metadata"
 
-	"github.com/milvus-io/milvus/internal/mocks"
 	"github.com/milvus-io/milvus/internal/util/hookutil"
-	"github.com/milvus-io/milvus/pkg/util"
-	"github.com/milvus-io/milvus/pkg/util/crypto"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util"
+	"github.com/milvus-io/milvus/pkg/v2/util/crypto"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 // validAuth validates the authentication
@@ -39,10 +38,9 @@ func TestValidAuth(t *testing.T) {
 	res = validAuth(ctx, []string{"xxx"})
 	assert.False(t, res)
 	// normal metadata
-	rootCoord := &MockRootCoordClientInterface{}
-	queryCoord := &mocks.MockQueryCoordClient{}
+	mix := &MockMixCoordClientInterface{}
 	mgr := newShardClientMgr()
-	err := InitMetaCache(ctx, rootCoord, queryCoord, mgr)
+	err := InitMetaCache(ctx, mix, mgr)
 	assert.NoError(t, err)
 	res = validAuth(ctx, []string{crypto.Base64Encode("mockUser:mockPass")})
 	assert.True(t, res)
@@ -72,10 +70,9 @@ func TestAuthenticationInterceptor(t *testing.T) {
 	_, err := AuthenticationInterceptor(ctx)
 	assert.Error(t, err)
 	// mock metacache
-	rootCoord := &MockRootCoordClientInterface{}
-	queryCoord := &mocks.MockQueryCoordClient{}
+	queryCoord := &MockMixCoordClientInterface{}
 	mgr := newShardClientMgr()
-	err = InitMetaCache(ctx, rootCoord, queryCoord, mgr)
+	err = InitMetaCache(ctx, queryCoord, mgr)
 	assert.NoError(t, err)
 	// with invalid metadata
 	md := metadata.Pairs("xxx", "yyy")
@@ -119,7 +116,7 @@ func TestAuthenticationInterceptor(t *testing.T) {
 
 	{
 		// verify apikey error
-		SetMockAPIHook("", errors.New("err"))
+		hookutil.SetMockAPIHook("", errors.New("err"))
 		md = metadata.Pairs(util.HeaderAuthorize, crypto.Base64Encode("mockapikey"))
 		ctx = metadata.NewIncomingContext(ctx, md)
 		_, err = AuthenticationInterceptor(ctx)
@@ -127,7 +124,7 @@ func TestAuthenticationInterceptor(t *testing.T) {
 	}
 
 	{
-		SetMockAPIHook("mockUser", nil)
+		hookutil.SetMockAPIHook("mockUser", nil)
 		md = metadata.Pairs(util.HeaderAuthorize, crypto.Base64Encode("mockapikey"))
 		ctx = metadata.NewIncomingContext(ctx, md)
 		authCtx, err := AuthenticationInterceptor(ctx)
@@ -141,5 +138,5 @@ func TestAuthenticationInterceptor(t *testing.T) {
 		user, _ := parseMD(rawToken)
 		assert.Equal(t, "mockUser", user)
 	}
-	hoo = hookutil.DefaultHook{}
+	hookutil.SetTestHook(hookutil.DefaultHook{})
 }

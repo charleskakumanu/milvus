@@ -129,6 +129,11 @@ if (LINUX OR MSYS)
                   "-Wno-error"
                   "-Wno-all"
                   )
+    if (USE_ASAN STREQUAL "ON") 
+        message( STATUS "Building Milvus Core Using AddressSanitizer")
+        add_compile_options(-fno-stack-protector -fno-omit-frame-pointer -fno-var-tracking -fsanitize=address)
+        add_link_options(-fno-stack-protector -fno-omit-frame-pointer -fno-var-tracking -fsanitize=address)
+    endif()
     if (CMAKE_BUILD_TYPE STREQUAL "Release")
         append_flags( CMAKE_CXX_FLAGS
                 "-O3"
@@ -143,7 +148,11 @@ if ( APPLE )
             "-DELPP_THREAD_SAFE"
             "-fopenmp"
             "-pedantic"
-            "-Wno-all"
+            "-Wall"
+            "-D_DARWIN_C_SOURCE"
+            "-Wno-gnu-zero-variadic-macro-arguments"
+            "-Wno-variadic-macros"
+            "-Wno-reorder-ctor"
             "-DBOOST_STACKTRACE_GNU_SOURCE_NOT_REQUIRED=1"
             )
 endif ()
@@ -287,6 +296,12 @@ install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/src/segcore/
         FILES_MATCHING PATTERN "*_c.h"
 )
 
+# Install exec/expression/function
+install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/src/exec/expression/function/
+        DESTINATION include/exec/expression/function
+        FILES_MATCHING PATTERN "*_c.h"
+)
+
 # Install indexbuilder
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/src/indexbuilder/
         DESTINATION include/indexbuilder
@@ -305,6 +320,12 @@ install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/src/common/
         FILES_MATCHING PATTERN "*_c.h"
 )
 
+# Install monitor
+install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/src/monitor/
+        DESTINATION include/monitor
+        FILES_MATCHING PATTERN "*_c.h"
+)
+
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/src/futures/
         DESTINATION include/futures
         FILES_MATCHING PATTERN "*.h"
@@ -313,4 +334,3 @@ install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/src/futures/
 install(DIRECTORY ${CMAKE_BINARY_DIR}/lib/
         DESTINATION ${CMAKE_INSTALL_FULL_LIBDIR}
 )
-

@@ -18,9 +18,18 @@ package allocator
 
 import (
 	"github.com/milvus-io/milvus/internal/tso"
-	"github.com/milvus-io/milvus/pkg/kv"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/kv"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
+
+type GlobalIDAllocatorInterface interface {
+	// Initialize will initialize the created global TSO allocator.
+	Initialize() error
+	// Alloc allocates the id of the count number.
+	Alloc(count uint32) (typeutil.UniqueID, typeutil.UniqueID, error)
+	// AllocOne allocates one id.
+	AllocOne() (typeutil.UniqueID, error)
+}
 
 // GlobalIDAllocator is the global single point TSO allocator.
 type GlobalIDAllocator struct {

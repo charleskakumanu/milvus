@@ -25,32 +25,37 @@ import (
 
 	"github.com/samber/lo"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
-	"github.com/milvus-io/milvus/internal/datanode/compaction"
+	"github.com/milvus-io/milvus/internal/compaction"
+	"github.com/milvus-io/milvus/internal/datanode/compactor"
 	"github.com/milvus-io/milvus/internal/datanode/importv2"
-	"github.com/milvus-io/milvus/internal/datanode/io"
-	"github.com/milvus-io/milvus/internal/datanode/metacache"
-	"github.com/milvus-io/milvus/internal/datanode/util"
+	"github.com/milvus-io/milvus/internal/flushcommon/io"
+	"github.com/milvus-io/milvus/internal/flushcommon/metacache/pkoracle"
 	"github.com/milvus-io/milvus/internal/metastore/kv/binlog"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/util/importutilv2"
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/metrics"
-	"github.com/milvus-io/milvus/pkg/tracer"
-	"github.com/milvus-io/milvus/pkg/util/conc"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/metricsinfo"
-	"github.com/milvus-io/milvus/pkg/util/tsoutil"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/metrics"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/workerpb"
+	"github.com/milvus-io/milvus/pkg/v2/taskcommon"
+	"github.com/milvus-io/milvus/pkg/v2/tracer"
+	"github.com/milvus-io/milvus/pkg/v2/util/conc"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/tsoutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 // WatchDmChannels is not in use
 func (node *DataNode) WatchDmChannels(ctx context.Context, in *datapb.WatchDmChannelsRequest) (*commonpb.Status, error) {
-	log.Warn("DataNode WatchDmChannels is not in use")
+	log.Ctx(ctx).Warn("DataNode WatchDmChannels is not in use")
 
 	// TODO ERROR OF GRPC NOT IN USE
 	return merr.Success(), nil
@@ -59,8 +64,8 @@ func (node *DataNode) WatchDmChannels(ctx context.Context, in *datapb.WatchDmCha
 // GetComponentStates will return current state of DataNode
 func (node *DataNode) GetComponentStates(ctx context.Context, req *milvuspb.GetComponentStatesRequest) (*milvuspb.ComponentStates, error) {
 	nodeID := common.NotRegisteredID
-	state := node.stateCode.Load().(commonpb.StateCode)
-	log.Debug("DataNode current state", zap.String("State", state.String()))
+	state := node.GetStateCode()
+	log.Ctx(ctx).Debug("DataNode current state", zap.String("State", state.String()))
 	if node.GetSession() != nil && node.session.Registered() {
 		nodeID = node.GetSession().ServerID
 	}
@@ -69,7 +74,7 @@ func (node *DataNode) GetComponentStates(ctx context.Context, req *milvuspb.GetC
 			// NodeID:    Params.NodeID, // will race with DataNode.Register()
 			NodeID:    nodeID,
 			Role:      node.Role,
-			StateCode: node.stateCode.Load().(commonpb.StateCode),
+			StateCode: state,
 		},
 		SubcomponentStates: make([]*milvuspb.ComponentInfo, 0),
 		Status:             merr.Success(),
@@ -132,9 +137,9 @@ func (node *DataNode) GetStatisticsChannel(ctx context.Context, req *internalpb.
 
 // ShowConfigurations returns the configurations of DataNode matching req.Pattern
 func (node *DataNode) ShowConfigurations(ctx context.Context, req *internalpb.ShowConfigurationsRequest) (*internalpb.ShowConfigurationsResponse, error) {
-	log.Debug("DataNode.ShowConfigurations", zap.String("pattern", req.Pattern))
+	log.Ctx(ctx).Debug("DataNode.ShowConfigurations", zap.String("pattern", req.Pattern))
 	if err := merr.CheckHealthy(node.GetStateCode()); err != nil {
-		log.Warn("DataNode.ShowConfigurations failed", zap.Int64("nodeId", node.GetNodeID()), zap.Error(err))
+		log.Ctx(ctx).Warn("DataNode.ShowConfigurations failed", zap.Int64("nodeId", node.GetNodeID()), zap.Error(err))
 
 		return &internalpb.ShowConfigurationsResponse{
 			Status:        merr.Status(err),
@@ -159,45 +164,27 @@ func (node *DataNode) ShowConfigurations(ctx context.Context, req *internalpb.Sh
 // GetMetrics return datanode metrics
 func (node *DataNode) GetMetrics(ctx context.Context, req *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error) {
 	if err := merr.CheckHealthy(node.GetStateCode()); err != nil {
-		log.Warn("DataNode.GetMetrics failed", zap.Int64("nodeId", node.GetNodeID()), zap.Error(err))
+		log.Ctx(ctx).Warn("DataNode.GetMetrics failed", zap.Int64("nodeId", node.GetNodeID()), zap.Error(err))
 
 		return &milvuspb.GetMetricsResponse{
 			Status: merr.Status(err),
 		}, nil
 	}
 
-	metricType, err := metricsinfo.ParseMetricType(req.Request)
+	resp := &milvuspb.GetMetricsResponse{
+		Status: merr.Success(),
+		ComponentName: metricsinfo.ConstructComponentName(typeutil.DataNodeRole,
+			paramtable.GetNodeID()),
+	}
+
+	ret, err := node.metricsRequest.ExecuteMetricsRequest(ctx, req)
 	if err != nil {
-		log.Warn("DataNode.GetMetrics failed to parse metric type",
-			zap.Int64("nodeID", node.GetNodeID()),
-			zap.String("req", req.Request),
-			zap.Error(err))
-
-		return &milvuspb.GetMetricsResponse{
-			Status: merr.Status(err),
-		}, nil
+		resp.Status = merr.Status(err)
+		return resp, nil
 	}
 
-	if metricType == metricsinfo.SystemInfoMetrics {
-		systemInfoMetrics, err := node.getSystemInfoMetrics(ctx, req)
-		if err != nil {
-			log.Warn("DataNode GetMetrics failed", zap.Int64("nodeID", node.GetNodeID()), zap.Error(err))
-			return &milvuspb.GetMetricsResponse{
-				Status: merr.Status(err),
-			}, nil
-		}
-
-		return systemInfoMetrics, nil
-	}
-
-	log.RatedWarn(60, "DataNode.GetMetrics failed, request metric type is not implemented yet",
-		zap.Int64("nodeID", node.GetNodeID()),
-		zap.String("req", req.Request),
-		zap.String("metric_type", metricType))
-
-	return &milvuspb.GetMetricsResponse{
-		Status: merr.Status(merr.WrapErrMetricNotFound(metricType)),
-	}, nil
+	resp.Response = ret
+	return resp, nil
 }
 
 // CompactionV2 handles compaction request from DataCoord
@@ -214,35 +201,46 @@ func (node *DataNode) CompactionV2(ctx context.Context, req *datapb.CompactionPl
 		return merr.Success(), nil
 	}
 
+	if req.GetBeginLogID() == 0 {
+		return merr.Status(merr.WrapErrParameterInvalidMsg("invalid beginLogID")), nil
+	}
+
+	if req.GetPreAllocatedLogIDs().GetBegin() == 0 || req.GetPreAllocatedLogIDs().GetEnd() == 0 {
+		return merr.Status(merr.WrapErrParameterInvalidMsg(fmt.Sprintf("invalid beginID %d or invalid endID %d", req.GetPreAllocatedLogIDs().GetBegin(), req.GetPreAllocatedLogIDs().GetEnd()))), nil
+	}
+
 	/*
 		spanCtx := trace.SpanContextFromContext(ctx)
 
 		taskCtx := trace.ContextWithSpanContext(node.ctx, spanCtx)*/
 	taskCtx := tracer.Propagate(ctx, node.ctx)
 
-	var task compaction.Compactor
+	var task compactor.Compactor
 	binlogIO := io.NewBinlogIO(node.chunkManager)
 	switch req.GetType() {
 	case datapb.CompactionType_Level0DeleteCompaction:
-		task = compaction.NewLevelZeroCompactionTask(
+		task = compactor.NewLevelZeroCompactionTask(
 			taskCtx,
 			binlogIO,
-			node.allocator,
 			node.chunkManager,
 			req,
 		)
 	case datapb.CompactionType_MixCompaction:
-		task = compaction.NewMixCompactionTask(
+		if req.GetPreAllocatedSegmentIDs() == nil || req.GetPreAllocatedSegmentIDs().GetBegin() == 0 {
+			return merr.Status(merr.WrapErrParameterInvalidMsg("invalid pre-allocated segmentID range")), nil
+		}
+		task = compactor.NewMixCompactionTask(
 			taskCtx,
 			binlogIO,
-			node.allocator,
 			req,
 		)
 	case datapb.CompactionType_ClusteringCompaction:
-		task = compaction.NewClusteringCompactionTask(
+		if req.GetPreAllocatedSegmentIDs() == nil || req.GetPreAllocatedSegmentIDs().GetBegin() == 0 {
+			return merr.Status(merr.WrapErrParameterInvalidMsg("invalid pre-allocated segmentID range")), nil
+		}
+		task = compactor.NewClusteringCompactionTask(
 			taskCtx,
 			binlogIO,
-			node.allocator,
 			req,
 		)
 	default:
@@ -250,15 +248,19 @@ func (node *DataNode) CompactionV2(ctx context.Context, req *datapb.CompactionPl
 		return merr.Status(merr.WrapErrParameterInvalidMsg("Unknown compaction type: %v", req.GetType().String())), nil
 	}
 
-	node.compactionExecutor.Execute(task)
-	return merr.Success(), nil
+	succeed, err := node.compactionExecutor.Execute(task)
+	if succeed {
+		return merr.Success(), nil
+	} else {
+		return merr.Status(err), nil
+	}
 }
 
 // GetCompactionState called by DataCoord
 // return status of all compaction plans
 func (node *DataNode) GetCompactionState(ctx context.Context, req *datapb.CompactionStateRequest) (*datapb.CompactionStateResponse, error) {
 	if err := merr.CheckHealthy(node.GetStateCode()); err != nil {
-		log.Warn("DataNode.GetCompactionState failed", zap.Int64("nodeId", node.GetNodeID()), zap.Error(err))
+		log.Ctx(ctx).Warn("DataNode.GetCompactionState failed", zap.Int64("nodeId", node.GetNodeID()), zap.Error(err))
 		return &datapb.CompactionStateResponse{
 			Status: merr.Status(err),
 		}, nil
@@ -306,32 +308,41 @@ func (node *DataNode) SyncSegments(ctx context.Context, req *datapb.SyncSegments
 		allSegments[segID] = struct{}{}
 	}
 
-	missingSegments := ds.metacache.DetectMissingSegments(allSegments)
+	missingSegments := ds.GetMetaCache().DetectMissingSegments(allSegments)
 
 	newSegments := make([]*datapb.SyncSegmentInfo, 0, len(missingSegments))
 	futures := make([]*conc.Future[any], 0, len(missingSegments))
 
 	for _, segID := range missingSegments {
-		segID := segID
 		newSeg := req.GetSegmentInfos()[segID]
-		newSegments = append(newSegments, newSeg)
-		future := io.GetOrCreateStatsPool().Submit(func() (any, error) {
-			var val *metacache.BloomFilterSet
-			var err error
-			err = binlog.DecompressBinLog(storage.StatsBinlog, req.GetCollectionId(), req.GetPartitionId(), newSeg.GetSegmentId(), []*datapb.FieldBinlog{newSeg.GetPkStatsLog()})
-			if err != nil {
-				log.Warn("failed to DecompressBinLog", zap.Error(err))
-				return val, err
+		switch newSeg.GetLevel() {
+		case datapb.SegmentLevel_L0:
+			log.Warn("segment level is L0, may be the channel has not been successfully watched yet", zap.Int64("segmentID", segID))
+		case datapb.SegmentLevel_Legacy:
+			log.Warn("segment level is legacy, please check", zap.Int64("segmentID", segID))
+		default:
+			if newSeg.GetState() == commonpb.SegmentState_Flushed {
+				log.Info("segment loading PKs", zap.Int64("segmentID", segID))
+				newSegments = append(newSegments, newSeg)
+				future := io.GetOrCreateStatsPool().Submit(func() (any, error) {
+					var val *pkoracle.BloomFilterSet
+					var err error
+					err = binlog.DecompressBinLog(storage.StatsBinlog, req.GetCollectionId(), req.GetPartitionId(), newSeg.GetSegmentId(), []*datapb.FieldBinlog{newSeg.GetPkStatsLog()})
+					if err != nil {
+						log.Warn("failed to DecompressBinLog", zap.Error(err))
+						return val, err
+					}
+					pks, err := compaction.LoadStats(ctx, node.chunkManager, ds.GetMetaCache().Schema(), newSeg.GetSegmentId(), []*datapb.FieldBinlog{newSeg.GetPkStatsLog()})
+					if err != nil {
+						log.Warn("failed to load segment stats log", zap.Error(err))
+						return val, err
+					}
+					val = pkoracle.NewBloomFilterSet(pks...)
+					return val, nil
+				})
+				futures = append(futures, future)
 			}
-			pks, err := util.LoadStats(ctx, node.chunkManager, ds.metacache.Schema(), newSeg.GetSegmentId(), []*datapb.FieldBinlog{newSeg.GetPkStatsLog()})
-			if err != nil {
-				log.Warn("failed to load segment stats log", zap.Error(err))
-				return val, err
-			}
-			val = metacache.NewBloomFilterSet(pks...)
-			return val, nil
-		})
-		futures = append(futures, future)
+		}
 	}
 
 	err := conc.AwaitAll(futures...)
@@ -339,18 +350,18 @@ func (node *DataNode) SyncSegments(ctx context.Context, req *datapb.SyncSegments
 		return merr.Status(err), nil
 	}
 
-	newSegmentsBF := lo.Map(futures, func(future *conc.Future[any], _ int) *metacache.BloomFilterSet {
-		return future.Value().(*metacache.BloomFilterSet)
+	newSegmentsBF := lo.Map(futures, func(future *conc.Future[any], _ int) *pkoracle.BloomFilterSet {
+		return future.Value().(*pkoracle.BloomFilterSet)
 	})
 
-	ds.metacache.UpdateSegmentView(req.GetPartitionId(), newSegments, newSegmentsBF, allSegments)
+	ds.GetMetaCache().UpdateSegmentView(req.GetPartitionId(), newSegments, newSegmentsBF, allSegments)
 	return merr.Success(), nil
 }
 
 func (node *DataNode) NotifyChannelOperation(ctx context.Context, req *datapb.ChannelOperationsRequest) (*commonpb.Status, error) {
-	log.Ctx(ctx).Info("DataNode receives NotifyChannelOperation",
-		zap.Int("operation count", len(req.GetInfos())))
+	log := log.Ctx(ctx).With(zap.Int("operation count", len(req.GetInfos())))
 
+	log.Info("DataNode receives NotifyChannelOperation")
 	if node.channelManager == nil {
 		log.Warn("DataNode NotifyChannelOperation failed due to nil channelManager")
 		return merr.Status(merr.WrapErrServiceInternal("channelManager is nil! Ignore if you are upgrading datanode/coord to rpc based watch")), nil
@@ -452,6 +463,8 @@ func (node *DataNode) ImportV2(ctx context.Context, req *datapb.ImportRequest) (
 	log := log.Ctx(ctx).With(zap.Int64("taskID", req.GetTaskID()),
 		zap.Int64("jobID", req.GetJobID()),
 		zap.Int64("collectionID", req.GetCollectionID()),
+		zap.Int64s("partitionIDs", req.GetPartitionIDs()),
+		zap.Strings("vchannels", req.GetVchannels()),
 		zap.Any("segments", req.GetRequestSegments()),
 		zap.Any("files", req.GetFiles()))
 
@@ -479,15 +492,16 @@ func (node *DataNode) QueryPreImport(ctx context.Context, req *datapb.QueryPreIm
 	if err := merr.CheckHealthy(node.GetStateCode()); err != nil {
 		return &datapb.QueryPreImportResponse{Status: merr.Status(err)}, nil
 	}
-	status := merr.Success()
 	task := node.importTaskMgr.Get(req.GetTaskID())
 	if task == nil {
-		status = merr.Status(importv2.WrapTaskNotFoundError(req.GetTaskID()))
+		return &datapb.QueryPreImportResponse{
+			Status: merr.Status(importv2.WrapTaskNotFoundError(req.GetTaskID())),
+		}, nil
 	}
 	log.RatedInfo(10, "datanode query preimport", zap.String("state", task.GetState().String()),
 		zap.String("reason", task.GetReason()))
 	return &datapb.QueryPreImportResponse{
-		Status: status,
+		Status: merr.Success(),
 		TaskID: task.GetTaskID(),
 		State:  task.GetState(),
 		Reason: task.GetReason(),
@@ -505,12 +519,10 @@ func (node *DataNode) QueryImport(ctx context.Context, req *datapb.QueryImportRe
 		return &datapb.QueryImportResponse{Status: merr.Status(err)}, nil
 	}
 
-	status := merr.Success()
-
 	// query slot
 	if req.GetQuerySlot() {
 		return &datapb.QueryImportResponse{
-			Status: status,
+			Status: merr.Success(),
 			Slots:  node.importScheduler.Slots(),
 		}, nil
 	}
@@ -518,12 +530,14 @@ func (node *DataNode) QueryImport(ctx context.Context, req *datapb.QueryImportRe
 	// query import
 	task := node.importTaskMgr.Get(req.GetTaskID())
 	if task == nil {
-		status = merr.Status(importv2.WrapTaskNotFoundError(req.GetTaskID()))
+		return &datapb.QueryImportResponse{
+			Status: merr.Status(importv2.WrapTaskNotFoundError(req.GetTaskID())),
+		}, nil
 	}
 	log.RatedInfo(10, "datanode query import", zap.String("state", task.GetState().String()),
 		zap.String("reason", task.GetReason()))
 	return &datapb.QueryImportResponse{
-		Status: status,
+		Status: merr.Success(),
 		TaskID: task.GetTaskID(),
 		State:  task.GetState(),
 		Reason: task.GetReason(),
@@ -569,4 +583,219 @@ func (node *DataNode) DropCompactionPlan(ctx context.Context, req *datapb.DropCo
 	node.compactionExecutor.RemoveTask(req.GetPlanID())
 	log.Ctx(ctx).Info("DropCompactionPlans success", zap.Int64("planID", req.GetPlanID()))
 	return merr.Success(), nil
+}
+
+// CreateTask creates different types of tasks based on task type
+func (node *DataNode) CreateTask(ctx context.Context, request *workerpb.CreateTaskRequest) (*commonpb.Status, error) {
+	log.Ctx(ctx).Info("CreateTask received", zap.Any("properties", request.GetProperties()))
+	if err := merr.CheckHealthy(node.GetStateCode()); err != nil {
+		return merr.Status(err), nil
+	}
+	properties := taskcommon.NewProperties(request.GetProperties())
+	taskType, err := properties.GetTaskType()
+	if err != nil {
+		return merr.Status(err), nil
+	}
+	switch taskType {
+	case taskcommon.PreImport:
+		req := &datapb.PreImportRequest{}
+		err := proto.Unmarshal(request.GetPayload(), req)
+		if err != nil {
+			return merr.Status(err), nil
+		}
+		return node.PreImport(ctx, req)
+	case taskcommon.Import:
+		req := &datapb.ImportRequest{}
+		err := proto.Unmarshal(request.GetPayload(), req)
+		if err != nil {
+			return merr.Status(err), nil
+		}
+		return node.ImportV2(ctx, req)
+	case taskcommon.Compaction:
+		req := &datapb.CompactionPlan{}
+		err := proto.Unmarshal(request.GetPayload(), req)
+		if err != nil {
+			return merr.Status(err), nil
+		}
+		return node.CompactionV2(ctx, req)
+	case taskcommon.Index:
+		req := &workerpb.CreateJobRequest{}
+		err := proto.Unmarshal(request.GetPayload(), req)
+		if err != nil {
+			return merr.Status(err), nil
+		}
+		return node.createIndexTask(ctx, req)
+	case taskcommon.Stats:
+		req := &workerpb.CreateStatsRequest{}
+		err := proto.Unmarshal(request.GetPayload(), req)
+		if err != nil {
+			return merr.Status(err), nil
+		}
+		return node.createStatsTask(ctx, req)
+	case taskcommon.Analyze:
+		req := &workerpb.AnalyzeRequest{}
+		err := proto.Unmarshal(request.GetPayload(), req)
+		if err != nil {
+			return merr.Status(err), nil
+		}
+		return node.createAnalyzeTask(ctx, req)
+	default:
+		err := fmt.Errorf("unrecognized task type '%s', properties=%v", taskType, request.GetProperties())
+		log.Ctx(ctx).Warn("CreateTask failed", zap.Error(err))
+		return merr.Status(err), nil
+	}
+}
+
+type ResponseWithStatus interface {
+	GetStatus() *commonpb.Status
+}
+
+func wrapQueryTaskResult[Resp proto.Message](resp Resp, properties taskcommon.Properties) (*workerpb.QueryTaskResponse, error) {
+	payload, err := proto.Marshal(resp)
+	if err != nil {
+		return &workerpb.QueryTaskResponse{Status: merr.Status(err)}, nil
+	}
+	statusResp, ok := any(resp).(ResponseWithStatus)
+	if !ok {
+		return &workerpb.QueryTaskResponse{Status: merr.Status(fmt.Errorf("response does not implement GetStatus"))}, nil
+	}
+	return &workerpb.QueryTaskResponse{
+		Status:     statusResp.GetStatus(),
+		Payload:    payload,
+		Properties: properties,
+	}, nil
+}
+
+// QueryTask queries task status
+func (node *DataNode) QueryTask(ctx context.Context, request *workerpb.QueryTaskRequest) (*workerpb.QueryTaskResponse, error) {
+	if err := merr.CheckHealthy(node.GetStateCode()); err != nil {
+		return &workerpb.QueryTaskResponse{Status: merr.Status(err)}, nil
+	}
+	reqProperties := taskcommon.NewProperties(request.GetProperties())
+	clusterID, err := reqProperties.GetClusterID()
+	if err != nil {
+		return &workerpb.QueryTaskResponse{Status: merr.Status(err)}, nil
+	}
+	taskType, err := reqProperties.GetTaskType()
+	if err != nil {
+		return &workerpb.QueryTaskResponse{Status: merr.Status(err)}, nil
+	}
+	taskID, err := reqProperties.GetTaskID()
+	if err != nil {
+		return &workerpb.QueryTaskResponse{Status: merr.Status(err)}, nil
+	}
+	switch taskType {
+	case taskcommon.PreImport:
+		resp, err := node.QueryPreImport(ctx, &datapb.QueryPreImportRequest{ClusterID: clusterID, TaskID: taskID})
+		if err != nil {
+			return nil, err
+		}
+		resProperties := taskcommon.NewProperties(nil)
+		resProperties.AppendTaskState(taskcommon.FromImportState(resp.GetState()))
+		resProperties.AppendReason(resp.GetReason())
+		return wrapQueryTaskResult(resp, resProperties)
+	case taskcommon.Import:
+		resp, err := node.QueryImport(ctx, &datapb.QueryImportRequest{ClusterID: clusterID, TaskID: taskID})
+		if err != nil {
+			return nil, err
+		}
+		resProperties := taskcommon.NewProperties(nil)
+		resProperties.AppendTaskState(taskcommon.FromImportState(resp.GetState()))
+		resProperties.AppendReason(resp.GetReason())
+		return wrapQueryTaskResult(resp, resProperties)
+	case taskcommon.Compaction:
+		resp, err := node.GetCompactionState(ctx, &datapb.CompactionStateRequest{PlanID: taskID})
+		if err != nil {
+			return nil, err
+		}
+		resProperties := taskcommon.NewProperties(nil)
+		if len(resp.GetResults()) > 0 {
+			resProperties.AppendTaskState(taskcommon.FromCompactionState(resp.GetResults()[0].GetState()))
+		}
+		return wrapQueryTaskResult(resp, resProperties)
+	case taskcommon.Index:
+		resp, err := node.queryIndexTask(ctx, &workerpb.QueryJobsRequest{ClusterID: clusterID, TaskIDs: []int64{taskID}})
+		if err != nil {
+			return nil, err
+		}
+		resProperties := taskcommon.NewProperties(nil)
+		results := resp.GetIndexJobResults().GetResults()
+		if len(results) > 0 {
+			resProperties.AppendTaskState(taskcommon.State(results[0].GetState()))
+			resProperties.AppendReason(results[0].GetFailReason())
+		}
+		return wrapQueryTaskResult(resp, resProperties)
+	case taskcommon.Stats:
+		resp, err := node.queryStatsTask(ctx, &workerpb.QueryJobsRequest{ClusterID: clusterID, TaskIDs: []int64{taskID}})
+		if err != nil {
+			return nil, err
+		}
+		resProperties := taskcommon.NewProperties(nil)
+		results := resp.GetStatsJobResults().GetResults()
+		if len(results) > 0 {
+			resProperties.AppendTaskState(results[0].GetState())
+			resProperties.AppendReason(results[0].GetFailReason())
+		}
+		return wrapQueryTaskResult(resp, resProperties)
+	case taskcommon.Analyze:
+		resp, err := node.queryAnalyzeTask(ctx, &workerpb.QueryJobsRequest{ClusterID: clusterID, TaskIDs: []int64{taskID}})
+		if err != nil {
+			return nil, err
+		}
+		resProperties := taskcommon.NewProperties(nil)
+		results := resp.GetAnalyzeJobResults().GetResults()
+		if len(results) > 0 {
+			resProperties.AppendTaskState(results[0].GetState())
+			resProperties.AppendReason(results[0].GetFailReason())
+		}
+		return wrapQueryTaskResult(resp, resProperties)
+	case taskcommon.QuerySlot:
+		resp, err := node.GetJobStats(ctx, &workerpb.GetJobStatsRequest{})
+		if err != nil {
+			return nil, err
+		}
+		return wrapQueryTaskResult(resp, nil)
+	default:
+		err := fmt.Errorf("unrecognized task type '%s', properties=%v", taskType, request.GetProperties())
+		log.Ctx(ctx).Warn("QueryTask failed", zap.Error(err))
+		return &workerpb.QueryTaskResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+}
+
+// DropTask deletes specified type of task
+func (node *DataNode) DropTask(ctx context.Context, request *workerpb.DropTaskRequest) (*commonpb.Status, error) {
+	log.Ctx(ctx).Info("DropTask received", zap.Any("properties", request.GetProperties()))
+	if err := merr.CheckHealthy(node.GetStateCode()); err != nil {
+		return merr.Status(err), nil
+	}
+	properties := taskcommon.NewProperties(request.GetProperties())
+	taskType, err := properties.GetTaskType()
+	if err != nil {
+		return merr.Status(err), nil
+	}
+	taskID, err := properties.GetTaskID()
+	if err != nil {
+		return merr.Status(err), nil
+	}
+	switch taskType {
+	case taskcommon.PreImport, taskcommon.Import:
+		return node.DropImport(ctx, &datapb.DropImportRequest{TaskID: taskID})
+	case taskcommon.Compaction:
+		return node.DropCompactionPlan(ctx, &datapb.DropCompactionPlanRequest{PlanID: taskID})
+	case taskcommon.Index, taskcommon.Stats, taskcommon.Analyze:
+		jobType, err := properties.GetJobType()
+		if err != nil {
+			return merr.Status(err), nil
+		}
+		return node.DropJobsV2(ctx, &workerpb.DropJobsV2Request{
+			TaskIDs: []int64{taskID},
+			JobType: jobType,
+		})
+	default:
+		err := fmt.Errorf("unrecognized task type '%s', properties=%v", taskType, request.GetProperties())
+		log.Ctx(ctx).Warn("DropTask failed", zap.Error(err))
+		return merr.Status(err), nil
+	}
 }

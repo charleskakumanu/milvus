@@ -23,9 +23,10 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
+	"github.com/milvus-io/milvus/internal/allocator"
 	"github.com/milvus-io/milvus/internal/util/testutil"
-	"github.com/milvus-io/milvus/pkg/common"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 )
 
 func Test_AppendSystemFieldsData(t *testing.T) {
@@ -57,13 +58,10 @@ func Test_AppendSystemFieldsData(t *testing.T) {
 	schema := &schemapb.CollectionSchema{}
 	task := &ImportTask{
 		req: &datapb.ImportRequest{
-			Ts: 1000,
-			AutoIDRange: &datapb.AutoIDRange{
-				Begin: 0,
-				End:   count,
-			},
+			Ts:     1000,
 			Schema: schema,
 		},
+		allocator: allocator.NewLocalAllocator(0, count*2),
 	}
 
 	pkField.DataType = schemapb.DataType_Int64
@@ -73,7 +71,8 @@ func Test_AppendSystemFieldsData(t *testing.T) {
 	assert.Equal(t, 0, insertData.Data[pkField.GetFieldID()].RowNum())
 	assert.Nil(t, insertData.Data[common.RowIDField])
 	assert.Nil(t, insertData.Data[common.TimeStampField])
-	err = AppendSystemFieldsData(task, insertData)
+	rowNum := GetInsertDataRowCount(insertData, task.GetSchema())
+	err = AppendSystemFieldsData(task, insertData, rowNum)
 	assert.NoError(t, err)
 	assert.Equal(t, count, insertData.Data[pkField.GetFieldID()].RowNum())
 	assert.Equal(t, count, insertData.Data[common.RowIDField].RowNum())
@@ -86,7 +85,8 @@ func Test_AppendSystemFieldsData(t *testing.T) {
 	assert.Equal(t, 0, insertData.Data[pkField.GetFieldID()].RowNum())
 	assert.Nil(t, insertData.Data[common.RowIDField])
 	assert.Nil(t, insertData.Data[common.TimeStampField])
-	err = AppendSystemFieldsData(task, insertData)
+	rowNum = GetInsertDataRowCount(insertData, task.GetSchema())
+	err = AppendSystemFieldsData(task, insertData, rowNum)
 	assert.NoError(t, err)
 	assert.Equal(t, count, insertData.Data[pkField.GetFieldID()].RowNum())
 	assert.Equal(t, count, insertData.Data[common.RowIDField].RowNum())
@@ -155,7 +155,8 @@ func Test_PickSegment(t *testing.T) {
 	batchSize := 1 * 1024 * 1024
 
 	for totalSize > 0 {
-		picked := PickSegment(task.req.GetRequestSegments(), vchannel, partitionID)
+		picked, err := PickSegment(task.req.GetRequestSegments(), vchannel, partitionID)
+		assert.NoError(t, err)
 		importedSize[picked] += batchSize
 		totalSize -= batchSize
 	}
@@ -169,4 +170,8 @@ func Test_PickSegment(t *testing.T) {
 	fn(importedSize[int64(101)])
 	fn(importedSize[int64(102)])
 	fn(importedSize[int64(103)])
+
+	// test no candidate segments found
+	_, err := PickSegment(task.req.GetRequestSegments(), "ch-2", 20)
+	assert.Error(t, err)
 }

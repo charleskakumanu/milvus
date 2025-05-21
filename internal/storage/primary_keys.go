@@ -20,7 +20,7 @@ import (
 	"github.com/samber/lo"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 )
 
 // PrimaryKeys is the interface holding a slice of PrimaryKey
@@ -32,13 +32,14 @@ type PrimaryKeys interface {
 	Size() int64
 	Len() int
 	MustMerge(pks PrimaryKeys)
+	Reset()
 }
 
 type Int64PrimaryKeys struct {
 	values []int64
 }
 
-func NewInt64PrimaryKeys(cap int) *Int64PrimaryKeys {
+func NewInt64PrimaryKeys(cap int64) *Int64PrimaryKeys {
 	return &Int64PrimaryKeys{values: make([]int64, 0, cap)}
 }
 
@@ -92,12 +93,16 @@ func (pks *Int64PrimaryKeys) MustMerge(another PrimaryKeys) {
 	pks.values = append(pks.values, aPks.values...)
 }
 
+func (pks *Int64PrimaryKeys) Reset() {
+	pks.values = pks.values[:0]
+}
+
 type VarcharPrimaryKeys struct {
 	values []string
 	size   int64
 }
 
-func NewVarcharPrimaryKeys(cap int) *VarcharPrimaryKeys {
+func NewVarcharPrimaryKeys(cap int64) *VarcharPrimaryKeys {
 	return &VarcharPrimaryKeys{
 		values: make([]string, 0, cap),
 	}
@@ -155,4 +160,9 @@ func (pks *VarcharPrimaryKeys) MustMerge(another PrimaryKeys) {
 
 	pks.values = append(pks.values, aPks.values...)
 	pks.size += aPks.size
+}
+
+func (pks *VarcharPrimaryKeys) Reset() {
+	pks.values = pks.values[:0]
+	pks.size = 0
 }

@@ -21,20 +21,17 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <unordered_map>
 
 #include "storage/IndexData.h"
 #include "storage/FileManager.h"
 #include "storage/ChunkManager.h"
-#include "storage/space.h"
 
 namespace milvus::storage {
 
 class MemFileManagerImpl : public FileManagerImpl {
  public:
     explicit MemFileManagerImpl(const FileManagerContext& fileManagerContext);
-
-    MemFileManagerImpl(const FileManagerContext& fileManagerContext,
-                       std::shared_ptr<milvus_storage::Space> space);
 
     virtual bool
     LoadFile(const std::string& filename) noexcept;
@@ -54,32 +51,46 @@ class MemFileManagerImpl : public FileManagerImpl {
         return "MemIndexFileManagerImpl";
     }
 
-    std::map<std::string, FieldDataPtr>
+    std::map<std::string, std::unique_ptr<DataCodec>>
     LoadIndexToMemory(const std::vector<std::string>& remote_files);
 
     std::vector<FieldDataPtr>
-    CacheRawDataToMemory(std::vector<std::string> remote_files);
+    CacheRawDataToMemory(const Config& config);
 
     bool
     AddFile(const BinarySet& binary_set);
 
     bool
-    AddFileV2(const BinarySet& binary_set);
-
-    std::shared_ptr<milvus_storage::Space>
-    space() const {
-        return space_;
-    }
+    AddTextLog(const BinarySet& binary_set);
 
     std::map<std::string, int64_t>
     GetRemotePathsToFileSize() const {
         return remote_paths_to_size_;
     }
 
+    size_t
+    GetAddedTotalMemSize() const {
+        return added_total_mem_size_;
+    }
+
+    std::unordered_map<int64_t, std::vector<std::vector<uint32_t>>>
+    CacheOptFieldToMemory(OptFieldT& fields_map);
+
+ private:
+    bool
+    AddBinarySet(const BinarySet& binary_set, const std::string& prefix);
+
+    std::vector<FieldDataPtr>
+    cache_row_data_to_memory_internal(const Config& config);
+
+    std::vector<FieldDataPtr>
+    cache_row_data_to_memory_storage_v2(const Config& config);
+
  private:
     // remote file path
     std::map<std::string, int64_t> remote_paths_to_size_;
-    std::shared_ptr<milvus_storage::Space> space_;
+
+    size_t added_total_mem_size_ = 0;
 };
 
 using MemFileManagerImplPtr = std::shared_ptr<MemFileManagerImpl>;

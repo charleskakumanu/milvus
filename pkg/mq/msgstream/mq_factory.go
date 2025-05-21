@@ -28,16 +28,15 @@ import (
 	"github.com/streamnative/pulsarctl/pkg/pulsar/utils"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/metrics"
-	"github.com/milvus-io/milvus/pkg/mq/common"
-	"github.com/milvus-io/milvus/pkg/mq/mqimpl/rocksmq/server"
-	kafkawrapper "github.com/milvus-io/milvus/pkg/mq/msgstream/mqwrapper/kafka"
-	"github.com/milvus-io/milvus/pkg/mq/msgstream/mqwrapper/nmq"
-	pulsarmqwrapper "github.com/milvus-io/milvus/pkg/mq/msgstream/mqwrapper/pulsar"
-	"github.com/milvus-io/milvus/pkg/mq/msgstream/mqwrapper/rmq"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/retry"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/metrics"
+	"github.com/milvus-io/milvus/pkg/v2/mq/common"
+	"github.com/milvus-io/milvus/pkg/v2/mq/mqimpl/rocksmq/server"
+	kafkawrapper "github.com/milvus-io/milvus/pkg/v2/mq/msgstream/mqwrapper/kafka"
+	pulsarmqwrapper "github.com/milvus-io/milvus/pkg/v2/mq/msgstream/mqwrapper/pulsar"
+	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream/mqwrapper/rmq"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/retry"
 )
 
 // PmsFactory is a pulsar msgstream factory that implemented Factory interface(msgstream.go)
@@ -223,19 +222,6 @@ func NewKmsFactory(config *paramtable.ServiceParam) Factory {
 	return f
 }
 
-// NewNatsmqFactory create a new nats-mq factory.
-func NewNatsmqFactory() Factory {
-	paramtable.Init()
-	paramtable := paramtable.Get()
-	nmq.MustInitNatsMQ(nmq.ParseServerOption(paramtable))
-	return &CommonFactory{
-		Newer:             nmq.NewClientWithDefaultOptions,
-		DispatcherFactory: ProtoUDFactory{},
-		ReceiveBufSize:    paramtable.MQCfg.ReceiveBufSize.GetAsInt64(),
-		MQBufSize:         paramtable.MQCfg.MQBufSize.GetAsInt64(),
-	}
-}
-
 // NewRocksmqFactory creates a new message stream factory based on rocksmq.
 func NewRocksmqFactory(path string, cfg *paramtable.ServiceParam) Factory {
 	if err := server.InitRocksMQ(path); err != nil {
@@ -249,4 +235,81 @@ func NewRocksmqFactory(path string, cfg *paramtable.ServiceParam) Factory {
 		ReceiveBufSize:    cfg.MQCfg.ReceiveBufSize.GetAsInt64(),
 		MQBufSize:         cfg.MQCfg.MQBufSize.GetAsInt64(),
 	}
+}
+
+var _ Factory = &WpmsFactory{}
+
+// TODO Should use streamingNode uniformly as a message stream service
+type WpmsFactory struct{}
+
+func (w WpmsFactory) NewMsgStream(ctx context.Context) (MsgStream, error) {
+	return &WpMsgStream{}, nil
+}
+
+func (w WpmsFactory) NewTtMsgStream(ctx context.Context) (MsgStream, error) {
+	return nil, nil
+}
+
+func (w WpmsFactory) NewMsgStreamDisposer(ctx context.Context) func([]string, string) error {
+	return nil
+}
+
+var _ MsgStream = &WpMsgStream{}
+
+type WpMsgStream struct{}
+
+func (w WpMsgStream) Close() {
+	// NO-OP
+}
+
+func (w WpMsgStream) AsProducer(ctx context.Context, channels []string) {
+	// NO-OP
+}
+
+func (w WpMsgStream) Produce(ctx context.Context, pack *MsgPack) error {
+	// NO-OP
+	return nil
+}
+
+func (w WpMsgStream) SetRepackFunc(repackFunc RepackFunc) {}
+
+func (w WpMsgStream) GetProduceChannels() []string {
+	return nil
+}
+
+func (w WpMsgStream) Broadcast(ctx context.Context, pack *MsgPack) (map[string][]MessageID, error) {
+	return nil, nil
+}
+
+func (w WpMsgStream) AsConsumer(ctx context.Context, channels []string, subName string, position common.SubscriptionInitialPosition) error {
+	return nil
+}
+
+func (w WpMsgStream) Chan() <-chan *ConsumeMsgPack {
+	return nil
+}
+
+func (w WpMsgStream) GetUnmarshalDispatcher() UnmarshalDispatcher {
+	return nil
+}
+
+func (w WpMsgStream) Seek(ctx context.Context, msgPositions []*MsgPosition, includeCurrentMsg bool) error {
+	return nil
+}
+
+func (w WpMsgStream) GetLatestMsgID(channel string) (MessageID, error) {
+	return nil, nil
+}
+
+func (w WpMsgStream) CheckTopicValid(channel string) error {
+	return nil
+}
+
+func (w WpMsgStream) ForceEnableProduce(can bool) {
+}
+
+// NewWpmsFactory creates a new message stream factory based on woodpecker
+func NewWpmsFactory(cfg *paramtable.ServiceParam) Factory {
+	// TODO should not be used in mq wrapper
+	return &WpmsFactory{}
 }

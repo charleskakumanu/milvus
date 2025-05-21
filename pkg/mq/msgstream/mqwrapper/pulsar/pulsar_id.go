@@ -21,8 +21,15 @@ import (
 
 	"github.com/apache/pulsar-client-go/pulsar"
 
-	"github.com/milvus-io/milvus/pkg/mq/common"
+	"github.com/milvus-io/milvus/pkg/v2/mq/common"
 )
+
+// NewPulsarID creates a new pulsarID
+func NewPulsarID(id pulsar.MessageID) *pulsarID {
+	return &pulsarID{
+		messageID: id,
+	}
+}
 
 type pulsarID struct {
 	messageID pulsar.MessageID
@@ -31,15 +38,20 @@ type pulsarID struct {
 // Check if pulsarID implements and MessageID interface
 var _ common.MessageID = &pulsarID{}
 
+func (pid *pulsarID) PulsarID() pulsar.MessageID {
+	return pid.messageID
+}
+
 func (pid *pulsarID) Serialize() []byte {
 	return pid.messageID.Serialize()
 }
 
 func (pid *pulsarID) AtEarliestPosition() bool {
-	if pid.messageID.PartitionIdx() <= 0 &&
-		pid.messageID.LedgerID() <= 0 &&
-		pid.messageID.EntryID() <= 0 &&
-		pid.messageID.BatchIdx() <= 0 {
+	eid := pulsar.EarliestMessageID()
+	if pid.messageID.PartitionIdx() == eid.PartitionIdx() &&
+		pid.messageID.LedgerID() == eid.LedgerID() &&
+		pid.messageID.EntryID() == eid.EntryID() &&
+		pid.messageID.BatchIdx() == eid.BatchIdx() {
 		return true
 	}
 	return false

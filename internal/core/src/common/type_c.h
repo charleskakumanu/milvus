@@ -32,6 +32,14 @@ enum SegmentType {
 
 typedef enum SegmentType SegmentType;
 
+enum CacheWarmupPolicy {
+    CacheWarmupPolicy_Disable = 0,
+    CacheWarmupPolicy_Sync = 1,
+    CacheWarmupPolicy_Async = 2,
+};
+
+typedef enum CacheWarmupPolicy CacheWarmupPolicy;
+
 // pure C don't support that we use schemapb.DataType directly.
 // Note: the value of all enumerations must match the corresponding schemapb.DataType.
 // TODO: what if there are increments in schemapb.DataType.
@@ -54,6 +62,7 @@ enum CDataType {
     Float16Vector = 102,
     BFloat16Vector = 103,
     SparseFloatVector = 104,
+    Int8Vector = 105,
 };
 typedef enum CDataType CDataType;
 
@@ -92,6 +101,8 @@ typedef struct CStorageConfig {
     bool useIAM;
     bool useVirtualHost;
     int64_t requestTimeoutMs;
+    const char* gcp_credential_json;
+    bool use_custom_part_upload;
 } CStorageConfig;
 
 typedef struct CMmapConfig {
@@ -100,6 +111,7 @@ typedef struct CMmapConfig {
     uint64_t disk_limit;
     uint64_t fix_file_size;
     bool growing_enable_mmap;
+    bool scalar_index_enable_mmap;
 } CMmapConfig;
 
 typedef struct CTraceConfig {
@@ -107,6 +119,7 @@ typedef struct CTraceConfig {
     float sampleFraction;
     const char* jaegerURL;
     const char* otlpEndpoint;
+    const char* otlpMethod;
     bool oltpSecure;
 
     int nodeID;

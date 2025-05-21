@@ -21,6 +21,8 @@ import "strconv"
 const (
 	scannNlistKey       = `nlist`
 	scannWithRawDataKey = `with_raw_data`
+	scannNProbeKey      = `nprobe`
+	scannReorderKKey    = `reorder_k`
 )
 
 type scannIndex struct {
@@ -32,19 +34,43 @@ type scannIndex struct {
 
 func (idx scannIndex) Params() map[string]string {
 	return map[string]string{
-		MetricTypeKey: string(idx.metricType),
-		IndexTypeKey:  string(IvfFlat),
-		ivfNlistKey:   strconv.Itoa(idx.nlist),
+		MetricTypeKey:       string(idx.metricType),
+		IndexTypeKey:        string(SCANN),
+		scannNlistKey:       strconv.Itoa(idx.nlist),
+		scannWithRawDataKey: strconv.FormatBool(idx.withRawData),
 	}
 }
 
-func NewSCANNIndex(metricType MetricType, nlist int) Index {
-	return ivfFlatIndex{
+func NewSCANNIndex(metricType MetricType, nlist int, withRawData bool) Index {
+	return scannIndex{
 		baseIndex: baseIndex{
 			metricType: metricType,
-			indexType:  IvfFlat,
+			indexType:  SCANN,
 		},
-
-		nlist: nlist,
+		nlist:       nlist,
+		withRawData: withRawData,
 	}
+}
+
+type scannAnnParam struct {
+	baseAnnParam
+	nprobe   int
+	reorderK int
+}
+
+func NewSCANNAnnParam(nprobe int, reorderK int) scannAnnParam {
+	return scannAnnParam{
+		baseAnnParam: baseAnnParam{
+			params: make(map[string]any),
+		},
+		nprobe:   nprobe,
+		reorderK: reorderK,
+	}
+}
+
+func (ap scannAnnParam) Params() map[string]any {
+	result := ap.baseAnnParam.params
+	result[scannNProbeKey] = ap.nprobe
+	result[scannReorderKKey] = ap.reorderK
+	return result
 }

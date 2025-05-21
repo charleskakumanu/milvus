@@ -12,8 +12,8 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 func TestMain(m *testing.M) {
@@ -23,6 +23,32 @@ func TestMain(m *testing.M) {
 	if exitCode > 0 {
 		os.Exit(exitCode)
 	}
+}
+
+func TestFutureWithConcurrentReleaseAndCancel(t *testing.T) {
+	wg := sync.WaitGroup{}
+	for i := 0; i < 20; i++ {
+		future := createFutureWithTestCase(context.Background(), testCase{
+			interval: 100 * time.Millisecond,
+			loopCnt:  10,
+			caseNo:   100,
+		})
+		wg.Add(3)
+		// Double release should be ok.
+		go func() {
+			defer wg.Done()
+			future.Release()
+		}()
+		go func() {
+			defer wg.Done()
+			future.Release()
+		}()
+		go func() {
+			defer wg.Done()
+			future.cancel(context.DeadlineExceeded)
+		}()
+	}
+	wg.Wait()
 }
 
 func TestFutureWithSuccessCase(t *testing.T) {

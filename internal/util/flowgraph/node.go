@@ -17,14 +17,16 @@
 package flowgraph
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
 
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/timerecord"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/timerecord"
 )
 
 const (
@@ -59,14 +61,17 @@ type nodeCtxManager struct {
 	closeWg      *sync.WaitGroup
 	closeOnce    sync.Once
 	closeCh      chan struct{} // notify nodes to exit
+
+	lastAccessTime *atomic.Time
 }
 
 // NewNodeCtxManager init with the inputNode and fg.closeWg
 func NewNodeCtxManager(nodeCtx *nodeCtx, closeWg *sync.WaitGroup) *nodeCtxManager {
 	return &nodeCtxManager{
-		inputNodeCtx: nodeCtx,
-		closeWg:      closeWg,
-		closeCh:      make(chan struct{}),
+		inputNodeCtx:   nodeCtx,
+		closeWg:        closeWg,
+		closeCh:        make(chan struct{}),
+		lastAccessTime: atomic.NewTime(time.Now()),
 	}
 }
 
@@ -75,27 +80,23 @@ func (nodeCtxManager *nodeCtxManager) Start() {
 	// in dmInputNode, message from mq to channel, alloc goroutines
 	// limit the goroutines in other node to prevent huge goroutines numbers
 	nodeCtxManager.closeWg.Add(1)
+	curNode := nodeCtxManager.inputNodeCtx
+	// tt checker start
+	if enableTtChecker {
+		manager := timerecord.GetCheckerManger("data-fgNode", nodeCtxTtInterval, func(list []string) {
+			log.Warn("some node(s) haven't received input", zap.Strings("list", list), zap.Duration("duration ", nodeCtxTtInterval))
+		})
+		for curNode != nil {
+			name := fmt.Sprintf("nodeCtxTtChecker-%s", curNode.node.Name())
+			curNode.checker = timerecord.NewChecker(name, manager)
+			curNode = curNode.downstream
+		}
+	}
 	go nodeCtxManager.workNodeStart()
 }
 
 func (nodeCtxManager *nodeCtxManager) workNodeStart() {
 	defer nodeCtxManager.closeWg.Done()
-	inputNode := nodeCtxManager.inputNodeCtx
-	curNode := inputNode
-	// tt checker start
-	var checker *timerecord.Checker
-	if enableTtChecker {
-		manager := timerecord.GetCheckerManger("fgNode", nodeCtxTtInterval, func(list []string) {
-			log.Warn("some node(s) haven't received input", zap.Strings("list", list), zap.Duration("duration ", nodeCtxTtInterval))
-		})
-		for curNode != nil {
-			name := fmt.Sprintf("nodeCtxTtChecker-%s", curNode.node.Name())
-			checker = timerecord.NewChecker(name, manager)
-			curNode = curNode.downstream
-			defer checker.Close()
-		}
-	}
-
 	for {
 		select {
 		case <-nodeCtxManager.closeCh:
@@ -105,7 +106,8 @@ func (nodeCtxManager *nodeCtxManager) workNodeStart() {
 		// 2. invoke node.Operate
 		// 3. deliver the Operate result to downstream nodes
 		default:
-			curNode = inputNode
+			inputNode := nodeCtxManager.inputNodeCtx
+			curNode := inputNode
 			for curNode != nil {
 				// inputs from inputsMessages for Operate
 				var input, output []Msg
@@ -120,6 +122,10 @@ func (nodeCtxManager *nodeCtxManager) workNodeStart() {
 					curNode.blockMutex.RUnlock()
 					curNode = inputNode
 					continue
+				}
+
+				if nodeCtxManager.lastAccessTime != nil {
+					nodeCtxManager.lastAccessTime.Store(time.Now())
 				}
 
 				output = n.Operate(input)
@@ -137,8 +143,8 @@ func (nodeCtxManager *nodeCtxManager) workNodeStart() {
 				if curNode.downstream != nil {
 					curNode.downstream.inputChannel <- output
 				}
-				if enableTtChecker {
-					checker.Check()
+				if enableTtChecker && curNode.checker != nil {
+					curNode.checker.Check()
 				}
 				curNode = curNode.downstream
 			}
@@ -157,6 +163,7 @@ type nodeCtx struct {
 	node         Node
 	inputChannel chan []Msg
 	downstream   *nodeCtx
+	checker      *timerecord.Checker
 
 	blockMutex sync.RWMutex
 }
@@ -192,7 +199,10 @@ func (nodeCtx *nodeCtx) Close() {
 	if nodeCtx.node.IsInputNode() {
 		for nodeCtx != nil {
 			nodeCtx.node.Close()
-			log.Debug("flow graph node closed", zap.String("nodeName", nodeCtx.node.Name()))
+			if nodeCtx.checker != nil {
+				nodeCtx.checker.Close()
+			}
+			log.Ctx(context.TODO()).Debug("flow graph node closed", zap.String("nodeName", nodeCtx.node.Name()))
 			nodeCtx = nodeCtx.downstream
 		}
 	}

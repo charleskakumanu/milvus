@@ -23,12 +23,12 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/tsoutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/tsoutil"
 )
 
 func MergeMetaSegmentIntoSegmentInfo(info *querypb.SegmentInfo, segments ...*meta.Segment) {
@@ -44,6 +44,8 @@ func MergeMetaSegmentIntoSegmentInfo(info *querypb.SegmentInfo, segments ...*met
 			NodeIds:      make([]int64, 0),
 			SegmentState: commonpb.SegmentState_Sealed,
 			IndexInfos:   make([]*querypb.FieldIndexInfo, 0),
+			Level:        first.Level,
+			IsSorted:     first.GetIsSorted(),
 		}
 		for _, indexInfo := range first.IndexInfo {
 			info.IndexName = indexInfo.IndexName
@@ -72,19 +74,23 @@ func PackSegmentLoadInfo(segment *datapb.SegmentInfo, channelCheckpoint *msgpb.M
 			zap.Duration("tsLag", tsLag))
 	}
 	loadInfo := &querypb.SegmentLoadInfo{
-		SegmentID:      segment.ID,
-		PartitionID:    segment.PartitionID,
-		CollectionID:   segment.CollectionID,
-		BinlogPaths:    segment.Binlogs,
-		NumOfRows:      segment.NumOfRows,
-		Statslogs:      segment.Statslogs,
-		Deltalogs:      segment.Deltalogs,
-		InsertChannel:  segment.InsertChannel,
-		IndexInfos:     indexes,
-		StartPosition:  segment.GetStartPosition(),
-		DeltaPosition:  channelCheckpoint,
-		Level:          segment.GetLevel(),
-		StorageVersion: segment.GetStorageVersion(),
+		SegmentID:        segment.ID,
+		PartitionID:      segment.PartitionID,
+		CollectionID:     segment.CollectionID,
+		BinlogPaths:      segment.Binlogs,
+		NumOfRows:        segment.NumOfRows,
+		Statslogs:        segment.Statslogs,
+		Deltalogs:        segment.Deltalogs,
+		Bm25Logs:         segment.Bm25Statslogs,
+		InsertChannel:    segment.InsertChannel,
+		IndexInfos:       indexes,
+		StartPosition:    segment.GetStartPosition(),
+		DeltaPosition:    channelCheckpoint,
+		Level:            segment.GetLevel(),
+		StorageVersion:   segment.GetStorageVersion(),
+		IsSorted:         segment.GetIsSorted(),
+		TextStatsLogs:    segment.GetTextStatsLogs(),
+		JsonKeyStatsLogs: segment.GetJsonKeyStats(),
 	}
 	return loadInfo
 }

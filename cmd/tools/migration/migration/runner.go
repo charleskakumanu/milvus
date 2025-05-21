@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/blang/semver/v4"
+	"github.com/cockroachdb/errors"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/atomic"
 
@@ -16,7 +17,7 @@ import (
 	"github.com/milvus-io/milvus/cmd/tools/migration/console"
 	"github.com/milvus-io/milvus/cmd/tools/migration/versions"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
-	"github.com/milvus-io/milvus/pkg/util/etcd"
+	"github.com/milvus-io/milvus/pkg/v2/util/etcd"
 )
 
 type Runner struct {
@@ -143,7 +144,7 @@ func (r *Runner) checkMySelf() error {
 	}
 	for _, session := range sessions {
 		if session.Address != r.address {
-			return fmt.Errorf("other migration is running")
+			return errors.New("other migration is running")
 		}
 	}
 	return nil

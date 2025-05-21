@@ -17,12 +17,13 @@
 package querynodev2
 
 /*
-#cgo pkg-config: milvus_segcore milvus_common
+#cgo pkg-config: milvus_core
 
 #include "segcore/collection_c.h"
 #include "segcore/segment_c.h"
 #include "segcore/segcore_init_c.h"
 #include "common/init_c.h"
+#include "exec/expression/function/init_c.h"
 
 */
 import "C"
@@ -34,42 +35,48 @@ import (
 	"path"
 	"path/filepath"
 	"plugin"
-	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
 	"unsafe"
 
+	"github.com/cockroachdb/errors"
 	"github.com/samber/lo"
+	"github.com/tidwall/gjson"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	grpcquerynodeclient "github.com/milvus-io/milvus/internal/distributed/querynode/client"
+	"github.com/milvus-io/milvus/internal/distributed/streaming"
 	"github.com/milvus-io/milvus/internal/querynodev2/cluster"
 	"github.com/milvus-io/milvus/internal/querynodev2/delegator"
-	"github.com/milvus-io/milvus/internal/querynodev2/optimizers"
 	"github.com/milvus-io/milvus/internal/querynodev2/pipeline"
 	"github.com/milvus-io/milvus/internal/querynodev2/segments"
-	"github.com/milvus-io/milvus/internal/querynodev2/tasks"
-	"github.com/milvus-io/milvus/internal/querynodev2/tsafe"
 	"github.com/milvus-io/milvus/internal/registry"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/dependency"
+	"github.com/milvus-io/milvus/internal/util/hookutil"
 	"github.com/milvus-io/milvus/internal/util/initcore"
+	"github.com/milvus-io/milvus/internal/util/searchutil/optimizers"
+	"github.com/milvus-io/milvus/internal/util/searchutil/scheduler"
+	"github.com/milvus-io/milvus/internal/util/segcore"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
-	"github.com/milvus-io/milvus/pkg/config"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/metrics"
-	"github.com/milvus-io/milvus/pkg/mq/msgdispatcher"
-	"github.com/milvus-io/milvus/pkg/util/expr"
-	"github.com/milvus-io/milvus/pkg/util/gc"
-	"github.com/milvus-io/milvus/pkg/util/hardware"
-	"github.com/milvus-io/milvus/pkg/util/lifetime"
-	"github.com/milvus-io/milvus/pkg/util/lock"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/internal/util/streamingutil"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/config"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/metrics"
+	"github.com/milvus-io/milvus/pkg/v2/mq/msgdispatcher"
+	"github.com/milvus-io/milvus/pkg/v2/util/expr"
+	"github.com/milvus-io/milvus/pkg/v2/util/hardware"
+	"github.com/milvus-io/milvus/pkg/v2/util/lifetime"
+	"github.com/milvus-io/milvus/pkg/v2/util/lock"
+	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 // make sure QueryNode implements types.QueryNode
@@ -100,7 +107,6 @@ type QueryNode struct {
 	// internal components
 	manager               *segments.Manager
 	clusterManager        cluster.Manager
-	tSafeManager          tsafe.Manager
 	pipelineManager       pipeline.Manager
 	subscribingChannels   *typeutil.ConcurrentSet[string]
 	unsubscribingChannels *typeutil.ConcurrentSet[string]
@@ -111,8 +117,7 @@ type QueryNode struct {
 	loader segments.Loader
 
 	// Search/Query
-	scheduler       tasks.Scheduler
-	streamBatchSzie int
+	scheduler scheduler.Scheduler
 
 	// etcd client
 	etcdCli *clientv3.Client
@@ -136,34 +141,39 @@ type QueryNode struct {
 	// record the last modify ts of segment/channel distribution
 	lastModifyLock lock.RWMutex
 	lastModifyTs   int64
+
+	metricsRequest *metricsinfo.MetricsRequest
 }
 
 // NewQueryNode will return a QueryNode with abnormal state.
 func NewQueryNode(ctx context.Context, factory dependency.Factory) *QueryNode {
 	ctx, cancel := context.WithCancel(ctx)
 	node := &QueryNode{
-		ctx:      ctx,
-		cancel:   cancel,
-		factory:  factory,
-		lifetime: lifetime.NewLifetime(commonpb.StateCode_Abnormal),
+		ctx:            ctx,
+		cancel:         cancel,
+		factory:        factory,
+		lifetime:       lifetime.NewLifetime(commonpb.StateCode_Abnormal),
+		metricsRequest: metricsinfo.NewMetricsRequest(),
 	}
 
-	node.tSafeManager = tsafe.NewTSafeReplica()
 	expr.Register("querynode", node)
 	return node
 }
 
 func (node *QueryNode) initSession() error {
 	minimalIndexVersion, currentIndexVersion := getIndexEngineVersion()
-	node.session = sessionutil.NewSession(node.ctx, sessionutil.WithIndexEngineVersion(minimalIndexVersion, currentIndexVersion))
+	node.session = sessionutil.NewSession(node.ctx,
+		sessionutil.WithIndexEngineVersion(minimalIndexVersion, currentIndexVersion),
+		sessionutil.WithScalarIndexEngineVersion(common.MinimalScalarIndexEngineVersion, common.CurrentScalarIndexEngineVersion),
+		sessionutil.WithIndexNonEncoding())
 	if node.session == nil {
-		return fmt.Errorf("session is nil, the etcd client connection may have failed")
+		return errors.New("session is nil, the etcd client connection may have failed")
 	}
 	node.session.Init(typeutil.QueryNodeRole, node.address, false, true)
 	sessionutil.SaveServerInfo(typeutil.QueryNodeRole, node.session.ServerID)
 	paramtable.SetNodeID(node.session.ServerID)
 	node.serverID = node.session.ServerID
-	log.Info("QueryNode init session", zap.Int64("nodeID", node.GetNodeID()), zap.String("node address", node.session.Address))
+	log.Ctx(node.ctx).Info("QueryNode init session", zap.Int64("nodeID", node.GetNodeID()), zap.String("node address", node.session.Address))
 	return nil
 }
 
@@ -173,7 +183,7 @@ func (node *QueryNode) Register() error {
 	// start liveness check
 	metrics.NumNodes.WithLabelValues(fmt.Sprint(node.GetNodeID()), typeutil.QueryNodeRole).Inc()
 	node.session.LivenessCheck(node.ctx, func() {
-		log.Error("Query Node disconnected from etcd, process will exit", zap.Int64("Server Id", paramtable.GetNodeID()))
+		log.Ctx(node.ctx).Error("Query Node disconnected from etcd, process will exit", zap.Int64("Server Id", paramtable.GetNodeID()))
 		os.Exit(1)
 	})
 	return nil
@@ -230,16 +240,27 @@ func (node *QueryNode) InitSegcore() error {
 	if knowhereBuildPoolSize < uint32(1) {
 		knowhereBuildPoolSize = uint32(1)
 	}
-	log.Info("set up knowhere build pool size", zap.Uint32("pool_size", knowhereBuildPoolSize))
+	log.Ctx(node.ctx).Info("set up knowhere build pool size", zap.Uint32("pool_size", knowhereBuildPoolSize))
 	cKnowhereBuildPoolSize := C.uint32_t(knowhereBuildPoolSize)
 	C.SegcoreSetKnowhereBuildThreadPoolNum(cKnowhereBuildPoolSize)
 
 	cExprBatchSize := C.int64_t(paramtable.Get().QueryNodeCfg.ExprEvalBatchSize.GetAsInt64())
 	C.InitDefaultExprEvalBatchSize(cExprBatchSize)
 
+	cOptimizeExprEnabled := C.bool(paramtable.Get().CommonCfg.EnabledOptimizeExpr.GetAsBool())
+	C.InitDefaultOptimizeExprEnable(cOptimizeExprEnabled)
+
+	cJSONKeyStatsCommitInterval := C.int64_t(paramtable.Get().QueryNodeCfg.JSONKeyStatsCommitInterval.GetAsInt64())
+	C.InitDefaultJSONKeyStatsCommitInterval(cJSONKeyStatsCommitInterval)
+
+	cGrowingJSONKeyStatsEnabled := C.bool(paramtable.Get().CommonCfg.EnabledGrowingSegmentJSONKeyStats.GetAsBool())
+	C.InitDefaultGrowingJSONKeyStatsEnable(cGrowingJSONKeyStatsEnabled)
 	cGpuMemoryPoolInitSize := C.uint32_t(paramtable.Get().GpuConfig.InitSize.GetAsUint32())
 	cGpuMemoryPoolMaxSize := C.uint32_t(paramtable.Get().GpuConfig.MaxSize.GetAsUint32())
 	C.SegcoreSetKnowhereGpuMemoryPoolSize(cGpuMemoryPoolInitSize, cGpuMemoryPoolMaxSize)
+
+	cEnableConfigParamTypeCheck := C.bool(paramtable.Get().CommonCfg.EnableConfigParamTypeCheck.GetAsBool())
+	C.InitDefaultConfigParamTypeCheck(cEnableConfigParamTypeCheck)
 
 	localDataRootPath := filepath.Join(paramtable.Get().LocalStorageCfg.Path.GetValue(), typeutil.QueryNodeRole)
 	initcore.InitLocalChunkManager(localDataRootPath)
@@ -249,12 +270,85 @@ func (node *QueryNode) InitSegcore() error {
 		return err
 	}
 
+	err = initcore.InitStorageV2FileSystem(paramtable.Get())
+	if err != nil {
+		return err
+	}
+
 	err = initcore.InitMmapManager(paramtable.Get())
 	if err != nil {
 		return err
 	}
 
+	// init tiered storage
+	scalarFieldCacheWarmupPolicy, err := segcore.ConvertCacheWarmupPolicy(paramtable.Get().QueryNodeCfg.TieredWarmupScalarField.GetValue())
+	if err != nil {
+		return err
+	}
+	vectorFieldCacheWarmupPolicy, err := segcore.ConvertCacheWarmupPolicy(paramtable.Get().QueryNodeCfg.TieredWarmupVectorField.GetValue())
+	if err != nil {
+		return err
+	}
+	scalarIndexCacheWarmupPolicy, err := segcore.ConvertCacheWarmupPolicy(paramtable.Get().QueryNodeCfg.TieredWarmupScalarIndex.GetValue())
+	if err != nil {
+		return err
+	}
+	vectorIndexCacheWarmupPolicy, err := segcore.ConvertCacheWarmupPolicy(paramtable.Get().QueryNodeCfg.TieredWarmupVectorIndex.GetValue())
+	if err != nil {
+		return err
+	}
+	osMemBytes := hardware.GetMemoryCount()
+	osDiskBytes := paramtable.Get().QueryNodeCfg.DiskCapacityLimit.GetAsInt64()
+
+	memoryLowWatermarkRatio := paramtable.Get().QueryNodeCfg.TieredMemoryLowWatermarkRatio.GetAsFloat()
+	memoryHighWatermarkRatio := paramtable.Get().QueryNodeCfg.TieredMemoryHighWatermarkRatio.GetAsFloat()
+	memoryMaxRatio := paramtable.Get().QueryNodeCfg.TieredMemoryMaxRatio.GetAsFloat()
+	diskLowWatermarkRatio := paramtable.Get().QueryNodeCfg.TieredDiskLowWatermarkRatio.GetAsFloat()
+	diskHighWatermarkRatio := paramtable.Get().QueryNodeCfg.TieredDiskHighWatermarkRatio.GetAsFloat()
+	diskMaxRatio := paramtable.Get().QueryNodeCfg.TieredDiskMaxRatio.GetAsFloat()
+
+	if memoryLowWatermarkRatio > memoryHighWatermarkRatio {
+		return errors.New("memoryLowWatermarkRatio should not be greater than memoryHighWatermarkRatio")
+	}
+	if memoryHighWatermarkRatio > memoryMaxRatio {
+		return errors.New("memoryHighWatermarkRatio should not be greater than memoryMaxRatio")
+	}
+	if memoryMaxRatio >= 1 {
+		return errors.New("memoryMaxRatio should not be greater than 1")
+	}
+
+	if diskLowWatermarkRatio > diskHighWatermarkRatio {
+		return errors.New("diskLowWatermarkRatio should not be greater than diskHighWatermarkRatio")
+	}
+	if diskHighWatermarkRatio > diskMaxRatio {
+		return errors.New("diskHighWatermarkRatio should not be greater than diskMaxRatio")
+	}
+	if diskMaxRatio >= 1 {
+		return errors.New("diskMaxRatio should not be greater than 1")
+	}
+
+	memoryLowWatermarkBytes := C.int64_t(memoryLowWatermarkRatio * float64(osMemBytes))
+	memoryHighWatermarkBytes := C.int64_t(memoryHighWatermarkRatio * float64(osMemBytes))
+	memoryMaxBytes := C.int64_t(memoryMaxRatio * float64(osMemBytes))
+
+	diskLowWatermarkBytes := C.int64_t(diskLowWatermarkRatio * float64(osDiskBytes))
+	diskHighWatermarkBytes := C.int64_t(diskHighWatermarkRatio * float64(osDiskBytes))
+	diskMaxBytes := C.int64_t(diskMaxRatio * float64(osDiskBytes))
+
+	evictionEnabled := C.bool(paramtable.Get().QueryNodeCfg.TieredEvictionEnabled.GetAsBool())
+	cacheTouchWindowMs := C.int64_t(paramtable.Get().QueryNodeCfg.TieredCacheTouchWindowMs.GetAsInt64())
+	evictionIntervalMs := C.int64_t(paramtable.Get().QueryNodeCfg.TieredEvictionIntervalMs.GetAsInt64())
+
+	C.ConfigureTieredStorage(C.CacheWarmupPolicy(scalarFieldCacheWarmupPolicy),
+		C.CacheWarmupPolicy(vectorFieldCacheWarmupPolicy),
+		C.CacheWarmupPolicy(scalarIndexCacheWarmupPolicy),
+		C.CacheWarmupPolicy(vectorIndexCacheWarmupPolicy),
+		memoryLowWatermarkBytes, memoryHighWatermarkBytes, memoryMaxBytes,
+		diskLowWatermarkBytes, diskHighWatermarkBytes, diskMaxBytes,
+		evictionEnabled, cacheTouchWindowMs, evictionIntervalMs)
+
 	initcore.InitTraceConfig(paramtable.Get())
+	C.InitExecExpressionFunctionFactory()
 	return nil
 }
 
@@ -273,10 +367,32 @@ func (node *QueryNode) CloseSegcore() {
 	initcore.CleanGlogManager()
 }
 
+func (node *QueryNode) registerMetricsRequest() {
+	node.metricsRequest.RegisterMetricsRequest(metricsinfo.SystemInfoMetrics,
+		func(ctx context.Context, req *milvuspb.GetMetricsRequest, jsonReq gjson.Result) (string, error) {
+			return getSystemInfoMetrics(ctx, req, node)
+		})
+
+	node.metricsRequest.RegisterMetricsRequest(metricsinfo.SegmentKey,
+		func(ctx context.Context, req *milvuspb.GetMetricsRequest, jsonReq gjson.Result) (string, error) {
+			collectionID := metricsinfo.GetCollectionIDFromRequest(jsonReq)
+			return getSegmentJSON(node, collectionID), nil
+		})
+
+	node.metricsRequest.RegisterMetricsRequest(metricsinfo.ChannelKey,
+		func(ctx context.Context, req *milvuspb.GetMetricsRequest, jsonReq gjson.Result) (string, error) {
+			collectionID := metricsinfo.GetCollectionIDFromRequest(jsonReq)
+			return getChannelJSON(node, collectionID), nil
+		})
+	log.Ctx(node.ctx).Info("register metrics actions finished")
+}
+
 // Init function init historical and streaming module to manage segments
 func (node *QueryNode) Init() error {
+	log := log.Ctx(node.ctx)
 	var initError error
 	node.initOnce.Do(func() {
+		node.registerMetricsRequest()
 		// ctx := context.Background()
 		log.Info("QueryNode session info", zap.String("metaPath", paramtable.Get().EtcdCfg.MetaRootPath.GetValue()))
 		err := node.initSession()
@@ -299,7 +415,7 @@ func (node *QueryNode) Init() error {
 		node.factory.Init(paramtable.Get())
 
 		localRootPath := paramtable.Get().LocalStorageCfg.Path.GetValue()
-		localUsedSize, err := segments.GetLocalUsedSize(node.ctx, localRootPath)
+		localUsedSize, err := segcore.GetLocalUsedSize(localRootPath)
 		if err != nil {
 			log.Warn("get local used size failed", zap.Error(err))
 			initError = err
@@ -315,12 +431,11 @@ func (node *QueryNode) Init() error {
 		}
 
 		schedulePolicy := paramtable.Get().QueryNodeCfg.SchedulePolicyName.GetValue()
-		node.scheduler = tasks.NewScheduler(
+		node.scheduler = scheduler.NewScheduler(
 			schedulePolicy,
 		)
-		node.streamBatchSzie = paramtable.Get().QueryNodeCfg.QueryStreamBatchSize.GetAsInt()
-		log.Info("queryNode init scheduler", zap.String("policy", schedulePolicy))
 
+		log.Info("queryNode init scheduler", zap.String("policy", schedulePolicy))
 		node.clusterManager = cluster.NewWorkerManager(func(ctx context.Context, nodeID int64) (cluster.Worker, error) {
 			if nodeID == node.GetNodeID() {
 				return NewLocalWorker(node), nil
@@ -339,43 +454,29 @@ func (node *QueryNode) Init() error {
 				}
 			}
 
-			client, err := grpcquerynodeclient.NewClient(node.ctx, addr, nodeID)
-			if err != nil {
-				return nil, err
-			}
-
-			return cluster.NewRemoteWorker(client), nil
+			return cluster.NewPoolingRemoteWorker(func() (types.QueryNodeClient, error) {
+				return grpcquerynodeclient.NewClient(node.ctx, addr, nodeID)
+			})
 		})
 		node.delegators = typeutil.NewConcurrentMap[string, delegator.ShardDelegator]()
 		node.subscribingChannels = typeutil.NewConcurrentSet[string]()
 		node.unsubscribingChannels = typeutil.NewConcurrentSet[string]()
 		node.manager = segments.NewManager()
-		if paramtable.Get().CommonCfg.EnableStorageV2.GetAsBool() {
-			node.loader = segments.NewLoaderV2(node.manager, node.chunkManager)
-		} else {
-			node.loader = segments.NewLoader(node.manager, node.chunkManager)
-		}
+		node.loader = segments.NewLoader(node.ctx, node.manager, node.chunkManager)
 		node.manager.SetLoader(node.loader)
-		node.dispClient = msgdispatcher.NewClient(node.factory, typeutil.QueryNodeRole, node.GetNodeID())
+		if streamingutil.IsStreamingServiceEnabled() {
+			node.dispClient = msgdispatcher.NewClient(streaming.NewDelegatorMsgstreamFactory(), typeutil.QueryNodeRole, node.GetNodeID())
+		} else {
+			node.dispClient = msgdispatcher.NewClient(node.factory, typeutil.QueryNodeRole, node.GetNodeID())
+		}
 		// init pipeline manager
-		node.pipelineManager = pipeline.NewManager(node.manager, node.tSafeManager, node.dispClient, node.delegators)
+		node.pipelineManager = pipeline.NewManager(node.manager, node.dispClient, node.delegators)
 
 		err = node.InitSegcore()
 		if err != nil {
 			log.Error("QueryNode init segcore failed", zap.Error(err))
 			initError = err
 			return
-		}
-		if paramtable.Get().QueryNodeCfg.GCEnabled.GetAsBool() {
-			if paramtable.Get().QueryNodeCfg.GCHelperEnabled.GetAsBool() {
-				action := func(GOGC uint32) {
-					debug.SetGCPercent(int(GOGC))
-				}
-				gc.NewTuner(paramtable.Get().QueryNodeCfg.OverloadedMemoryThresholdPercentage.GetAsFloat(), uint32(paramtable.Get().QueryNodeCfg.MinimumGOGCConfig.GetAsInt()), uint32(paramtable.Get().QueryNodeCfg.MaximumGOGCConfig.GetAsInt()), action)
-			} else {
-				action := func(uint32) {}
-				gc.NewTuner(paramtable.Get().QueryNodeCfg.OverloadedMemoryThresholdPercentage.GetAsFloat(), uint32(paramtable.Get().QueryNodeCfg.MinimumGOGCConfig.GetAsInt()), uint32(paramtable.Get().QueryNodeCfg.MaximumGOGCConfig.GetAsInt()), action)
-			}
 		}
 
 		log.Info("query node init successfully",
@@ -389,6 +490,7 @@ func (node *QueryNode) Init() error {
 
 // Start mainly start QueryNode's query service.
 func (node *QueryNode) Start() error {
+	log := log.Ctx(node.ctx)
 	node.startOnce.Do(func() {
 		node.scheduler.Start()
 
@@ -396,6 +498,11 @@ func (node *QueryNode) Start() error {
 		paramtable.SetUpdateTime(time.Now())
 		mmapEnabled := paramtable.Get().QueryNodeCfg.MmapEnabled.GetAsBool()
 		growingmmapEnable := paramtable.Get().QueryNodeCfg.GrowingMmapEnabled.GetAsBool()
+		mmapVectorIndex := paramtable.Get().QueryNodeCfg.MmapVectorIndex.GetAsBool()
+		mmapVectorField := paramtable.Get().QueryNodeCfg.MmapVectorField.GetAsBool()
+		mmapScalarIndex := paramtable.Get().QueryNodeCfg.MmapScalarIndex.GetAsBool()
+		mmapScalarField := paramtable.Get().QueryNodeCfg.MmapScalarField.GetAsBool()
+
 		node.UpdateStateCode(commonpb.StateCode_Healthy)
 
 		registry.GetInMemoryResolver().RegisterQueryNode(node.GetNodeID(), node)
@@ -404,6 +511,10 @@ func (node *QueryNode) Start() error {
 			zap.String("Address", node.address),
 			zap.Bool("mmapEnabled", mmapEnabled),
 			zap.Bool("growingmmapEnable", growingmmapEnable),
+			zap.Bool("mmapVectorIndex", mmapVectorIndex),
+			zap.Bool("mmapVectorField", mmapVectorField),
+			zap.Bool("mmapScalarIndex", mmapScalarIndex),
+			zap.Bool("mmapScalarField", mmapScalarField),
 		)
 	})
 
@@ -412,6 +523,7 @@ func (node *QueryNode) Start() error {
 
 // Stop mainly stop QueryNode's query service, historical loop and streaming loop.
 func (node *QueryNode) Stop() error {
+	log := log.Ctx(node.ctx)
 	node.stopOnce.Do(func() {
 		log.Info("Query node stop...")
 		err := node.session.GoingStop()
@@ -518,12 +630,15 @@ func (node *QueryNode) SetAddress(address string) {
 
 // initHook initializes parameter tuning hook.
 func (node *QueryNode) initHook() error {
+	log := log.Ctx(node.ctx)
 	path := paramtable.Get().QueryNodeCfg.SoPath.GetValue()
 	if path == "" {
-		return fmt.Errorf("fail to set the plugin path")
+		return errors.New("fail to set the plugin path")
 	}
 	log.Info("start to load plugin", zap.String("path", path))
 
+	hookutil.LockHookInit()
+	defer hookutil.UnlockHookInit()
 	p, err := plugin.Open(path)
 	if err != nil {
 		return fmt.Errorf("fail to open the plugin, error: %s", err.Error())
@@ -537,7 +652,7 @@ func (node *QueryNode) initHook() error {
 
 	hoo, ok := h.(optimizers.QueryHook)
 	if !ok {
-		return fmt.Errorf("fail to convert the `Hook` interface")
+		return errors.New("fail to convert the `Hook` interface")
 	}
 	if err = hoo.Init(paramtable.Get().AutoIndexConfig.AutoIndexSearchConfig.GetValue()); err != nil {
 		return fmt.Errorf("fail to init configs for the hook, error: %s", err.Error())
@@ -553,6 +668,7 @@ func (node *QueryNode) initHook() error {
 }
 
 func (node *QueryNode) handleQueryHookEvent() {
+	log := log.Ctx(node.ctx)
 	onEvent := func(event *config.Event) {
 		if node.queryHook != nil {
 			if err := node.queryHook.Init(event.Value); err != nil {

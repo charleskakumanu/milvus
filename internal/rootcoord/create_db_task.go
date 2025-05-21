@@ -21,8 +21,8 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus/internal/metastore/model"
-	"github.com/milvus-io/milvus/internal/proto/etcdpb"
-	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/proto/etcdpb"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 )
 
 type createDatabaseTask struct {
@@ -38,7 +38,7 @@ func (t *createDatabaseTask) Prepare(ctx context.Context) error {
 	}
 
 	cfgMaxDatabaseNum := Params.RootCoordCfg.MaxDatabaseNum.GetAsInt()
-	if len(dbs) > cfgMaxDatabaseNum {
+	if len(dbs) >= cfgMaxDatabaseNum {
 		return merr.WrapErrDatabaseNumLimitExceeded(cfgMaxDatabaseNum)
 	}
 
@@ -50,6 +50,10 @@ func (t *createDatabaseTask) Prepare(ctx context.Context) error {
 }
 
 func (t *createDatabaseTask) Execute(ctx context.Context) error {
-	db := model.NewDatabase(t.dbID, t.Req.GetDbName(), etcdpb.DatabaseState_DatabaseCreated)
+	db := model.NewDatabase(t.dbID, t.Req.GetDbName(), etcdpb.DatabaseState_DatabaseCreated, t.Req.GetProperties())
 	return t.core.meta.CreateDatabase(ctx, db, t.GetTs())
+}
+
+func (t *createDatabaseTask) GetLockerKey() LockerKey {
+	return NewLockerKeyChain(NewClusterLockerKey(true))
 }

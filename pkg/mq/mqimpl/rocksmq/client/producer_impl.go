@@ -14,9 +14,9 @@ package client
 import (
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/mq/common"
-	"github.com/milvus-io/milvus/pkg/mq/mqimpl/rocksmq/server"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/mq/common"
+	"github.com/milvus-io/milvus/pkg/v2/mq/mqimpl/rocksmq/server"
 )
 
 // assertion make sure implementation
@@ -70,6 +70,20 @@ func (p *producer) Send(message *common.ProducerMessage) (UniqueID, error) {
 			Payload: payload,
 		},
 	})
+	if err != nil {
+		return 0, err
+	}
+	return ids[0], nil
+}
+
+func (p *producer) SendForStreamingService(message *common.ProducerMessage) (UniqueID, error) {
+	payload, err := marshalStreamingMessage(message)
+	if err != nil {
+		return 0, err
+	}
+	ids, err := p.c.server.Produce(p.topic, []server.ProducerMessage{{
+		Payload: payload,
+	}})
 	if err != nil {
 		return 0, err
 	}

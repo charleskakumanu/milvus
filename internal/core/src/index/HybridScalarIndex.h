@@ -28,7 +28,6 @@
 #include "storage/FileManager.h"
 #include "storage/DiskFileManagerImpl.h"
 #include "storage/MemFileManagerImpl.h"
-#include "storage/space.h"
 
 namespace milvus {
 namespace index {
@@ -43,12 +42,9 @@ template <typename T>
 class HybridScalarIndex : public ScalarIndex<T> {
  public:
     explicit HybridScalarIndex(
+        uint32_t tantivy_index_version,
         const storage::FileManagerContext& file_manager_context =
             storage::FileManagerContext());
-
-    explicit HybridScalarIndex(
-        const storage::FileManagerContext& file_manager_context,
-        std::shared_ptr<milvus_storage::Space> space);
 
     ~HybridScalarIndex() override = default;
 
@@ -61,9 +57,6 @@ class HybridScalarIndex : public ScalarIndex<T> {
     void
     Load(milvus::tracer::TraceContext ctx, const Config& config = {}) override;
 
-    void
-    LoadV2(const Config& config = {}) override;
-
     int64_t
     Count() override {
         return internal_index_->Count();
@@ -75,18 +68,17 @@ class HybridScalarIndex : public ScalarIndex<T> {
     }
 
     void
-    Build(size_t n, const T* values) override {
+    Build(size_t n,
+          const T* values,
+          const bool* valid_data = nullptr) override {
         SelectIndexBuildType(n, values);
         auto index = GetInternalIndex();
-        index->Build(n, values);
+        index->Build(n, values, valid_data);
         is_built_ = true;
     }
 
     void
     Build(const Config& config = {}) override;
-
-    void
-    BuildV2(const Config& config = {}) override;
 
     const TargetBitmap
     In(size_t n, const T* values) override {
@@ -96,6 +88,46 @@ class HybridScalarIndex : public ScalarIndex<T> {
     const TargetBitmap
     NotIn(size_t n, const T* values) override {
         return internal_index_->NotIn(n, values);
+    }
+
+    const TargetBitmap
+    IsNull() override {
+        return internal_index_->IsNull();
+    }
+
+    const TargetBitmap
+    IsNotNull() override {
+        return internal_index_->IsNotNull();
+    }
+
+    const TargetBitmap
+    Query(const DatasetPtr& dataset) override {
+        return internal_index_->Query(dataset);
+    }
+
+    bool
+    SupportPatternMatch() const override {
+        return internal_index_->SupportPatternMatch();
+    }
+
+    const TargetBitmap
+    PatternMatch(const std::string& pattern, proto::plan::OpType op) override {
+        return internal_index_->PatternMatch(pattern, op);
+    }
+
+    bool
+    TryUseRegexQuery() const override {
+        return internal_index_->TryUseRegexQuery();
+    }
+
+    bool
+    SupportRegexQuery() const override {
+        return internal_index_->SupportRegexQuery();
+    }
+
+    const TargetBitmap
+    RegexQuery(const std::string& pattern) override {
+        return internal_index_->RegexQuery(pattern);
     }
 
     const TargetBitmap
@@ -112,7 +144,7 @@ class HybridScalarIndex : public ScalarIndex<T> {
             lower_bound_value, lb_inclusive, upper_bound_value, ub_inclusive);
     }
 
-    T
+    std::optional<T>
     Reverse_Lookup(size_t offset) const override {
         return internal_index_->Reverse_Lookup(offset);
     }
@@ -130,11 +162,8 @@ class HybridScalarIndex : public ScalarIndex<T> {
         return internal_index_->HasRawData();
     }
 
-    BinarySet
+    IndexStatsPtr
     Upload(const Config& config = {}) override;
-
-    BinarySet
-    UploadV2(const Config& config = {}) override;
 
  private:
     ScalarIndexType
@@ -173,7 +202,13 @@ class HybridScalarIndex : public ScalarIndex<T> {
     std::shared_ptr<ScalarIndex<T>> internal_index_{nullptr};
     storage::FileManagerContext file_manager_context_;
     std::shared_ptr<storage::MemFileManagerImpl> mem_file_manager_{nullptr};
-    std::shared_ptr<milvus_storage::Space> space_{nullptr};
+
+    // `tantivy_index_version_` is used to control which kind of tantivy index should be used.
+    // There could be the case where milvus version of read node is lower than the version of index builder node(and read node
+    // may not be upgraded to a higher version in a predictable time), so we are using a lower version of tantivy to read index
+    // built from a higher version of tantivy which is not supported.
+    // Therefore, we should provide a way to allow higher version of milvus to build tantivy index with low version.
+    uint32_t tantivy_index_version_{0};
 };
 
 }  // namespace index

@@ -29,23 +29,26 @@ import (
 	"github.com/stretchr/testify/mock"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/internal/datanode/broker"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
+	"github.com/milvus-io/milvus/internal/flushcommon/broker"
+	"github.com/milvus-io/milvus/internal/flushcommon/pipeline"
+	"github.com/milvus-io/milvus/internal/flushcommon/syncmgr"
+	util2 "github.com/milvus-io/milvus/internal/flushcommon/util"
+	"github.com/milvus-io/milvus/internal/flushcommon/writebuffer"
+	"github.com/milvus-io/milvus/internal/mocks"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/types"
+	"github.com/milvus-io/milvus/internal/util/dependency"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/etcd"
-	"github.com/milvus-io/milvus/pkg/util/metricsinfo"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/mq/msgdispatcher"
+	"github.com/milvus-io/milvus/pkg/v2/objectstorage"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/util/etcd"
+	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
-
-const returnError = "ReturnError"
-
-type ctxKey struct{}
 
 func TestMain(t *testing.M) {
 	rand.Seed(time.Now().Unix())
@@ -70,20 +73,34 @@ func TestMain(t *testing.M) {
 	paramtable.Get().Save(Params.EtcdCfg.Endpoints.Key, strings.Join(addrs, ","))
 	paramtable.Get().Save(Params.CommonCfg.DataCoordTimeTick.Key, Params.CommonCfg.DataCoordTimeTick.GetValue()+strconv.Itoa(rand.Int()))
 
-	rateCol, err = newRateCollector()
-	if err != nil {
-		panic("init test failed, err = " + err.Error())
-	}
-
 	code := t.Run()
 	os.Exit(code)
+}
+
+func NewIDLEDataNodeMock(ctx context.Context, pkType schemapb.DataType) *DataNode {
+	factory := dependency.NewDefaultFactory(true)
+	node := NewDataNode(ctx, factory)
+	node.SetSession(&sessionutil.Session{SessionRaw: sessionutil.SessionRaw{ServerID: 1}})
+	node.dispClient = msgdispatcher.NewClient(factory, typeutil.DataNodeRole, paramtable.GetNodeID())
+
+	broker := &broker.MockBroker{}
+	broker.EXPECT().ReportTimeTick(mock.Anything, mock.Anything).Return(nil).Maybe()
+	broker.EXPECT().GetSegmentInfo(mock.Anything, mock.Anything).Return([]*datapb.SegmentInfo{}, nil).Maybe()
+
+	node.broker = broker
+	node.timeTickSender = util2.NewTimeTickSender(broker, 0)
+
+	syncMgr := syncmgr.NewSyncManager(node.chunkManager)
+	node.syncMgr = syncMgr
+	node.writeBufferManager = writebuffer.NewManager(syncMgr)
+
+	return node
 }
 
 func TestDataNode(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
-	node := newIDLEDataNodeMock(ctx, schemapb.DataType_Int64)
+	node := NewIDLEDataNodeMock(ctx, schemapb.DataType_Int64)
 	etcdCli, err := etcd.GetEtcdClient(
 		Params.EtcdCfg.UseEmbedEtcd.GetAsBool(),
 		Params.EtcdCfg.EtcdUseSSL.GetAsBool(),
@@ -111,47 +128,24 @@ func TestDataNode(t *testing.T) {
 
 	defer node.Stop()
 
-	node.chunkManager = storage.NewLocalChunkManager(storage.RootPath("/tmp/milvus_test/datanode"))
+	node.chunkManager = storage.NewLocalChunkManager(objectstorage.RootPath("/tmp/milvus_test/datanode"))
 	paramtable.SetNodeID(1)
 
 	defer cancel()
-	t.Run("Test SetRootCoordClient", func(t *testing.T) {
+	t.Run("Test SetMixCoordClient", func(t *testing.T) {
 		emptyDN := &DataNode{}
 		tests := []struct {
-			inrc        types.RootCoordClient
+			inrc        types.MixCoordClient
 			isvalid     bool
 			description string
 		}{
 			{nil, false, "nil input"},
-			{&RootCoordFactory{}, true, "valid input"},
+			{mocks.NewMockMixCoordClient(t), true, "valid input"},
 		}
 
 		for _, test := range tests {
 			t.Run(test.description, func(t *testing.T) {
-				err := emptyDN.SetRootCoordClient(test.inrc)
-				if test.isvalid {
-					assert.NoError(t, err)
-				} else {
-					assert.Error(t, err)
-				}
-			})
-		}
-	})
-
-	t.Run("Test SetDataCoordClient", func(t *testing.T) {
-		emptyDN := &DataNode{}
-		tests := []struct {
-			inrc        types.DataCoordClient
-			isvalid     bool
-			description string
-		}{
-			{nil, false, "nil input"},
-			{&DataCoordFactory{}, true, "valid input"},
-		}
-
-		for _, test := range tests {
-			t.Run(test.description, func(t *testing.T) {
-				err := emptyDN.SetDataCoordClient(test.inrc)
+				err := emptyDN.SetMixCoordClient(test.inrc)
 				if test.isvalid {
 					assert.NoError(t, err)
 				} else {
@@ -164,79 +158,26 @@ func TestDataNode(t *testing.T) {
 	t.Run("Test getSystemInfoMetrics", func(t *testing.T) {
 		emptyNode := &DataNode{}
 		emptyNode.SetSession(&sessionutil.Session{SessionRaw: sessionutil.SessionRaw{ServerID: 1}})
-		emptyNode.flowgraphManager = newFlowgraphManager()
+		emptyNode.flowgraphManager = pipeline.NewFlowgraphManager()
 
 		req, err := metricsinfo.ConstructRequestByMetricType(metricsinfo.SystemInfoMetrics)
 		assert.NoError(t, err)
 		resp, err := emptyNode.getSystemInfoMetrics(context.TODO(), req)
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
-		log.Info("Test DataNode.getSystemInfoMetrics",
-			zap.String("name", resp.ComponentName),
-			zap.String("response", resp.Response))
+		assert.NotEmpty(t, resp)
 	})
 
 	t.Run("Test getSystemInfoMetrics with quotaMetric error", func(t *testing.T) {
 		emptyNode := &DataNode{}
 		emptyNode.SetSession(&sessionutil.Session{SessionRaw: sessionutil.SessionRaw{ServerID: 1}})
-		emptyNode.flowgraphManager = newFlowgraphManager()
+		emptyNode.flowgraphManager = pipeline.NewFlowgraphManager()
 
 		req, err := metricsinfo.ConstructRequestByMetricType(metricsinfo.SystemInfoMetrics)
 		assert.NoError(t, err)
-		rateCol.Deregister(metricsinfo.InsertConsumeThroughput)
+		util2.DeregisterRateCollector(metricsinfo.InsertConsumeThroughput)
 		resp, err := emptyNode.getSystemInfoMetrics(context.TODO(), req)
-		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
-		rateCol.Register(metricsinfo.InsertConsumeThroughput)
-	})
-
-	t.Run("Test BackGroundGC", func(t *testing.T) {
-		vchanNameCh := make(chan string)
-		node.clearSignal = vchanNameCh
-		node.stopWaiter.Add(1)
-		go node.BackGroundGC(vchanNameCh)
-
-		testDataSyncs := []struct {
-			dmChannelName string
-		}{
-			{"fake-by-dev-rootcoord-dml-backgroundgc-1"},
-			{"fake-by-dev-rootcoord-dml-backgroundgc-2"},
-		}
-
-		for _, test := range testDataSyncs {
-			err = node.flowgraphManager.AddandStartWithEtcdTickler(node, &datapb.VchannelInfo{
-				CollectionID: 1, ChannelName: test.dmChannelName,
-			}, &schemapb.CollectionSchema{
-				Name: "test_collection",
-				Fields: []*schemapb.FieldSchema{
-					{
-						FieldID: common.RowIDField, Name: common.RowIDFieldName, DataType: schemapb.DataType_Int64,
-					},
-					{
-						FieldID: common.TimeStampField, Name: common.TimeStampFieldName, DataType: schemapb.DataType_Int64,
-					},
-					{
-						FieldID: 100, Name: "pk", DataType: schemapb.DataType_Int64, IsPrimaryKey: true,
-					},
-					{
-						FieldID: 101, Name: "vector", DataType: schemapb.DataType_FloatVector,
-						TypeParams: []*commonpb.KeyValuePair{
-							{Key: common.DimKey, Value: "128"},
-						},
-					},
-				},
-			}, genTestTickler())
-			assert.NoError(t, err)
-			vchanNameCh <- test.dmChannelName
-		}
-
-		assert.Eventually(t, func() bool {
-			for _, test := range testDataSyncs {
-				if node.flowgraphManager.HasFlowgraph(test.dmChannelName) {
-					return false
-				}
-			}
-			return true
-		}, 2*time.Second, 10*time.Millisecond)
+		assert.Error(t, err)
+		assert.Empty(t, resp)
+		util2.RegisterRateCollector(metricsinfo.InsertConsumeThroughput)
 	})
 }

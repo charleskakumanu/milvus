@@ -2,27 +2,29 @@ package proxy
 
 import (
 	"context"
+	"fmt"
 
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
-	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
 	"github.com/milvus-io/milvus/internal/types"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/mq/msgstream"
-	"github.com/milvus-io/milvus/pkg/util/commonpbutil"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/v2/proto/rootcoordpb"
+	"github.com/milvus-io/milvus/pkg/v2/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 type createDatabaseTask struct {
 	baseTask
 	Condition
 	*milvuspb.CreateDatabaseRequest
-	ctx       context.Context
-	rootCoord types.RootCoordClient
-	result    *commonpb.Status
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *commonpb.Status
 
 	replicateMsgStream msgstream.MsgStream
 }
@@ -74,8 +76,9 @@ func (cdt *createDatabaseTask) PreExecute(ctx context.Context) error {
 
 func (cdt *createDatabaseTask) Execute(ctx context.Context) error {
 	var err error
-	cdt.result, err = cdt.rootCoord.CreateDatabase(ctx, cdt.CreateDatabaseRequest)
-	if cdt.result != nil && cdt.result.ErrorCode == commonpb.ErrorCode_Success {
+	cdt.result, err = cdt.mixCoord.CreateDatabase(ctx, cdt.CreateDatabaseRequest)
+	err = merr.CheckRPCCall(cdt.result, err)
+	if err == nil {
 		SendReplicateMessagePack(ctx, cdt.replicateMsgStream, cdt.CreateDatabaseRequest)
 	}
 	return err
@@ -89,9 +92,9 @@ type dropDatabaseTask struct {
 	baseTask
 	Condition
 	*milvuspb.DropDatabaseRequest
-	ctx       context.Context
-	rootCoord types.RootCoordClient
-	result    *commonpb.Status
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *commonpb.Status
 
 	replicateMsgStream msgstream.MsgStream
 }
@@ -143,9 +146,10 @@ func (ddt *dropDatabaseTask) PreExecute(ctx context.Context) error {
 
 func (ddt *dropDatabaseTask) Execute(ctx context.Context) error {
 	var err error
-	ddt.result, err = ddt.rootCoord.DropDatabase(ctx, ddt.DropDatabaseRequest)
+	ddt.result, err = ddt.mixCoord.DropDatabase(ctx, ddt.DropDatabaseRequest)
 
-	if ddt.result != nil && ddt.result.ErrorCode == commonpb.ErrorCode_Success {
+	err = merr.CheckRPCCall(ddt.result, err)
+	if err == nil {
 		globalMetaCache.RemoveDatabase(ctx, ddt.DbName)
 		SendReplicateMessagePack(ctx, ddt.replicateMsgStream, ddt.DropDatabaseRequest)
 	}
@@ -160,9 +164,9 @@ type listDatabaseTask struct {
 	baseTask
 	Condition
 	*milvuspb.ListDatabasesRequest
-	ctx       context.Context
-	rootCoord types.RootCoordClient
-	result    *milvuspb.ListDatabasesResponse
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *milvuspb.ListDatabasesResponse
 }
 
 func (ldt *listDatabaseTask) TraceCtx() context.Context {
@@ -211,8 +215,8 @@ func (ldt *listDatabaseTask) PreExecute(ctx context.Context) error {
 func (ldt *listDatabaseTask) Execute(ctx context.Context) error {
 	var err error
 	ctx = AppendUserInfoForRPC(ctx)
-	ldt.result, err = ldt.rootCoord.ListDatabases(ctx, ldt.ListDatabasesRequest)
-	return err
+	ldt.result, err = ldt.mixCoord.ListDatabases(ctx, ldt.ListDatabasesRequest)
+	return merr.CheckRPCCall(ldt.result, err)
 }
 
 func (ldt *listDatabaseTask) PostExecute(ctx context.Context) error {
@@ -223,9 +227,11 @@ type alterDatabaseTask struct {
 	baseTask
 	Condition
 	*milvuspb.AlterDatabaseRequest
-	ctx       context.Context
-	rootCoord types.RootCoordClient
-	result    *commonpb.Status
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *commonpb.Status
+
+	replicateMsgStream msgstream.MsgStream
 }
 
 func (t *alterDatabaseTask) TraceCtx() context.Context {
@@ -264,12 +270,39 @@ func (t *alterDatabaseTask) OnEnqueue() error {
 	if t.Base == nil {
 		t.Base = commonpbutil.NewMsgBase()
 	}
+	t.Base.MsgType = commonpb.MsgType_AlterDatabase
+	t.Base.SourceID = paramtable.GetNodeID()
 	return nil
 }
 
 func (t *alterDatabaseTask) PreExecute(ctx context.Context) error {
-	t.Base.MsgType = commonpb.MsgType_AlterDatabase
-	t.Base.SourceID = paramtable.GetNodeID()
+	_, ok := common.GetReplicateID(t.Properties)
+	if ok {
+		return merr.WrapErrParameterInvalidMsg("can't set the replicate id property in alter database request")
+	}
+	endTS, ok := common.GetReplicateEndTS(t.Properties)
+	if !ok { // not exist replicate end ts property
+		return nil
+	}
+	cacheInfo, err := globalMetaCache.GetDatabaseInfo(ctx, t.DbName)
+	if err != nil {
+		return err
+	}
+	oldReplicateEnable, _ := common.IsReplicateEnabled(cacheInfo.properties)
+	if !oldReplicateEnable { // old replicate enable is false
+		return merr.WrapErrParameterInvalidMsg("can't set the replicate end ts property in alter database request when db replicate is disabled")
+	}
+	allocResp, err := t.mixCoord.AllocTimestamp(ctx, &rootcoordpb.AllocTimestampRequest{
+		Count:          1,
+		BlockTimestamp: endTS,
+	})
+	if err = merr.CheckRPCCall(allocResp, err); err != nil {
+		return merr.WrapErrServiceInternal("alloc timestamp failed", err.Error())
+	}
+	if allocResp.GetTimestamp() <= endTS {
+		return merr.WrapErrServiceInternal("alter database: alloc timestamp failed, timestamp is not greater than endTS",
+			fmt.Sprintf("timestamp = %d, endTS = %d", allocResp.GetTimestamp(), endTS))
+	}
 
 	return nil
 }
@@ -282,22 +315,18 @@ func (t *alterDatabaseTask) Execute(ctx context.Context) error {
 		DbName:     t.AlterDatabaseRequest.GetDbName(),
 		DbId:       t.AlterDatabaseRequest.GetDbId(),
 		Properties: t.AlterDatabaseRequest.GetProperties(),
+		DeleteKeys: t.AlterDatabaseRequest.GetDeleteKeys(),
 	}
 
-	ret, err := t.rootCoord.AlterDatabase(ctx, req)
+	ret, err := t.mixCoord.AlterDatabase(ctx, req)
+	err = merr.CheckRPCCall(ret, err)
 	if err != nil {
-		log.Warn("AlterDatabase failed", zap.Error(err))
 		return err
 	}
 
-	if err := merr.CheckRPCCall(t.result, err); err != nil {
-		log.Warn("AlterDatabase failed", zap.Error(err))
-		return err
-	}
-
+	SendReplicateMessagePack(ctx, t.replicateMsgStream, t.AlterDatabaseRequest)
 	t.result = ret
-
-	return err
+	return nil
 }
 
 func (t *alterDatabaseTask) PostExecute(ctx context.Context) error {
@@ -308,9 +337,9 @@ type describeDatabaseTask struct {
 	baseTask
 	Condition
 	*milvuspb.DescribeDatabaseRequest
-	ctx       context.Context
-	rootCoord types.RootCoordClient
-	result    *milvuspb.DescribeDatabaseResponse
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *milvuspb.DescribeDatabaseResponse
 }
 
 func (t *describeDatabaseTask) TraceCtx() context.Context {
@@ -349,13 +378,12 @@ func (t *describeDatabaseTask) OnEnqueue() error {
 	if t.Base == nil {
 		t.Base = commonpbutil.NewMsgBase()
 	}
+	t.Base.MsgType = commonpb.MsgType_DescribeDatabase
+	t.Base.SourceID = paramtable.GetNodeID()
 	return nil
 }
 
 func (t *describeDatabaseTask) PreExecute(ctx context.Context) error {
-	t.Base.MsgType = commonpb.MsgType_AlterCollection
-	t.Base.SourceID = paramtable.GetNodeID()
-
 	return nil
 }
 
@@ -364,14 +392,16 @@ func (t *describeDatabaseTask) Execute(ctx context.Context) error {
 		Base:   t.DescribeDatabaseRequest.GetBase(),
 		DbName: t.DescribeDatabaseRequest.GetDbName(),
 	}
-	ret, err := t.rootCoord.DescribeDatabase(ctx, req)
+
+	ctx = AppendUserInfoForRPC(ctx)
+	ret, err := t.mixCoord.DescribeDatabase(ctx, req)
 	if err != nil {
-		log.Warn("DescribeDatabase failed", zap.Error(err))
+		log.Ctx(ctx).Warn("DescribeDatabase failed", zap.Error(err))
 		return err
 	}
 
 	if err := merr.CheckRPCCall(ret, err); err != nil {
-		log.Warn("DescribeDatabase failed", zap.Error(err))
+		log.Ctx(ctx).Warn("DescribeDatabase failed", zap.Error(err))
 		return err
 	}
 

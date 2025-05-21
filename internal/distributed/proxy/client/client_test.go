@@ -26,10 +26,10 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus/internal/mocks"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/proxypb"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/proxypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 func Test_NewClient(t *testing.T) {
@@ -498,4 +498,25 @@ func Test_InvalidateShardLeaderCache(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	_, err = client.InvalidateShardLeaderCache(ctx, &proxypb.InvalidateShardLeaderCacheRequest{})
 	assert.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
+func Test_GetSegmentsInfo(t *testing.T) {
+	paramtable.Init()
+	ctx := context.Background()
+
+	client, err := NewClient(ctx, "test", 1)
+	assert.NoError(t, err)
+	defer client.Close()
+
+	mockProxy := mocks.NewMockProxyClient(t)
+	mockGrpcClient := mocks.NewMockGrpcClient[proxypb.ProxyClient](t)
+	mockGrpcClient.EXPECT().Close().Return(nil)
+	mockGrpcClient.EXPECT().ReCall(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, f func(proxypb.ProxyClient) (interface{}, error)) (interface{}, error) {
+		return f(mockProxy)
+	})
+	client.(*Client).grpcClient = mockGrpcClient
+
+	mockProxy.EXPECT().GetSegmentsInfo(mock.Anything, mock.Anything).Return(&internalpb.GetSegmentsInfoResponse{Status: merr.Success()}, nil)
+	_, err = client.GetSegmentsInfo(ctx, &internalpb.GetSegmentsInfoRequest{})
+	assert.Nil(t, err)
 }

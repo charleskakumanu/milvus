@@ -25,10 +25,10 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus/internal/mocks"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/types"
-	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 )
 
 type QnWrapperSuite struct {
@@ -242,6 +242,17 @@ func (s *QnWrapperSuite) TestDelete() {
 		Return(merr.Status(nil), nil)
 
 	resp, err := s.client.Delete(context.Background(), &querypb.DeleteRequest{})
+	err = merr.CheckRPCCall(resp, err)
+	s.NoError(err)
+}
+
+func (s *QnWrapperSuite) TestDeleteBatch() {
+	s.qn.EXPECT().DeleteBatch(mock.Anything, mock.Anything).
+		Return(&querypb.DeleteBatchResponse{
+			Status: merr.Status(nil),
+		}, nil)
+
+	resp, err := s.client.DeleteBatch(context.Background(), &querypb.DeleteBatchRequest{})
 	err = merr.CheckRPCCall(resp, err)
 	s.NoError(err)
 }

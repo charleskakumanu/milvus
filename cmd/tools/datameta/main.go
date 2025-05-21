@@ -1,19 +1,20 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"sort"
 	"strings"
 
-	"github.com/golang/protobuf/proto"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 
 	etcdkv "github.com/milvus-io/milvus/internal/kv/etcd"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/etcd"
-	"github.com/milvus-io/milvus/pkg/util/tsoutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/util/etcd"
+	"github.com/milvus-io/milvus/pkg/v2/util/tsoutil"
 )
 
 var (
@@ -37,7 +38,7 @@ func main() {
 
 	etcdkv := etcdkv.NewEtcdKV(etcdCli, *rootPath)
 
-	keys, values, err := etcdkv.LoadWithPrefix("/")
+	keys, values, err := etcdkv.LoadWithPrefix(context.TODO(), "/")
 	if err != nil {
 		log.Fatal("failed to list ", zap.Error(err))
 	}

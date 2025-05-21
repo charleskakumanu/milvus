@@ -31,24 +31,24 @@ import (
 	"github.com/milvus-io/milvus/internal/allocator"
 	"github.com/milvus-io/milvus/internal/metastore/model"
 	"github.com/milvus-io/milvus/internal/mocks"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	pb "github.com/milvus-io/milvus/internal/proto/etcdpb"
-	"github.com/milvus-io/milvus/internal/proto/indexpb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/proxypb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/tso"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/dependency"
 	"github.com/milvus-io/milvus/internal/util/proxyutil"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/mq/msgstream"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/metricsinfo"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/retry"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	pb "github.com/milvus-io/milvus/pkg/v2/proto/etcdpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/proxypb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/retry"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 const (
@@ -56,6 +56,7 @@ const (
 	TestRootCoordID = 200
 )
 
+// TODO: remove mockMetaTable, use mockery instead
 type mockMetaTable struct {
 	IMetaTable
 	ListDatabasesFunc                func(ctx context.Context, ts Timestamp) ([]*model.Database, error)
@@ -71,31 +72,37 @@ type mockMetaTable struct {
 	CreateAliasFunc                  func(ctx context.Context, dbName string, alias string, collectionName string, ts Timestamp) error
 	AlterAliasFunc                   func(ctx context.Context, dbName string, alias string, collectionName string, ts Timestamp) error
 	DropAliasFunc                    func(ctx context.Context, dbName string, alias string, ts Timestamp) error
-	IsAliasFunc                      func(dbName, name string) bool
+	IsAliasFunc                      func(ctx context.Context, dbName, name string) bool
 	DescribeAliasFunc                func(ctx context.Context, dbName, alias string, ts Timestamp) (string, error)
 	ListAliasesFunc                  func(ctx context.Context, dbName, collectionName string, ts Timestamp) ([]string, error)
-	ListAliasesByIDFunc              func(collID UniqueID) []string
+	ListAliasesByIDFunc              func(ctx context.Context, collID UniqueID) []string
 	GetCollectionIDByNameFunc        func(name string) (UniqueID, error)
 	GetPartitionByNameFunc           func(collID UniqueID, partitionName string, ts Timestamp) (UniqueID, error)
-	GetCollectionVirtualChannelsFunc func(colID int64) []string
+	GetCollectionVirtualChannelsFunc func(ctx context.Context, colID int64) []string
 	AlterCollectionFunc              func(ctx context.Context, oldColl *model.Collection, newColl *model.Collection, ts Timestamp) error
 	RenameCollectionFunc             func(ctx context.Context, oldName string, newName string, ts Timestamp) error
-	AddCredentialFunc                func(credInfo *internalpb.CredentialInfo) error
-	GetCredentialFunc                func(username string) (*internalpb.CredentialInfo, error)
-	DeleteCredentialFunc             func(username string) error
-	AlterCredentialFunc              func(credInfo *internalpb.CredentialInfo) error
-	ListCredentialUsernamesFunc      func() (*milvuspb.ListCredUsersResponse, error)
-	CreateRoleFunc                   func(tenant string, entity *milvuspb.RoleEntity) error
-	DropRoleFunc                     func(tenant string, roleName string) error
-	OperateUserRoleFunc              func(tenant string, userEntity *milvuspb.UserEntity, roleEntity *milvuspb.RoleEntity, operateType milvuspb.OperateUserRoleType) error
-	SelectRoleFunc                   func(tenant string, entity *milvuspb.RoleEntity, includeUserInfo bool) ([]*milvuspb.RoleResult, error)
-	SelectUserFunc                   func(tenant string, entity *milvuspb.UserEntity, includeRoleInfo bool) ([]*milvuspb.UserResult, error)
-	OperatePrivilegeFunc             func(tenant string, entity *milvuspb.GrantEntity, operateType milvuspb.OperatePrivilegeType) error
-	SelectGrantFunc                  func(tenant string, entity *milvuspb.GrantEntity) ([]*milvuspb.GrantEntity, error)
-	DropGrantFunc                    func(tenant string, role *milvuspb.RoleEntity) error
-	ListPolicyFunc                   func(tenant string) ([]string, error)
-	ListUserRoleFunc                 func(tenant string) ([]string, error)
+	AddCredentialFunc                func(ctx context.Context, credInfo *internalpb.CredentialInfo) error
+	GetCredentialFunc                func(ctx context.Context, username string) (*internalpb.CredentialInfo, error)
+	DeleteCredentialFunc             func(ctx context.Context, username string) error
+	AlterCredentialFunc              func(ctx context.Context, credInfo *internalpb.CredentialInfo) error
+	ListCredentialUsernamesFunc      func(ctx context.Context) (*milvuspb.ListCredUsersResponse, error)
+	CreateRoleFunc                   func(ctx context.Context, tenant string, entity *milvuspb.RoleEntity) error
+	DropRoleFunc                     func(ctx context.Context, tenant string, roleName string) error
+	OperateUserRoleFunc              func(ctx context.Context, tenant string, userEntity *milvuspb.UserEntity, roleEntity *milvuspb.RoleEntity, operateType milvuspb.OperateUserRoleType) error
+	SelectRoleFunc                   func(ctx context.Context, tenant string, entity *milvuspb.RoleEntity, includeUserInfo bool) ([]*milvuspb.RoleResult, error)
+	SelectUserFunc                   func(ctx context.Context, tenant string, entity *milvuspb.UserEntity, includeRoleInfo bool) ([]*milvuspb.UserResult, error)
+	OperatePrivilegeFunc             func(ctx context.Context, tenant string, entity *milvuspb.GrantEntity, operateType milvuspb.OperatePrivilegeType) error
+	SelectGrantFunc                  func(ctx context.Context, tenant string, entity *milvuspb.GrantEntity) ([]*milvuspb.GrantEntity, error)
+	DropGrantFunc                    func(ctx context.Context, tenant string, role *milvuspb.RoleEntity) error
+	ListPolicyFunc                   func(ctx context.Context, tenant string) ([]*milvuspb.GrantEntity, error)
+	ListUserRoleFunc                 func(ctx context.Context, tenant string) ([]string, error)
 	DescribeDatabaseFunc             func(ctx context.Context, dbName string) (*model.Database, error)
+	CreatePrivilegeGroupFunc         func(ctx context.Context, groupName string) error
+	DropPrivilegeGroupFunc           func(ctx context.Context, groupName string) error
+	IsCustomPrivilegeGroupFunc       func(ctx context.Context, groupName string) (bool, error)
+	ListPrivilegeGroupsFunc          func(ctx context.Context) ([]*milvuspb.PrivilegeGroupInfo, error)
+	OperatePrivilegeGroupFunc        func(ctx context.Context, groupName string, privileges []*milvuspb.PrivilegeEntity, operateType milvuspb.OperatePrivilegeGroupType) error
+	GetPrivilegeGroupRolesFunc       func(ctx context.Context, groupName string) ([]*milvuspb.RoleEntity, error)
 }
 
 func (m mockMetaTable) GetDatabaseByName(ctx context.Context, dbName string, ts Timestamp) (*model.Database, error) {
@@ -154,8 +161,8 @@ func (m mockMetaTable) DropAlias(ctx context.Context, dbName, alias string, ts T
 	return m.DropAliasFunc(ctx, dbName, alias, ts)
 }
 
-func (m mockMetaTable) IsAlias(dbName, name string) bool {
-	return m.IsAliasFunc(dbName, name)
+func (m mockMetaTable) IsAlias(ctx context.Context, dbName, name string) bool {
+	return m.IsAliasFunc(ctx, dbName, name)
 }
 
 func (m mockMetaTable) DescribeAlias(ctx context.Context, dbName, alias string, ts Timestamp) (string, error) {
@@ -166,8 +173,8 @@ func (m mockMetaTable) ListAliases(ctx context.Context, dbName, collectionName s
 	return m.ListAliasesFunc(ctx, dbName, collectionName, ts)
 }
 
-func (m mockMetaTable) ListAliasesByID(collID UniqueID) []string {
-	return m.ListAliasesByIDFunc(collID)
+func (m mockMetaTable) ListAliasesByID(ctx context.Context, collID UniqueID) []string {
+	return m.ListAliasesByIDFunc(ctx, collID)
 }
 
 func (m mockMetaTable) AlterCollection(ctx context.Context, oldColl *model.Collection, newColl *model.Collection, ts Timestamp) error {
@@ -186,68 +193,92 @@ func (m mockMetaTable) GetPartitionByName(collID UniqueID, partitionName string,
 	return m.GetPartitionByNameFunc(collID, partitionName, ts)
 }
 
-func (m mockMetaTable) GetCollectionVirtualChannels(colID int64) []string {
-	return m.GetCollectionVirtualChannelsFunc(colID)
+func (m mockMetaTable) GetCollectionVirtualChannels(ctx context.Context, colID int64) []string {
+	return m.GetCollectionVirtualChannelsFunc(ctx, colID)
 }
 
-func (m mockMetaTable) AddCredential(credInfo *internalpb.CredentialInfo) error {
-	return m.AddCredentialFunc(credInfo)
+func (m mockMetaTable) AddCredential(ctx context.Context, credInfo *internalpb.CredentialInfo) error {
+	return m.AddCredentialFunc(ctx, credInfo)
 }
 
-func (m mockMetaTable) GetCredential(username string) (*internalpb.CredentialInfo, error) {
-	return m.GetCredentialFunc(username)
+func (m mockMetaTable) GetCredential(ctx context.Context, username string) (*internalpb.CredentialInfo, error) {
+	return m.GetCredentialFunc(ctx, username)
 }
 
-func (m mockMetaTable) DeleteCredential(username string) error {
-	return m.DeleteCredentialFunc(username)
+func (m mockMetaTable) DeleteCredential(ctx context.Context, username string) error {
+	return m.DeleteCredentialFunc(ctx, username)
 }
 
-func (m mockMetaTable) AlterCredential(credInfo *internalpb.CredentialInfo) error {
-	return m.AlterCredentialFunc(credInfo)
+func (m mockMetaTable) AlterCredential(ctx context.Context, credInfo *internalpb.CredentialInfo) error {
+	return m.AlterCredentialFunc(ctx, credInfo)
 }
 
-func (m mockMetaTable) ListCredentialUsernames() (*milvuspb.ListCredUsersResponse, error) {
-	return m.ListCredentialUsernamesFunc()
+func (m mockMetaTable) ListCredentialUsernames(ctx context.Context) (*milvuspb.ListCredUsersResponse, error) {
+	return m.ListCredentialUsernamesFunc(ctx)
 }
 
-func (m mockMetaTable) CreateRole(tenant string, entity *milvuspb.RoleEntity) error {
-	return m.CreateRoleFunc(tenant, entity)
+func (m mockMetaTable) CreateRole(ctx context.Context, tenant string, entity *milvuspb.RoleEntity) error {
+	return m.CreateRoleFunc(ctx, tenant, entity)
 }
 
-func (m mockMetaTable) DropRole(tenant string, roleName string) error {
-	return m.DropRoleFunc(tenant, roleName)
+func (m mockMetaTable) DropRole(ctx context.Context, tenant string, roleName string) error {
+	return m.DropRoleFunc(ctx, tenant, roleName)
 }
 
-func (m mockMetaTable) OperateUserRole(tenant string, userEntity *milvuspb.UserEntity, roleEntity *milvuspb.RoleEntity, operateType milvuspb.OperateUserRoleType) error {
-	return m.OperateUserRoleFunc(tenant, userEntity, roleEntity, operateType)
+func (m mockMetaTable) OperateUserRole(ctx context.Context, tenant string, userEntity *milvuspb.UserEntity, roleEntity *milvuspb.RoleEntity, operateType milvuspb.OperateUserRoleType) error {
+	return m.OperateUserRoleFunc(ctx, tenant, userEntity, roleEntity, operateType)
 }
 
-func (m mockMetaTable) SelectRole(tenant string, entity *milvuspb.RoleEntity, includeUserInfo bool) ([]*milvuspb.RoleResult, error) {
-	return m.SelectRoleFunc(tenant, entity, includeUserInfo)
+func (m mockMetaTable) SelectRole(ctx context.Context, tenant string, entity *milvuspb.RoleEntity, includeUserInfo bool) ([]*milvuspb.RoleResult, error) {
+	return m.SelectRoleFunc(ctx, tenant, entity, includeUserInfo)
 }
 
-func (m mockMetaTable) SelectUser(tenant string, entity *milvuspb.UserEntity, includeRoleInfo bool) ([]*milvuspb.UserResult, error) {
-	return m.SelectUserFunc(tenant, entity, includeRoleInfo)
+func (m mockMetaTable) SelectUser(ctx context.Context, tenant string, entity *milvuspb.UserEntity, includeRoleInfo bool) ([]*milvuspb.UserResult, error) {
+	return m.SelectUserFunc(ctx, tenant, entity, includeRoleInfo)
 }
 
-func (m mockMetaTable) OperatePrivilege(tenant string, entity *milvuspb.GrantEntity, operateType milvuspb.OperatePrivilegeType) error {
-	return m.OperatePrivilegeFunc(tenant, entity, operateType)
+func (m mockMetaTable) OperatePrivilege(ctx context.Context, tenant string, entity *milvuspb.GrantEntity, operateType milvuspb.OperatePrivilegeType) error {
+	return m.OperatePrivilegeFunc(ctx, tenant, entity, operateType)
 }
 
-func (m mockMetaTable) SelectGrant(tenant string, entity *milvuspb.GrantEntity) ([]*milvuspb.GrantEntity, error) {
-	return m.SelectGrantFunc(tenant, entity)
+func (m mockMetaTable) SelectGrant(ctx context.Context, tenant string, entity *milvuspb.GrantEntity) ([]*milvuspb.GrantEntity, error) {
+	return m.SelectGrantFunc(ctx, tenant, entity)
 }
 
-func (m mockMetaTable) DropGrant(tenant string, role *milvuspb.RoleEntity) error {
-	return m.DropGrantFunc(tenant, role)
+func (m mockMetaTable) DropGrant(ctx context.Context, tenant string, role *milvuspb.RoleEntity) error {
+	return m.DropGrantFunc(ctx, tenant, role)
 }
 
-func (m mockMetaTable) ListPolicy(tenant string) ([]string, error) {
-	return m.ListPolicyFunc(tenant)
+func (m mockMetaTable) ListPolicy(ctx context.Context, tenant string) ([]*milvuspb.GrantEntity, error) {
+	return m.ListPolicyFunc(ctx, tenant)
 }
 
-func (m mockMetaTable) ListUserRole(tenant string) ([]string, error) {
-	return m.ListUserRoleFunc(tenant)
+func (m mockMetaTable) ListUserRole(ctx context.Context, tenant string) ([]string, error) {
+	return m.ListUserRoleFunc(ctx, tenant)
+}
+
+func (m mockMetaTable) CreatePrivilegeGroup(ctx context.Context, groupName string) error {
+	return m.CreatePrivilegeGroupFunc(ctx, groupName)
+}
+
+func (m mockMetaTable) DropPrivilegeGroup(ctx context.Context, groupName string) error {
+	return m.DropPrivilegeGroupFunc(ctx, groupName)
+}
+
+func (m mockMetaTable) ListPrivilegeGroups(ctx context.Context) ([]*milvuspb.PrivilegeGroupInfo, error) {
+	return m.ListPrivilegeGroupsFunc(ctx)
+}
+
+func (m mockMetaTable) IsCustomPrivilegeGroup(ctx context.Context, groupName string) (bool, error) {
+	return m.IsCustomPrivilegeGroupFunc(ctx, groupName)
+}
+
+func (m mockMetaTable) OperatePrivilegeGroup(ctx context.Context, groupName string, privileges []*milvuspb.PrivilegeEntity, operateType milvuspb.OperatePrivilegeGroupType) error {
+	return m.OperatePrivilegeGroupFunc(ctx, groupName, privileges, operateType)
+}
+
+func (m mockMetaTable) GetPrivilegeGroupRoles(ctx context.Context, groupName string) ([]*milvuspb.RoleEntity, error) {
+	return m.GetPrivilegeGroupRolesFunc(ctx, groupName)
 }
 
 func newMockMetaTable() *mockMetaTable {
@@ -374,7 +405,8 @@ func newMockProxy() *mockProxy {
 
 func newTestCore(opts ...Opt) *Core {
 	c := &Core{
-		session: &sessionutil.Session{SessionRaw: sessionutil.SessionRaw{ServerID: TestRootCoordID}},
+		metricsRequest: metricsinfo.NewMetricsRequest(),
+		session:        &sessionutil.Session{SessionRaw: sessionutil.SessionRaw{ServerID: TestRootCoordID}},
 	}
 	executor := newMockStepExecutor()
 	executor.AddStepsFunc = func(s *stepStack) {
@@ -386,6 +418,7 @@ func newTestCore(opts ...Opt) *Core {
 	for _, opt := range opts {
 		opt(c)
 	}
+	c.registerMetricsRequest()
 	return c
 }
 
@@ -470,49 +503,49 @@ func withInvalidMeta() Opt {
 	meta.DropAliasFunc = func(ctx context.Context, dbName string, alias string, ts Timestamp) error {
 		return errors.New("error mock DropAlias")
 	}
-	meta.AddCredentialFunc = func(credInfo *internalpb.CredentialInfo) error {
+	meta.AddCredentialFunc = func(ctx context.Context, credInfo *internalpb.CredentialInfo) error {
 		return errors.New("error mock AddCredential")
 	}
-	meta.GetCredentialFunc = func(username string) (*internalpb.CredentialInfo, error) {
+	meta.GetCredentialFunc = func(ctx context.Context, username string) (*internalpb.CredentialInfo, error) {
 		return nil, errors.New("error mock GetCredential")
 	}
-	meta.DeleteCredentialFunc = func(username string) error {
+	meta.DeleteCredentialFunc = func(ctx context.Context, username string) error {
 		return errors.New("error mock DeleteCredential")
 	}
-	meta.AlterCredentialFunc = func(credInfo *internalpb.CredentialInfo) error {
+	meta.AlterCredentialFunc = func(ctx context.Context, credInfo *internalpb.CredentialInfo) error {
 		return errors.New("error mock AlterCredential")
 	}
-	meta.ListCredentialUsernamesFunc = func() (*milvuspb.ListCredUsersResponse, error) {
+	meta.ListCredentialUsernamesFunc = func(ctx context.Context) (*milvuspb.ListCredUsersResponse, error) {
 		return nil, errors.New("error mock ListCredentialUsernames")
 	}
-	meta.CreateRoleFunc = func(tenant string, entity *milvuspb.RoleEntity) error {
+	meta.CreateRoleFunc = func(ctx context.Context, tenant string, entity *milvuspb.RoleEntity) error {
 		return errors.New("error mock CreateRole")
 	}
-	meta.DropRoleFunc = func(tenant string, roleName string) error {
+	meta.DropRoleFunc = func(ctx context.Context, tenant string, roleName string) error {
 		return errors.New("error mock DropRole")
 	}
-	meta.OperateUserRoleFunc = func(tenant string, userEntity *milvuspb.UserEntity, roleEntity *milvuspb.RoleEntity, operateType milvuspb.OperateUserRoleType) error {
+	meta.OperateUserRoleFunc = func(ctx context.Context, tenant string, userEntity *milvuspb.UserEntity, roleEntity *milvuspb.RoleEntity, operateType milvuspb.OperateUserRoleType) error {
 		return errors.New("error mock OperateUserRole")
 	}
-	meta.SelectUserFunc = func(tenant string, entity *milvuspb.UserEntity, includeRoleInfo bool) ([]*milvuspb.UserResult, error) {
+	meta.SelectUserFunc = func(ctx context.Context, tenant string, entity *milvuspb.UserEntity, includeRoleInfo bool) ([]*milvuspb.UserResult, error) {
 		return nil, errors.New("error mock SelectUser")
 	}
-	meta.SelectRoleFunc = func(tenant string, entity *milvuspb.RoleEntity, includeUserInfo bool) ([]*milvuspb.RoleResult, error) {
+	meta.SelectRoleFunc = func(ctx context.Context, tenant string, entity *milvuspb.RoleEntity, includeUserInfo bool) ([]*milvuspb.RoleResult, error) {
 		return nil, errors.New("error mock SelectRole")
 	}
-	meta.OperatePrivilegeFunc = func(tenant string, entity *milvuspb.GrantEntity, operateType milvuspb.OperatePrivilegeType) error {
+	meta.OperatePrivilegeFunc = func(ctx context.Context, tenant string, entity *milvuspb.GrantEntity, operateType milvuspb.OperatePrivilegeType) error {
 		return errors.New("error mock OperatePrivilege")
 	}
-	meta.SelectGrantFunc = func(tenant string, entity *milvuspb.GrantEntity) ([]*milvuspb.GrantEntity, error) {
+	meta.SelectGrantFunc = func(ctx context.Context, tenant string, entity *milvuspb.GrantEntity) ([]*milvuspb.GrantEntity, error) {
 		return nil, errors.New("error mock SelectGrant")
 	}
-	meta.DropGrantFunc = func(tenant string, role *milvuspb.RoleEntity) error {
+	meta.DropGrantFunc = func(ctx context.Context, tenant string, role *milvuspb.RoleEntity) error {
 		return errors.New("error mock DropGrant")
 	}
-	meta.ListPolicyFunc = func(tenant string) ([]string, error) {
+	meta.ListPolicyFunc = func(ctx context.Context, tenant string) ([]*milvuspb.GrantEntity, error) {
 		return nil, errors.New("error mock ListPolicy")
 	}
-	meta.ListUserRoleFunc = func(tenant string) ([]string, error) {
+	meta.ListUserRoleFunc = func(ctx context.Context, tenant string) ([]string, error) {
 		return nil, errors.New("error mock ListUserRole")
 	}
 	meta.DescribeAliasFunc = func(ctx context.Context, dbName, alias string, ts Timestamp) (string, error) {
@@ -523,6 +556,24 @@ func withInvalidMeta() Opt {
 	}
 	meta.DescribeDatabaseFunc = func(ctx context.Context, dbName string) (*model.Database, error) {
 		return nil, errors.New("error mock DescribeDatabase")
+	}
+	meta.CreatePrivilegeGroupFunc = func(ctx context.Context, groupName string) error {
+		return errors.New("error mock CreatePrivilegeGroup")
+	}
+	meta.DropPrivilegeGroupFunc = func(ctx context.Context, groupName string) error {
+		return errors.New("error mock DropPrivilegeGroup")
+	}
+	meta.ListPrivilegeGroupsFunc = func(ctx context.Context) ([]*milvuspb.PrivilegeGroupInfo, error) {
+		return nil, errors.New("error mock ListPrivilegeGroups")
+	}
+	meta.IsCustomPrivilegeGroupFunc = func(ctx context.Context, groupName string) (bool, error) {
+		return false, errors.New("error mock IsCustomPrivilegeGroup")
+	}
+	meta.OperatePrivilegeGroupFunc = func(ctx context.Context, groupName string, privileges []*milvuspb.PrivilegeEntity, operateType milvuspb.OperatePrivilegeGroupType) error {
+		return errors.New("error mock OperatePrivilegeGroup")
+	}
+	meta.GetPrivilegeGroupRolesFunc = func(ctx context.Context, groupName string) ([]*milvuspb.RoleEntity, error) {
+		return nil, errors.New("error mock GetPrivilegeGroupRoles")
 	}
 	return withMeta(meta)
 }
@@ -552,92 +603,146 @@ func withInvalidIDAllocator() Opt {
 	return withIDAllocator(idAllocator)
 }
 
-func withQueryCoord(qc types.QueryCoordClient) Opt {
+func withMixCoord(mixc types.MixCoord) Opt {
 	return func(c *Core) {
-		c.queryCoord = qc
+		c.mixCoord = mixc
 	}
 }
 
-func withUnhealthyQueryCoord() Opt {
-	qc := &mocks.MockQueryCoordClient{}
+func withUnhealthyMixCoord() Opt {
+	mixc := &mocks.MixCoord{}
 	err := errors.New("mock error")
-	qc.EXPECT().GetComponentStates(mock.Anything, mock.Anything).Return(
+	mixc.EXPECT().GetComponentStates(mock.Anything, mock.Anything).Return(
 		&milvuspb.ComponentStates{
 			State:  &milvuspb.ComponentInfo{StateCode: commonpb.StateCode_Abnormal},
 			Status: merr.Status(err),
 		}, retry.Unrecoverable(errors.New("error mock GetComponentStates")),
 	)
-	return withQueryCoord(qc)
+
+	return withMixCoord(mixc)
 }
 
-func withInvalidQueryCoord() Opt {
-	qc := &mocks.MockQueryCoordClient{}
-	qc.EXPECT().GetComponentStates(mock.Anything, mock.Anything).Return(
+func withInvalidMixCoord() Opt {
+	mixc := &mocks.MixCoord{}
+	mixc.EXPECT().GetComponentStates(mock.Anything, mock.Anything).Return(
 		&milvuspb.ComponentStates{
 			State:  &milvuspb.ComponentInfo{StateCode: commonpb.StateCode_Healthy},
 			Status: merr.Success(),
 		}, nil,
 	)
-	qc.EXPECT().ReleaseCollection(mock.Anything, mock.Anything).Return(
+	mixc.EXPECT().WatchChannels(mock.Anything, mock.Anything).Return(
+		nil, errors.New("error mock WatchChannels"),
+	)
+
+	mixc.EXPECT().Flush(mock.Anything, mock.Anything).Return(
+		nil, errors.New("error mock Flush"),
+	)
+
+	mixc.EXPECT().BroadcastAlteredCollection(mock.Anything, mock.Anything).Return(
+		nil, errors.New("error mock broadCastAlteredCollection"),
+	)
+	mixc.EXPECT().DropIndex(mock.Anything, mock.Anything).Return(
+		nil, errors.New("error mock DropIndex"),
+	)
+
+	mixc.EXPECT().ReleaseCollection(mock.Anything, mock.Anything).Return(
 		nil, errors.New("error mock ReleaseCollection"),
 	)
 
-	qc.EXPECT().GetSegmentInfo(mock.Anything, mock.Anything).Return(
+	mixc.EXPECT().GetLoadSegmentInfo(mock.Anything, mock.Anything).Return(
 		nil, errors.New("error mock GetSegmentInfo"),
 	)
 
-	return withQueryCoord(qc)
+	return withMixCoord(mixc)
 }
 
-func withFailedQueryCoord() Opt {
-	qc := &mocks.MockQueryCoordClient{}
-	qc.EXPECT().GetComponentStates(mock.Anything, mock.Anything).Return(
+func withFailedMixCoord() Opt {
+	mixc := &mocks.MixCoord{}
+	mixc.EXPECT().GetComponentStates(mock.Anything, mock.Anything).Return(
 		&milvuspb.ComponentStates{
 			State:  &milvuspb.ComponentInfo{StateCode: commonpb.StateCode_Healthy},
 			Status: merr.Success(),
 		}, nil,
 	)
 	err := errors.New("mock error")
-	qc.EXPECT().ReleaseCollection(mock.Anything, mock.Anything).Return(
+	mixc.EXPECT().ReleaseCollection(mock.Anything, mock.Anything).Return(
 		merr.Status(err), nil,
 	)
 
-	qc.EXPECT().GetSegmentInfo(mock.Anything, mock.Anything).Return(
+	mixc.EXPECT().GetLoadSegmentInfo(mock.Anything, mock.Anything).Return(
 		&querypb.GetSegmentInfoResponse{
 			Status: merr.Status(err),
 		}, nil,
 	)
 
-	return withQueryCoord(qc)
+	mixc.EXPECT().WatchChannels(mock.Anything, mock.Anything).Return(
+		&datapb.WatchChannelsResponse{
+			Status: merr.Status(err),
+		}, nil,
+	)
+
+	mixc.EXPECT().Flush(mock.Anything, mock.Anything).Return(
+		&datapb.FlushResponse{
+			Status: merr.Status(err),
+		}, nil,
+	)
+
+	mixc.EXPECT().BroadcastAlteredCollection(mock.Anything, mock.Anything).Return(
+		merr.Status(err), nil,
+	)
+	mixc.EXPECT().DropIndex(mock.Anything, mock.Anything).Return(
+		merr.Status(err), nil,
+	)
+
+	return withMixCoord(mixc)
 }
 
-func withValidQueryCoord() Opt {
-	qc := &mocks.MockQueryCoordClient{}
-	qc.EXPECT().GetComponentStates(mock.Anything, mock.Anything).Return(
+func withValidMixCoord() Opt {
+	mixc := &mocks.MixCoord{}
+	mixc.EXPECT().GetComponentStates(mock.Anything, mock.Anything).Return(
 		&milvuspb.ComponentStates{
 			State:  &milvuspb.ComponentInfo{StateCode: commonpb.StateCode_Healthy},
 			Status: merr.Success(),
 		}, nil,
 	)
-	qc.EXPECT().ReleaseCollection(mock.Anything, mock.Anything).Return(
+	mixc.EXPECT().ReleaseCollection(mock.Anything, mock.Anything).Return(
 		merr.Success(), nil,
 	)
 
-	qc.EXPECT().ReleasePartitions(mock.Anything, mock.Anything).Return(
+	mixc.EXPECT().ReleasePartitions(mock.Anything, mock.Anything).Return(
 		merr.Success(), nil,
 	)
 
-	qc.EXPECT().GetSegmentInfo(mock.Anything, mock.Anything).Return(
+	mixc.EXPECT().GetLoadSegmentInfo(mock.Anything, mock.Anything).Return(
 		&querypb.GetSegmentInfoResponse{
 			Status: merr.Success(),
 		}, nil,
 	)
 
-	qc.EXPECT().SyncNewCreatedPartition(mock.Anything, mock.Anything).Return(
+	mixc.EXPECT().SyncNewCreatedPartition(mock.Anything, mock.Anything).Return(
 		merr.Success(), nil,
 	)
 
-	return withQueryCoord(qc)
+	mixc.EXPECT().WatchChannels(mock.Anything, mock.Anything).Return(
+		&datapb.WatchChannelsResponse{
+			Status: merr.Success(),
+		}, nil,
+	)
+
+	mixc.EXPECT().Flush(mock.Anything, mock.Anything).Return(
+		&datapb.FlushResponse{
+			Status: merr.Success(),
+		}, nil,
+	)
+
+	mixc.EXPECT().BroadcastAlteredCollection(mock.Anything, mock.Anything).Return(
+		merr.Success(), nil,
+	)
+	mixc.EXPECT().DropIndex(mock.Anything, mock.Anything).Return(
+		merr.Success(), nil,
+	)
+
+	return withMixCoord(mixc)
 }
 
 // cleanTestEnv clean test environment, for example, files generated by rocksmq.
@@ -661,7 +766,7 @@ func newRocksMqTtSynchronizer() *timetickSync {
 	ctx := context.Background()
 	factory := dependency.NewDefaultFactory(true)
 	chans := map[UniqueID][]string{}
-	ticker := newTimeTickSync(ctx, TestRootCoordID, factory, chans)
+	ticker := newTimeTickSync(context.TODO(), ctx, TestRootCoordID, factory, chans)
 	return ticker
 }
 
@@ -669,118 +774,6 @@ func newRocksMqTtSynchronizer() *timetickSync {
 func withRocksMqTtSynchronizer() Opt {
 	ticker := newRocksMqTtSynchronizer()
 	return withTtSynchronizer(ticker)
-}
-
-func withDataCoord(dc types.DataCoordClient) Opt {
-	return func(c *Core) {
-		c.dataCoord = dc
-	}
-}
-
-func withUnhealthyDataCoord() Opt {
-	dc := newMockDataCoord()
-	err := errors.New("mock error")
-	dc.GetComponentStatesFunc = func(ctx context.Context) (*milvuspb.ComponentStates, error) {
-		return &milvuspb.ComponentStates{
-			State:  &milvuspb.ComponentInfo{StateCode: commonpb.StateCode_Abnormal},
-			Status: merr.Status(err),
-		}, retry.Unrecoverable(errors.New("error mock GetComponentStates"))
-	}
-	return withDataCoord(dc)
-}
-
-func withInvalidDataCoord() Opt {
-	dc := newMockDataCoord()
-	dc.GetComponentStatesFunc = func(ctx context.Context) (*milvuspb.ComponentStates, error) {
-		return &milvuspb.ComponentStates{
-			State:  &milvuspb.ComponentInfo{StateCode: commonpb.StateCode_Healthy},
-			Status: merr.Success(),
-		}, nil
-	}
-	dc.WatchChannelsFunc = func(ctx context.Context, req *datapb.WatchChannelsRequest) (*datapb.WatchChannelsResponse, error) {
-		return nil, errors.New("error mock WatchChannels")
-	}
-	dc.WatchChannelsFunc = func(ctx context.Context, req *datapb.WatchChannelsRequest) (*datapb.WatchChannelsResponse, error) {
-		return nil, errors.New("error mock WatchChannels")
-	}
-	dc.FlushFunc = func(ctx context.Context, req *datapb.FlushRequest) (*datapb.FlushResponse, error) {
-		return nil, errors.New("error mock Flush")
-	}
-	dc.broadCastAlteredCollectionFunc = func(ctx context.Context, req *datapb.AlterCollectionRequest) (*commonpb.Status, error) {
-		return nil, errors.New("error mock broadCastAlteredCollection")
-	}
-	dc.GetSegmentIndexStateFunc = func(ctx context.Context, req *indexpb.GetSegmentIndexStateRequest) (*indexpb.GetSegmentIndexStateResponse, error) {
-		return nil, errors.New("error mock GetSegmentIndexStateFunc")
-	}
-	dc.DropIndexFunc = func(ctx context.Context, req *indexpb.DropIndexRequest) (*commonpb.Status, error) {
-		return nil, errors.New("error mock DropIndexFunc")
-	}
-	return withDataCoord(dc)
-}
-
-func withFailedDataCoord() Opt {
-	dc := newMockDataCoord()
-	dc.GetComponentStatesFunc = func(ctx context.Context) (*milvuspb.ComponentStates, error) {
-		return &milvuspb.ComponentStates{
-			State:  &milvuspb.ComponentInfo{StateCode: commonpb.StateCode_Healthy},
-			Status: merr.Success(),
-		}, nil
-	}
-	err := errors.New("mock error")
-	dc.WatchChannelsFunc = func(ctx context.Context, req *datapb.WatchChannelsRequest) (*datapb.WatchChannelsResponse, error) {
-		return &datapb.WatchChannelsResponse{
-			Status: merr.Status(err),
-		}, nil
-	}
-	dc.FlushFunc = func(ctx context.Context, req *datapb.FlushRequest) (*datapb.FlushResponse, error) {
-		return &datapb.FlushResponse{
-			Status: merr.Status(err),
-		}, nil
-	}
-	dc.broadCastAlteredCollectionFunc = func(ctx context.Context, req *datapb.AlterCollectionRequest) (*commonpb.Status, error) {
-		return merr.Status(err), nil
-	}
-	dc.GetSegmentIndexStateFunc = func(ctx context.Context, req *indexpb.GetSegmentIndexStateRequest) (*indexpb.GetSegmentIndexStateResponse, error) {
-		return &indexpb.GetSegmentIndexStateResponse{
-			Status: merr.Status(err),
-		}, nil
-	}
-	dc.DropIndexFunc = func(ctx context.Context, req *indexpb.DropIndexRequest) (*commonpb.Status, error) {
-		return merr.Status(err), nil
-	}
-	return withDataCoord(dc)
-}
-
-func withValidDataCoord() Opt {
-	dc := newMockDataCoord()
-	dc.GetComponentStatesFunc = func(ctx context.Context) (*milvuspb.ComponentStates, error) {
-		return &milvuspb.ComponentStates{
-			State:  &milvuspb.ComponentInfo{StateCode: commonpb.StateCode_Healthy},
-			Status: merr.Success(),
-		}, nil
-	}
-	dc.WatchChannelsFunc = func(ctx context.Context, req *datapb.WatchChannelsRequest) (*datapb.WatchChannelsResponse, error) {
-		return &datapb.WatchChannelsResponse{
-			Status: merr.Success(),
-		}, nil
-	}
-	dc.FlushFunc = func(ctx context.Context, req *datapb.FlushRequest) (*datapb.FlushResponse, error) {
-		return &datapb.FlushResponse{
-			Status: merr.Success(),
-		}, nil
-	}
-	dc.broadCastAlteredCollectionFunc = func(ctx context.Context, req *datapb.AlterCollectionRequest) (*commonpb.Status, error) {
-		return merr.Success(), nil
-	}
-	dc.GetSegmentIndexStateFunc = func(ctx context.Context, req *indexpb.GetSegmentIndexStateRequest) (*indexpb.GetSegmentIndexStateResponse, error) {
-		return &indexpb.GetSegmentIndexStateResponse{
-			Status: merr.Success(),
-		}, nil
-	}
-	dc.DropIndexFunc = func(ctx context.Context, req *indexpb.DropIndexRequest) (*commonpb.Status, error) {
-		return merr.Success(), nil
-	}
-	return withDataCoord(dc)
 }
 
 func withStateCode(code commonpb.StateCode) Opt {
@@ -952,24 +945,6 @@ func withBroker(b Broker) Opt {
 	}
 }
 
-type mockGarbageCollector struct {
-	GarbageCollector
-	GcCollectionDataFunc func(ctx context.Context, coll *model.Collection) (Timestamp, error)
-	GcPartitionDataFunc  func(ctx context.Context, pChannels []string, partition *model.Partition) (Timestamp, error)
-}
-
-func (m mockGarbageCollector) GcCollectionData(ctx context.Context, coll *model.Collection) (Timestamp, error) {
-	return m.GcCollectionDataFunc(ctx, coll)
-}
-
-func (m mockGarbageCollector) GcPartitionData(ctx context.Context, pChannels []string, partition *model.Partition) (Timestamp, error) {
-	return m.GcPartitionDataFunc(ctx, pChannels, partition)
-}
-
-func newMockGarbageCollector() *mockGarbageCollector {
-	return &mockGarbageCollector{}
-}
-
 func withGarbageCollector(gc GarbageCollector) Opt {
 	return func(c *Core) {
 		c.garbageCollector = gc
@@ -1033,8 +1008,33 @@ func newTickerWithFactory(factory msgstream.Factory) *timetickSync {
 	paramtable.Get().Save(Params.RootCoordCfg.DmlChannelNum.Key, "4")
 	ctx := context.Background()
 	chans := map[UniqueID][]string{}
-	ticker := newTimeTickSync(ctx, TestRootCoordID, factory, chans)
+	ticker := newTimeTickSync(context.TODO(), ctx, TestRootCoordID, factory, chans)
 	return ticker
+}
+
+func newChanTimeTickSync(packChan chan *msgstream.ConsumeMsgPack) *timetickSync {
+	f := msgstream.NewMockMqFactory()
+	f.NewMsgStreamFunc = func(ctx context.Context) (msgstream.MsgStream, error) {
+		stream := msgstream.NewWastedMockMsgStream()
+		stream.BroadcastFunc = func(pack *msgstream.MsgPack) error {
+			log.Info("mock Broadcast")
+			packChan <- msgstream.BuildConsumeMsgPack(pack)
+			return nil
+		}
+		stream.BroadcastMarkFunc = func(pack *msgstream.MsgPack) (map[string][]msgstream.MessageID, error) {
+			log.Info("mock BroadcastMark")
+			packChan <- msgstream.BuildConsumeMsgPack(pack)
+			return map[string][]msgstream.MessageID{}, nil
+		}
+		stream.AsProducerFunc = func(channels []string) {
+		}
+		stream.ChanFunc = func() <-chan *msgstream.ConsumeMsgPack {
+			return packChan
+		}
+		return stream, nil
+	}
+
+	return newTickerWithFactory(f)
 }
 
 type mockDdlTsLockManager struct {

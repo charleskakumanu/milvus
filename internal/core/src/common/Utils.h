@@ -42,6 +42,8 @@ namespace milvus {
 #define VEC_FIELD_DATA(data_array, type) \
     (data_array->vectors().type##_vector().data())
 
+using CheckDataValid = std::function<bool(size_t)>;
+
 inline DatasetPtr
 GenDataset(const int64_t nb, const int64_t dim, const void* xb) {
     return knowhere::GenDataSet(nb, dim, xb);
@@ -136,6 +138,14 @@ PostfixMatch(const std::string_view str, const std::string_view postfix) {
     return true;
 }
 
+inline bool
+InnerMatch(const std::string_view str, const std::string_view pattern) {
+    if (pattern.length() > str.length()) {
+        return false;
+    }
+    return str.find(pattern) != std::string::npos;
+}
+
 inline int64_t
 upper_align(int64_t value, int64_t align) {
     Assert(align > 0);
@@ -157,16 +167,10 @@ IsMetricType(const std::string_view str,
 }
 
 inline bool
-IsFloatMetricType(const knowhere::MetricType& metric_type) {
-    return IsMetricType(metric_type, knowhere::metric::L2) ||
-           IsMetricType(metric_type, knowhere::metric::IP) ||
-           IsMetricType(metric_type, knowhere::metric::COSINE);
-}
-
-inline bool
 PositivelyRelated(const knowhere::MetricType& metric_type) {
     return IsMetricType(metric_type, knowhere::metric::IP) ||
-           IsMetricType(metric_type, knowhere::metric::COSINE);
+           IsMetricType(metric_type, knowhere::metric::COSINE) ||
+           IsMetricType(metric_type, knowhere::metric::BM25);
 }
 
 inline std::string
@@ -208,11 +212,36 @@ Join(const std::vector<T>& items, const std::string& delimiter) {
 }
 
 inline std::string
+PrintBitsetTypeView(const BitsetTypeView& view) {
+    std::stringstream ss;
+    for (auto i = 0; i < view.size(); ++i) {
+        ss << int(view[i]);
+    }
+    return ss.str();
+}
+
+inline std::string
 GetCommonPrefix(const std::string& str1, const std::string& str2) {
     size_t len = std::min(str1.length(), str2.length());
     size_t i = 0;
     while (i < len && str1[i] == str2[i]) ++i;
     return str1.substr(0, i);
+}
+
+// Escape braces in the input string,
+// used for fmt::format json string
+inline std::string
+EscapeBraces(const std::string& input) {
+    std::string result;
+    for (char ch : input) {
+        if (ch == '{')
+            result += "{{";
+        else if (ch == '}')
+            result += "}}";
+        else
+            result += ch;
+    }
+    return result;
 }
 
 inline knowhere::sparse::SparseRow<float>
@@ -224,7 +253,6 @@ CopyAndWrapSparseRow(const void* data,
     knowhere::sparse::SparseRow<float> row(num_elements);
     std::memcpy(row.data(), data, size);
     if (validate) {
-        AssertInfo(size > 0, "Sparse row data should not be empty");
         AssertInfo(
             size % knowhere::sparse::SparseRow<float>::element_size() == 0,
             "Invalid size for sparse row data");
@@ -286,5 +314,19 @@ inline void SparseRowsToProto(
     }
     proto->set_dim(max_dim);
 }
+
+class Defer {
+ public:
+    Defer(std::function<void()> fn) : fn_(fn) {
+    }
+    ~Defer() {
+        fn_();
+    }
+
+ private:
+    std::function<void()> fn_;
+};
+
+#define DeferLambda(fn) Defer Defer_##__COUNTER__(fn);
 
 }  // namespace milvus

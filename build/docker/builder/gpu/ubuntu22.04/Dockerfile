@@ -13,12 +13,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends wget curl ca-ce
 
 
 # Install go
-RUN mkdir -p /usr/local/go && wget -qO- "https://go.dev/dl/go1.21.10.linux-$TARGETARCH.tar.gz" | tar --strip-components=1 -xz -C /usr/local/go
+RUN mkdir -p /usr/local/go && wget -qO- "https://go.dev/dl/go1.24.2.linux-$TARGETARCH.tar.gz" | tar --strip-components=1 -xz -C /usr/local/go
 # Install conan
-RUN pip3 install conan==1.61.0
+RUN pip3 install conan==1.64.1
 # Install rust
 RUN curl https://sh.rustup.rs -sSf | \
-    sh -s -- --default-toolchain=1.73 -y
+    sh -s -- --default-toolchain=1.83 -y
 ENV PATH=/root/.cargo/bin:/usr/local/bin:/usr/local/go/bin:$PATH
 
 RUN mkdir /opt/vcpkg &&  \
@@ -31,7 +31,7 @@ RUN vcpkg install azure-identity-cpp azure-storage-blobs-cpp gtest
 
 # refer: https://code.visualstudio.com/docs/remote/containers-advanced#_avoiding-extension-reinstalls-on-container-rebuild
 RUN mkdir -p /home/milvus/.vscode-server/extensions \
-        /home/milvus/.vscode-server-insiders/extensions \
+    /home/milvus/.vscode-server-insiders/extensions \
     && chmod -R 777 /home/milvus
 
 

@@ -19,7 +19,6 @@ package numpy
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"io"
 	"unicode/utf8"
@@ -29,8 +28,11 @@ import (
 	"github.com/sbinet/npyio/npy"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/internal/json"
+	"github.com/milvus-io/milvus/internal/util/importutilv2/common"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/parameterutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 type FieldReader struct {
@@ -102,6 +104,8 @@ func (c *FieldReader) getCount(count int64) int64 {
 		count *= c.dim
 	case schemapb.DataType_Float16Vector, schemapb.DataType_BFloat16Vector:
 		count *= c.dim * 2
+	case schemapb.DataType_Int8Vector:
+		count *= c.dim
 	}
 	if int(count) > (total - c.readPosition) {
 		return int64(total - c.readPosition)
@@ -201,6 +205,12 @@ func (c *FieldReader) Next(count int64) (any, error) {
 			return nil, err
 		}
 		c.readPosition += int(readCount)
+	case schemapb.DataType_Int8Vector:
+		data, err = ReadN[int8](c.reader, c.order, readCount)
+		if err != nil {
+			return nil, err
+		}
+		c.readPosition += int(readCount)
 	case schemapb.DataType_FloatVector:
 		var elementType schemapb.DataType
 		elementType, err = convertNumpyType(c.npyReader.Header.Descr.Type)
@@ -238,8 +248,6 @@ func (c *FieldReader) Next(count int64) (any, error) {
 	return data, nil
 }
 
-func (c *FieldReader) Close() {}
-
 // setByteOrder sets BigEndian/LittleEndian, the logic of this method is copied from npyio lib
 func (c *FieldReader) setByteOrder() {
 	var nativeEndian binary.ByteOrder
@@ -268,7 +276,10 @@ func (c *FieldReader) ReadString(count int64) ([]string, error) {
 		return nil, merr.WrapErrImportFailed(
 			fmt.Sprintf("failed to get max length %d of varchar from numpy file header, error: %v", maxLen, err))
 	}
-
+	maxLength, err := parameterutil.GetMaxLength(c.field)
+	if c.field.DataType == schemapb.DataType_VarChar && err != nil {
+		return nil, err
+	}
 	// read data
 	data := make([]string, 0, count)
 	for len(data) < int(count) {
@@ -285,6 +296,11 @@ func (c *FieldReader) ReadString(count int64) ([]string, error) {
 				return nil, merr.WrapErrImportFailed(fmt.Sprintf("failed to read utf32 bytes from numpy file, error: %v", err))
 			}
 			str, err := decodeUtf32(raw, c.order)
+			if c.field.DataType == schemapb.DataType_VarChar {
+				if err = common.CheckVarcharLength(str, maxLength, c.field); err != nil {
+					return nil, err
+				}
+			}
 			if err != nil {
 				return nil, merr.WrapErrImportFailed(fmt.Sprintf("failed to decode utf32 bytes, error: %v", err))
 			}
@@ -300,7 +316,11 @@ func (c *FieldReader) ReadString(count int64) ([]string, error) {
 			if n > 0 {
 				buf = buf[:n]
 			}
-			data = append(data, string(buf))
+			str := string(buf)
+			if err = common.CheckValidUTF8(str, c.field); err != nil {
+				return nil, err
+			}
+			data = append(data, str)
 		}
 	}
 	return data, nil

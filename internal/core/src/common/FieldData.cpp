@@ -17,6 +17,7 @@
 #include "common/FieldData.h"
 
 #include "arrow/array/array_binary.h"
+#include "arrow/chunked_array.h"
 #include "common/Array.h"
 #include "common/EasyAssert.h"
 #include "common/Exception.h"
@@ -30,6 +31,9 @@ template <typename Type, bool is_type_entire_row>
 void
 FieldDataImpl<Type, is_type_entire_row>::FillFieldData(const void* source,
                                                        ssize_t element_count) {
+    AssertInfo(!nullable_,
+               "need to fill valid_data, use the 3-argument version instead");
+
     if (element_count == 0) {
         return;
     }
@@ -40,7 +44,38 @@ FieldDataImpl<Type, is_type_entire_row>::FillFieldData(const void* source,
     }
     std::copy_n(static_cast<const Type*>(source),
                 element_count * dim_,
-                field_data_.data() + length_ * dim_);
+                data_.data() + length_ * dim_);
+    length_ += element_count;
+}
+
+template <typename Type, bool is_type_entire_row>
+void
+FieldDataImpl<Type, is_type_entire_row>::FillFieldData(
+    const void* field_data, const uint8_t* valid_data, ssize_t element_count) {
+    AssertInfo(
+        nullable_,
+        "no need to fill valid_data, use the 2-argument version instead");
+    if (element_count == 0) {
+        return;
+    }
+
+    std::lock_guard lck(tell_mutex_);
+    if (length_ + element_count > get_num_rows()) {
+        resize_field_data(length_ + element_count);
+    }
+    std::copy_n(static_cast<const Type*>(field_data),
+                element_count * dim_,
+                data_.data() + length_ * dim_);
+
+    ssize_t byte_count = (element_count + 7) / 8;
+    // Note: if 'nullable == true` and valid_data is nullptr
+    // means null_count == 0, will fill it with 0xFF
+    if (valid_data == nullptr) {
+        valid_data_.assign(byte_count, 0xFF);
+    } else {
+        std::copy_n(valid_data, byte_count, valid_data_.data());
+    }
+
     length_ += element_count;
 }
 
@@ -60,12 +95,27 @@ GetDataInfoFromArray(const std::shared_ptr<arrow::Array> array) {
 template <typename Type, bool is_type_entire_row>
 void
 FieldDataImpl<Type, is_type_entire_row>::FillFieldData(
+    const std::shared_ptr<arrow::ChunkedArray> arrays) {
+    AssertInfo(arrays != nullptr, "null arrow chunked array");
+    auto element_count = arrays->length();
+    if (element_count == 0) {
+        return;
+    }
+    for (const auto& array : arrays->chunks()) {
+        FillFieldData(array);
+    }
+}
+
+template <typename Type, bool is_type_entire_row>
+void
+FieldDataImpl<Type, is_type_entire_row>::FillFieldData(
     const std::shared_ptr<arrow::Array> array) {
     AssertInfo(array != nullptr, "null arrow array");
     auto element_count = array->length();
     if (element_count == 0) {
         return;
     }
+    null_count_ = array->null_count();
     switch (data_type_) {
         case DataType::BOOL: {
             AssertInfo(array->type()->id() == arrow::Type::type::BOOL,
@@ -76,46 +126,76 @@ FieldDataImpl<Type, is_type_entire_row>::FillFieldData(
             for (size_t index = 0; index < element_count; ++index) {
                 values[index] = bool_array->Value(index);
             }
+            if (nullable_) {
+                return FillFieldData(values.data(),
+                                     bool_array->null_bitmap_data(),
+                                     element_count);
+            }
             return FillFieldData(values.data(), element_count);
         }
         case DataType::INT8: {
             auto array_info =
                 GetDataInfoFromArray<arrow::Int8Array, arrow::Type::type::INT8>(
                     array);
+            if (nullable_) {
+                return FillFieldData(
+                    array_info.first, array->null_bitmap_data(), element_count);
+            }
             return FillFieldData(array_info.first, array_info.second);
         }
         case DataType::INT16: {
             auto array_info =
                 GetDataInfoFromArray<arrow::Int16Array,
                                      arrow::Type::type::INT16>(array);
+            if (nullable_) {
+                return FillFieldData(
+                    array_info.first, array->null_bitmap_data(), element_count);
+            }
             return FillFieldData(array_info.first, array_info.second);
         }
         case DataType::INT32: {
             auto array_info =
                 GetDataInfoFromArray<arrow::Int32Array,
                                      arrow::Type::type::INT32>(array);
+            if (nullable_) {
+                return FillFieldData(
+                    array_info.first, array->null_bitmap_data(), element_count);
+            }
             return FillFieldData(array_info.first, array_info.second);
         }
         case DataType::INT64: {
             auto array_info =
                 GetDataInfoFromArray<arrow::Int64Array,
                                      arrow::Type::type::INT64>(array);
+            if (nullable_) {
+                return FillFieldData(
+                    array_info.first, array->null_bitmap_data(), element_count);
+            }
             return FillFieldData(array_info.first, array_info.second);
         }
         case DataType::FLOAT: {
             auto array_info =
                 GetDataInfoFromArray<arrow::FloatArray,
                                      arrow::Type::type::FLOAT>(array);
+            if (nullable_) {
+                return FillFieldData(
+                    array_info.first, array->null_bitmap_data(), element_count);
+            }
             return FillFieldData(array_info.first, array_info.second);
         }
         case DataType::DOUBLE: {
             auto array_info =
                 GetDataInfoFromArray<arrow::DoubleArray,
                                      arrow::Type::type::DOUBLE>(array);
+            if (nullable_) {
+                return FillFieldData(
+                    array_info.first, array->null_bitmap_data(), element_count);
+            }
             return FillFieldData(array_info.first, array_info.second);
         }
         case DataType::STRING:
-        case DataType::VARCHAR: {
+        case DataType::VARCHAR:
+        case DataType::TEXT: {
             AssertInfo(array->type()->id() == arrow::Type::type::STRING,
                        "inconsistent data type");
             auto string_array =
@@ -124,9 +204,15 @@ FieldDataImpl<Type, is_type_entire_row>::FillFieldData(
             for (size_t index = 0; index < element_count; ++index) {
                 values[index] = string_array->GetString(index);
             }
+            if (nullable_) {
+                return FillFieldData(
+                    values.data(), array->null_bitmap_data(), element_count);
+            }
             return FillFieldData(values.data(), element_count);
         }
         case DataType::JSON: {
+            // The code here is not referenced.
+            // A subclass named FieldDataJsonImpl is implemented, which overloads this function.
             AssertInfo(array->type()->id() == arrow::Type::type::BINARY,
                        "inconsistent data type");
             auto json_array =
@@ -136,22 +222,39 @@ FieldDataImpl<Type, is_type_entire_row>::FillFieldData(
                 values[index] =
                     Json(simdjson::padded_string(json_array->GetString(index)));
             }
+            if (nullable_) {
+                return FillFieldData(
+                    values.data(), array->null_bitmap_data(), element_count);
+            }
             return FillFieldData(values.data(), element_count);
         }
         case DataType::ARRAY: {
             auto array_array =
                 std::dynamic_pointer_cast<arrow::BinaryArray>(array);
             std::vector<Array> values(element_count);
+            int null_number = 0;
             for (size_t index = 0; index < element_count; ++index) {
                 ScalarArray field_data;
-                field_data.ParseFromString(array_array->GetString(index));
+                if (array_array->GetString(index) == "") {
+                    null_number++;
+                    continue;
+                }
+                auto success =
+                    field_data.ParseFromString(array_array->GetString(index));
+                AssertInfo(success, "parse from string failed");
                 values[index] = Array(field_data);
             }
+            if (nullable_) {
+                return FillFieldData(
+                    values.data(), array->null_bitmap_data(), element_count);
+            }
+            AssertInfo(null_number == 0, "get empty string when not nullable");
             return FillFieldData(values.data(), element_count);
         }
         case DataType::VECTOR_FLOAT:
         case DataType::VECTOR_FLOAT16:
         case DataType::VECTOR_BFLOAT16:
+        case DataType::VECTOR_INT8:
         case DataType::VECTOR_BINARY: {
             auto array_info =
                 GetDataInfoFromArray<arrow::FixedSizeBinaryArray,
@@ -170,6 +273,127 @@ FieldDataImpl<Type, is_type_entire_row>::FillFieldData(
                     CopyAndWrapSparseRow(view.data(), view.size()));
             }
             return FillFieldData(values.data(), element_count);
+        }
+        default: {
+            PanicInfo(DataTypeInvalid,
+                      GetName() + "::FillFieldData" +
+                          " not support data type " +
+                          GetDataTypeName(data_type_));
+        }
+    }
+}
+
+// used for generate added field which has no related binlogs
+template <typename Type, bool is_type_entire_row>
+void
+FieldDataImpl<Type, is_type_entire_row>::FillFieldData(
+    std::optional<DefaultValueType> default_value, ssize_t element_count) {
+    AssertInfo(nullable_, "added field must be nullable");
+    if (element_count == 0) {
+        return;
+    }
+    null_count_ = default_value.has_value() ? 0 : element_count;
+
+    auto valid_data_ptr = [&] {
+        ssize_t byte_count = (element_count + 7) / 8;
+        std::shared_ptr<uint8_t[]> valid_data(new uint8_t[byte_count]);
+        std::fill(valid_data.get(), valid_data.get() + byte_count, 0x00);
+        return valid_data;
+    }();
+    switch (data_type_) {
+        case DataType::BOOL: {
+            FixedVector<bool> values(element_count);
+            if (default_value.has_value()) {
+                std::fill(
+                    values.begin(), values.end(), default_value->bool_data());
+                return FillFieldData(values.data(), nullptr, element_count);
+            }
+            return FillFieldData(
+                values.data(), valid_data_ptr.get(), element_count);
+        }
+        case DataType::INT8: {
+            FixedVector<int8_t> values(element_count);
+            if (default_value.has_value()) {
+                std::fill(
+                    values.begin(), values.end(), default_value->int_data());
+                return FillFieldData(values.data(), nullptr, element_count);
+            }
+            return FillFieldData(
+                values.data(), valid_data_ptr.get(), element_count);
+        }
+        case DataType::INT16: {
+            FixedVector<int16_t> values(element_count);
+            if (default_value.has_value()) {
+                std::fill(
+                    values.begin(), values.end(), default_value->int_data());
+                return FillFieldData(values.data(), nullptr, element_count);
+            }
+            return FillFieldData(
+                values.data(), valid_data_ptr.get(), element_count);
+        }
+        case DataType::INT32: {
+            FixedVector<int32_t> values(element_count);
+            if (default_value.has_value()) {
+                std::fill(
+                    values.begin(), values.end(), default_value->int_data());
+                return FillFieldData(values.data(), nullptr, element_count);
+            }
+            return FillFieldData(
+                values.data(), valid_data_ptr.get(), element_count);
+        }
+        case DataType::INT64: {
+            FixedVector<int64_t> values(element_count);
+            if (default_value.has_value()) {
+                std::fill(
+                    values.begin(), values.end(), default_value->long_data());
+                return FillFieldData(values.data(), nullptr, element_count);
+            }
+            return FillFieldData(
+                values.data(), valid_data_ptr.get(), element_count);
+        }
+        case DataType::FLOAT: {
+            FixedVector<float> values(element_count);
+            if (default_value.has_value()) {
+                std::fill(
+                    values.begin(), values.end(), default_value->float_data());
+                return FillFieldData(values.data(), nullptr, element_count);
+            }
+            return FillFieldData(
+                values.data(), valid_data_ptr.get(), element_count);
+        }
+        case DataType::DOUBLE: {
+            FixedVector<double> values(element_count);
+            if (default_value.has_value()) {
+                std::fill(
+                    values.begin(), values.end(), default_value->double_data());
+                return FillFieldData(values.data(), nullptr, element_count);
+            }
+            return FillFieldData(
+                values.data(), valid_data_ptr.get(), element_count);
+        }
+        case DataType::STRING:
+        case DataType::VARCHAR: {
+            FixedVector<std::string> values(element_count);
+            if (default_value.has_value()) {
+                std::fill(
+                    values.begin(), values.end(), default_value->string_data());
+                return FillFieldData(values.data(), nullptr, element_count);
+            }
+            return FillFieldData(
+                values.data(), valid_data_ptr.get(), element_count);
+        }
+        case DataType::JSON: {
+            // The code here is not referenced.
+            // A subclass named FieldDataJsonImpl is implemented, which overloads this function.
+            FixedVector<Json> values(element_count);
+            return FillFieldData(
+                values.data(), valid_data_ptr.get(), element_count);
+        }
+        case DataType::ARRAY: {
+            // todo: add array default_value
+            FixedVector<Array> values(element_count);
+            return FillFieldData(
+                values.data(), valid_data_ptr.get(), element_count);
         }
         default: {
             PanicInfo(DataTypeInvalid,
@@ -201,27 +425,34 @@ template class FieldDataImpl<bfloat16, false>;
 template class FieldDataImpl<knowhere::sparse::SparseRow<float>, true>;
 
 FieldDataPtr
-InitScalarFieldData(const DataType& type, int64_t cap_rows) {
+InitScalarFieldData(const DataType& type, bool nullable, int64_t cap_rows) {
     switch (type) {
         case DataType::BOOL:
-            return std::make_shared<FieldData<bool>>(type, cap_rows);
+            return std::make_shared<FieldData<bool>>(type, nullable, cap_rows);
         case DataType::INT8:
-            return std::make_shared<FieldData<int8_t>>(type, cap_rows);
+            return std::make_shared<FieldData<int8_t>>(
+                type, nullable, cap_rows);
         case DataType::INT16:
-            return std::make_shared<FieldData<int16_t>>(type, cap_rows);
+            return std::make_shared<FieldData<int16_t>>(
+                type, nullable, cap_rows);
         case DataType::INT32:
-            return std::make_shared<FieldData<int32_t>>(type, cap_rows);
+            return std::make_shared<FieldData<int32_t>>(
+                type, nullable, cap_rows);
         case DataType::INT64:
-            return std::make_shared<FieldData<int64_t>>(type, cap_rows);
+            return std::make_shared<FieldData<int64_t>>(
+                type, nullable, cap_rows);
         case DataType::FLOAT:
-            return std::make_shared<FieldData<float>>(type, cap_rows);
+            return std::make_shared<FieldData<float>>(type, nullable, cap_rows);
         case DataType::DOUBLE:
-            return std::make_shared<FieldData<double>>(type, cap_rows);
+            return std::make_shared<FieldData<double>>(
+                type, nullable, cap_rows);
         case DataType::STRING:
         case DataType::VARCHAR:
-            return std::make_shared<FieldData<std::string>>(type, cap_rows);
+        case DataType::TEXT:
+            return std::make_shared<FieldData<std::string>>(
+                type, nullable, cap_rows);
         case DataType::JSON:
-            return std::make_shared<FieldData<Json>>(type, cap_rows);
+            return std::make_shared<FieldData<Json>>(type, nullable, cap_rows);
         default:
             PanicInfo(DataTypeInvalid,
                       "InitScalarFieldData not support data type " +

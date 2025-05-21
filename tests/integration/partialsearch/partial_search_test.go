@@ -24,20 +24,20 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/stretchr/testify/suite"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/commonpbutil"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/metric"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/metric"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 	"github.com/milvus-io/milvus/tests/integration"
 )
 
@@ -327,7 +327,7 @@ func (s *PartialSearchSuite) TestPartialSearch() {
 	// Partial search does not work yet.
 	c := s.Cluster
 	q1 := c.QueryNode
-	c.QueryCoord.StopCheckerForTestOnly()
+	c.MixCoord.StopCheckerForTestOnly()
 	collectionName := s.prefix + "_0"
 	nodeID := q1.GetServerIDForTestOnly()
 	collectionID, channels := s.describeCollection(collectionName)
@@ -339,7 +339,7 @@ func (s *PartialSearchSuite) TestPartialSearch() {
 	req := s.releaseSegmentsReq(collectionID, nodeID, segmentID, shard)
 	q1.ReleaseSegments(context.TODO(), req)
 	s.FailOnSearch(collectionName)
-	c.QueryCoord.StartCheckerForTestOnly()
+	c.MixCoord.StartCheckerForTestOnly()
 }
 
 func TestPartialSearchUtil(t *testing.T) {

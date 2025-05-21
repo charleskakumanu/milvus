@@ -14,13 +14,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <algorithm>
+#include <cstddef>
 #include <optional>
 #include <string>
+#include "arrow/type.h"
 #include <boost/lexical_cast.hpp>
 #include <google/protobuf/text_format.h>
+#include <memory>
 
 #include "Schema.h"
 #include "SystemProperty.h"
+#include "arrow/util/key_value_metadata.h"
+#include "milvus-storage/common/constants.h"
 #include "protobuf_utils.h"
 
 namespace milvus {
@@ -37,51 +43,21 @@ Schema::ParseFrom(const milvus::proto::schema::CollectionSchema& schema_proto) {
     for (const milvus::proto::schema::FieldSchema& child :
          schema_proto.fields()) {
         auto field_id = FieldId(child.fieldid());
-        auto name = FieldName(child.name());
 
-        if (field_id.get() < 100) {
-            // system field id
-            auto is_system =
-                SystemProperty::Instance().SystemFieldVerify(name, field_id);
-            AssertInfo(is_system,
-                       "invalid system type: name(" + name.get() + "), id(" +
-                           std::to_string(field_id.get()) + ")");
-        }
-
-        auto data_type = DataType(child.data_type());
-
-        if (IsVectorDataType(data_type)) {
-            auto type_map = RepeatedKeyValToMap(child.type_params());
-            auto index_map = RepeatedKeyValToMap(child.index_params());
-
-            int64_t dim = 0;
-            if (!IsSparseFloatVectorDataType(data_type)) {
-                AssertInfo(type_map.count("dim"), "dim not found");
-                dim = boost::lexical_cast<int64_t>(type_map.at("dim"));
-            }
-            if (!index_map.count("metric_type")) {
-                schema->AddField(name, field_id, data_type, dim, std::nullopt);
-            } else {
-                auto metric_type = index_map.at("metric_type");
-                schema->AddField(name, field_id, data_type, dim, metric_type);
-            }
-        } else if (IsStringDataType(data_type)) {
-            auto type_map = RepeatedKeyValToMap(child.type_params());
-            AssertInfo(type_map.count(MAX_LENGTH), "max_length not found");
-            auto max_len =
-                boost::lexical_cast<int64_t>(type_map.at(MAX_LENGTH));
-            schema->AddField(name, field_id, data_type, max_len);
-        } else if (IsArrayDataType(data_type)) {
-            schema->AddField(
-                name, field_id, data_type, DataType(child.element_type()));
-        } else {
-            schema->AddField(name, field_id, data_type);
-        }
+        auto f = FieldMeta::ParseFrom(child);
+        schema->AddField(std::move(f));
 
         if (child.is_primary_key()) {
             AssertInfo(!schema->get_primary_field_id().has_value(),
                        "repetitive primary key");
             schema->set_primary_field_id(field_id);
+        }
+
+        if (child.is_dynamic()) {
+            Assert(schema_proto.enable_dynamic_field());
+            AssertInfo(!schema->get_dynamic_field_id().has_value(),
+                       "repetitive dynamic field");
+            schema->set_dynamic_field_id(field_id);
         }
     }
 
@@ -91,8 +67,40 @@ Schema::ParseFrom(const milvus::proto::schema::CollectionSchema& schema_proto) {
     return schema;
 }
 
-const FieldMeta FieldMeta::RowIdMeta(FieldName("RowID"),
-                                     RowFieldID,
-                                     DataType::INT64);
+const FieldMeta FieldMeta::RowIdMeta(
+    FieldName("RowID"), RowFieldID, DataType::INT64, false, std::nullopt);
+
+const ArrowSchemaPtr
+Schema::ConvertToArrowSchema() const {
+    arrow::FieldVector arrow_fields;
+    for (auto& field : fields_) {
+        auto meta = field.second;
+        int dim = IsVectorDataType(meta.get_data_type()) &&
+                          !IsSparseFloatVectorDataType(meta.get_data_type())
+                      ? meta.get_dim()
+                      : 1;
+        auto arrow_field = std::make_shared<arrow::Field>(
+            meta.get_name().get(),
+            GetArrowDataType(meta.get_data_type(), dim),
+            meta.is_nullable(),
+            arrow::key_value_metadata({milvus_storage::ARROW_FIELD_ID_KEY},
+                                      {std::to_string(meta.get_id().get())}));
+        arrow_fields.push_back(arrow_field);
+    }
+    return arrow::schema(arrow_fields);
+}
+
+std::unique_ptr<std::vector<FieldMeta>>
+Schema::absent_fields(Schema& old_schema) const {
+    std::vector<FieldMeta> result;
+    for (const auto& [field_id, field_meta] : fields_) {
+        auto it = old_schema.fields_.find(field_id);
+        if (it == old_schema.fields_.end()) {
+            result.emplace_back(field_meta);
+        }
+    }
+
+    return std::make_unique<std::vector<FieldMeta>>(result);
+}
 
 }  // namespace milvus

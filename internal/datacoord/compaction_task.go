@@ -17,44 +17,37 @@
 package datacoord
 
 import (
-	"go.opentelemetry.io/otel/trace"
-
-	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
+	"github.com/milvus-io/milvus/internal/datacoord/task"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 )
 
 type CompactionTask interface {
+	task.Task
+	// Process performs the task's state machine
+	//
+	// Returns:
+	//   - <bool>:  whether the task state machine ends.
+	//
+	// Notes:
+	//
+	//	`end` doesn't mean the task completed, its state may be completed or failed or timeout.
 	Process() bool
+	// Clean performs clean logic for a fail/timeout task
+	Clean() bool
 	BuildCompactionRequest() (*datapb.CompactionPlan, error)
-
-	GetTriggerID() UniqueID
-	GetPlanID() UniqueID
-	GetState() datapb.CompactionTaskState
-	GetChannel() string
+	GetSlotUsage() int64
 	GetLabel() string
 
-	GetType() datapb.CompactionType
-	GetCollectionID() int64
-	GetPartitionID() int64
-	GetInputSegments() []int64
-	GetStartTime() int64
-	GetTimeoutInSeconds() int32
-	GetPos() *msgpb.MsgPosition
-
-	GetPlan() *datapb.CompactionPlan
-	GetResult() *datapb.CompactionPlanResult
-
-	GetNodeID() UniqueID
-	GetSpan() trace.Span
-	ShadowClone(opts ...compactionTaskOpt) *datapb.CompactionTask
-	SetNodeID(UniqueID) error
 	SetTask(*datapb.CompactionTask)
-	SetSpan(trace.Span)
-	SetResult(*datapb.CompactionPlanResult)
-	EndSpan()
-	CleanLogPath()
+	GetTaskProto() *datapb.CompactionTask
+	ShadowClone(opts ...compactionTaskOpt) *datapb.CompactionTask
+
+	SetNodeID(UniqueID) error
 	NeedReAssignNodeID() bool
 	SaveTaskMeta() error
+
+	PreparePlan() bool
+	CheckCompactionContainsSegment(segmentID int64) bool
 }
 
 type compactionTaskOpt func(task *datapb.CompactionTask)
@@ -89,6 +82,12 @@ func setResultSegments(segments []int64) compactionTaskOpt {
 	}
 }
 
+func setTmpSegments(segments []int64) compactionTaskOpt {
+	return func(task *datapb.CompactionTask) {
+		task.TmpSegments = segments
+	}
+}
+
 func setState(state datapb.CompactionTaskState) compactionTaskOpt {
 	return func(task *datapb.CompactionTask) {
 		task.State = state
@@ -98,5 +97,23 @@ func setState(state datapb.CompactionTaskState) compactionTaskOpt {
 func setStartTime(startTime int64) compactionTaskOpt {
 	return func(task *datapb.CompactionTask) {
 		task.StartTime = startTime
+	}
+}
+
+func setRetryTimes(retryTimes int32) compactionTaskOpt {
+	return func(task *datapb.CompactionTask) {
+		task.RetryTimes = retryTimes
+	}
+}
+
+func setLastStateStartTime(lastStateStartTime int64) compactionTaskOpt {
+	return func(task *datapb.CompactionTask) {
+		task.LastStateStartTime = lastStateStartTime
+	}
+}
+
+func setAnalyzeTaskID(id int64) compactionTaskOpt {
+	return func(task *datapb.CompactionTask) {
+		task.AnalyzeTaskID = id
 	}
 }

@@ -17,6 +17,8 @@
 #pragma once
 
 #include <iostream>
+#include <utility>
+#include <variant>
 #include "common/Consts.h"
 
 namespace milvus {
@@ -27,6 +29,10 @@ extern int64_t MIDDLE_PRIORITY_THREAD_CORE_COEFFICIENT;
 extern int64_t LOW_PRIORITY_THREAD_CORE_COEFFICIENT;
 extern int CPU_NUM;
 extern int64_t EXEC_EVAL_EXPR_BATCH_SIZE;
+extern int64_t JSON_KEY_STATS_COMMIT_INTERVAL;
+extern bool OPTIMIZE_EXPR_ENABLED;
+extern bool GROWING_JSON_KEY_STATS_ENABLED;
+extern bool CONFIG_PARAM_TYPE_CHECK_ENABLED;
 
 void
 SetIndexSliceSize(const int64_t size);
@@ -45,5 +51,28 @@ SetCpuNum(const int core);
 
 void
 SetDefaultExecEvalExprBatchSize(int64_t val);
+
+void
+SetDefaultOptimizeExprEnable(bool val);
+
+void
+SetDefaultJSONKeyStatsCommitInterval(int64_t val);
+
+void
+SetDefaultGrowingJSONKeyStatsEnable(bool val);
+
+void
+SetDefaultConfigParamTypeCheck(bool val);
+
+struct BufferView {
+    struct Element {
+        const char* data_;
+        uint32_t* offsets_;
+        int start_;
+        int end_;
+    };
+
+    std::variant<std::vector<Element>, std::pair<char*, size_t>> data_;
+};
 
 }  // namespace milvus

@@ -45,6 +45,8 @@ get_storage_config(const milvus::proto::clustering::StorageConfig& config) {
     storage_config.region = config.region();
     storage_config.useVirtualHost = config.use_virtual_host();
     storage_config.requestTimeoutMs = config.request_timeout_ms();
+    storage_config.gcp_credential_json =
+        std::string(config.gcpcredentialjson());
     return storage_config;
 }
 
@@ -56,7 +58,7 @@ Analyze(CAnalyze* res_analyze,
         auto analyze_info =
             std::make_unique<milvus::proto::clustering::AnalyzeInfo>();
         auto res = analyze_info->ParseFromArray(serialized_analyze_info, len);
-        AssertInfo(res, "Unmarshall analyze info failed");
+        AssertInfo(res, "Unmarshal analyze info failed");
         auto field_type =
             static_cast<DataType>(analyze_info->field_schema().data_type());
         auto field_id = analyze_info->field_schema().fieldid();

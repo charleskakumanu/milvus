@@ -3,8 +3,8 @@ package segmentutil
 import (
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 )
 
 // ReCalcRowCount re-calculates number of rows of `oldSeg` based on its bin log count, and correct its value in its
@@ -31,6 +31,19 @@ func CalcRowCountFromBinLog(seg *datapb.SegmentInfo) int64 {
 			// This segment contains stale log with incorrect entries num,
 			if ct.GetEntriesNum() <= 0 {
 				return -1
+			}
+		}
+	}
+	return rowCt
+}
+
+// CalcDelRowCountFromDeltaLog calculates deleted rows of a L0 segment from delta logs
+func CalcDelRowCountFromDeltaLog(seg *datapb.SegmentInfo) int64 {
+	var rowCt int64
+	if len(seg.GetDeltalogs()) > 0 {
+		for _, dls := range seg.GetDeltalogs() {
+			for _, dl := range dls.GetBinlogs() {
+				rowCt += dl.GetEntriesNum()
 			}
 		}
 	}

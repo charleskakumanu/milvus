@@ -24,7 +24,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/v2/log"
 )
 
 func TestConversion(t *testing.T) {
@@ -117,5 +117,23 @@ func TestConversion(t *testing.T) {
 			log.Info("bfloat16", zap.Float32("v", v), zap.Float32("v2", v2))
 			assert.Less(t, math.Abs(float64(v2/v-1)), 0.01)
 		}
+	})
+
+	t.Run("TestFloatArrays", func(t *testing.T) {
+		parameters := []float32{0.11111, 0.22222}
+		assert.Equal(t, "\xa4\x8d\xe3=\xa4\x8dc>", string(Float32ArrayToBytes(parameters)))
+
+		f16vec := Float32ArrayToFloat16Bytes(parameters)
+		assert.Equal(t, 4, len(f16vec))
+		// \x1c/ is 0.1111, \x1c3 is 0.2222
+		assert.Equal(t, "\x1c/\x1c3", string(f16vec))
+		assert.Equal(t, "\x1c/", string(Float32ToFloat16Bytes(0.11111)))
+		assert.Equal(t, "\x1c3", string(Float32ToFloat16Bytes(0.22222)))
+
+		bf16vec := Float32ArrayToBFloat16Bytes(parameters)
+		assert.Equal(t, 4, len(bf16vec))
+		assert.Equal(t, "\xe3=c>", string(bf16vec))
+		assert.Equal(t, "\xe3=", string(Float32ToBFloat16Bytes(0.11111)))
+		assert.Equal(t, "c>", string(Float32ToBFloat16Bytes(0.22222)))
 	})
 }

@@ -27,8 +27,8 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/storage"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/internal/util/importutilv2/common"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 )
 
 const (
@@ -40,6 +40,7 @@ type Row = map[storage.FieldID]any
 type reader struct {
 	ctx    context.Context
 	cm     storage.ChunkManager
+	cmr    storage.FileReader
 	schema *schemapb.CollectionSchema
 
 	fileSize *atomic.Int64
@@ -58,13 +59,14 @@ func NewReader(ctx context.Context, cm storage.ChunkManager, schema *schemapb.Co
 	if err != nil {
 		return nil, merr.WrapErrImportFailed(fmt.Sprintf("read json file failed, path=%s, err=%s", path, err.Error()))
 	}
-	count, err := estimateReadCountPerBatch(bufferSize, schema)
+	count, err := common.EstimateReadCountPerBatch(bufferSize, schema)
 	if err != nil {
 		return nil, err
 	}
 	reader := &reader{
 		ctx:        ctx,
 		cm:         cm,
+		cmr:        r,
 		schema:     schema,
 		fileSize:   atomic.NewInt64(0),
 		filePath:   path,
@@ -140,7 +142,7 @@ func (j *reader) Read() (*storage.InsertData, error) {
 		}
 		row, err := j.parser.Parse(value)
 		if err != nil {
-			return nil, err
+			return nil, merr.WrapErrImportFailed(fmt.Sprintf("failed to parse row, error: %v", err))
 		}
 		err = insertData.Append(row)
 		if err != nil {
@@ -180,15 +182,8 @@ func (j *reader) Size() (int64, error) {
 	return size, nil
 }
 
-func (j *reader) Close() {}
-
-func estimateReadCountPerBatch(bufferSize int, schema *schemapb.CollectionSchema) (int64, error) {
-	sizePerRecord, err := typeutil.EstimateMaxSizePerRecord(schema)
-	if err != nil {
-		return 0, err
+func (j *reader) Close() {
+	if j.cmr != nil {
+		j.cmr.Close()
 	}
-	if 1000*sizePerRecord <= bufferSize {
-		return 1000, nil
-	}
-	return int64(bufferSize) / int64(sizePerRecord), nil
 }

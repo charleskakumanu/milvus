@@ -16,22 +16,28 @@
 package config
 
 import (
-	"fmt"
 	"os"
 	"strings"
 
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/cockroachdb/errors"
+
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
+
+// DefaultEnvPrefix is the default prefix for environment variables
+const DefaultEnvPrefix = "MILVUS_CONF_"
 
 type EnvSource struct {
 	configs      *typeutil.ConcurrentMap[string, string]
 	KeyFormatter func(string) string
+	prefix       string
 }
 
 func NewEnvSource(KeyFormatter func(string) string) EnvSource {
 	es := EnvSource{
 		configs:      typeutil.NewConcurrentMap[string, string](),
 		KeyFormatter: KeyFormatter,
+		prefix:       DefaultEnvPrefix,
 	}
 
 	for _, value := range os.Environ() {
@@ -42,6 +48,15 @@ func NewEnvSource(KeyFormatter func(string) string) EnvSource {
 		envKey := KeyFormatter(key)
 		es.configs.Insert(key, value)
 		es.configs.Insert(envKey, value)
+
+		// Handle prefixed environment variables
+		// e.g., MILVUS_MINIO_PORT will override MINIO_PORT
+		if strings.HasPrefix(key, es.prefix) {
+			originalKey := key[len(es.prefix):]
+			originalEnvKey := KeyFormatter(originalKey)
+			es.configs.Insert(originalKey, value)
+			es.configs.Insert(originalEnvKey, value)
+		}
 	}
 	return es
 }
@@ -51,7 +66,7 @@ func (es EnvSource) GetConfigurationByKey(key string) (string, error) {
 	value, ok := es.configs.Get(key)
 
 	if !ok {
-		return "", fmt.Errorf("key not found: %s", key)
+		return "", errors.Wrap(ErrKeyNotFound, key) // fmt.Errorf("key not found: %s", key)
 	}
 
 	return value, nil

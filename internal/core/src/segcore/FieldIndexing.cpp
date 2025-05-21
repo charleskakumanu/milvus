@@ -299,6 +299,7 @@ ScalarFieldIndexing<T>::BuildIndexRange(int64_t ack_beg,
     for (int chunk_id = ack_beg; chunk_id < ack_end; chunk_id++) {
         auto chunk_data = source->get_chunk_data(chunk_id);
         // build index for chunk
+        // seem no lint, not pass valid_data here
         // TODO
         if constexpr (std::is_same_v<T, std::string>) {
             auto indexing = index::CreateStringIndexSort();
@@ -323,6 +324,7 @@ CreateIndex(const FieldMeta& field_meta,
         if (field_meta.get_data_type() == DataType::VECTOR_FLOAT ||
             field_meta.get_data_type() == DataType::VECTOR_FLOAT16 ||
             field_meta.get_data_type() == DataType::VECTOR_BFLOAT16 ||
+            field_meta.get_data_type() == DataType::VECTOR_INT8 ||
             field_meta.get_data_type() == DataType::VECTOR_SPARSE_FLOAT) {
             return std::make_unique<VectorFieldIndexing>(field_meta,
                                                          field_index_meta,

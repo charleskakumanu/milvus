@@ -34,10 +34,10 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/mocks"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/util/streamrpc"
-	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 )
 
 type RemoteWorkerSuite struct {
@@ -190,6 +190,70 @@ func (s *RemoteWorkerSuite) TestDelete() {
 		err := s.worker.Delete(ctx, &querypb.DeleteRequest{})
 
 		s.NoError(err)
+	})
+}
+
+func (s *RemoteWorkerSuite) TestDeleteBatch() {
+	s.Run("normal_run", func() {
+		defer func() { s.mockClient.ExpectedCalls = nil }()
+
+		s.mockClient.EXPECT().DeleteBatch(mock.Anything, mock.AnythingOfType("*querypb.DeleteBatchRequest")).
+			Return(&querypb.DeleteBatchResponse{Status: merr.Success()}, nil).Once()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		resp, err := s.worker.DeleteBatch(ctx, &querypb.DeleteBatchRequest{
+			SegmentIds: []int64{100, 200},
+		})
+		s.NoError(merr.CheckRPCCall(resp, err))
+	})
+
+	s.Run("client_return_error", func() {
+		defer func() { s.mockClient.ExpectedCalls = nil }()
+
+		s.mockClient.EXPECT().DeleteBatch(mock.Anything, mock.AnythingOfType("*querypb.DeleteBatchRequest")).
+			Return(nil, merr.WrapErrServiceInternal("mocked")).Once()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		resp, err := s.worker.DeleteBatch(ctx, &querypb.DeleteBatchRequest{
+			SegmentIds: []int64{100, 200},
+		})
+
+		s.Error(merr.CheckRPCCall(resp, err))
+	})
+
+	s.Run("client_return_fail_status", func() {
+		defer func() { s.mockClient.ExpectedCalls = nil }()
+
+		s.mockClient.EXPECT().DeleteBatch(mock.Anything, mock.AnythingOfType("*querypb.DeleteBatchRequest")).
+			Return(&querypb.DeleteBatchResponse{
+				Status: merr.Status(merr.WrapErrServiceUnavailable("mocked")),
+			}, nil).Once()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		resp, err := s.worker.DeleteBatch(ctx, &querypb.DeleteBatchRequest{
+			SegmentIds: []int64{100, 200},
+		})
+
+		s.Error(merr.CheckRPCCall(resp, err))
+	})
+
+	s.Run("batch_delete_unimplemented", func() {
+		defer func() { s.mockClient.ExpectedCalls = nil }()
+
+		s.mockClient.EXPECT().DeleteBatch(mock.Anything, mock.AnythingOfType("*querypb.DeleteBatchRequest")).
+			Return(nil, merr.WrapErrServiceUnimplemented(status.Errorf(codes.Unimplemented, "mocked grpc unimplemented")))
+		s.mockClient.EXPECT().Delete(mock.Anything, mock.Anything).Return(merr.Success(), nil).Times(2)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		resp, err := s.worker.DeleteBatch(ctx, &querypb.DeleteBatchRequest{
+			SegmentIds: []int64{100, 200},
+		})
+
+		s.NoError(merr.CheckRPCCall(resp, err))
 	})
 }
 

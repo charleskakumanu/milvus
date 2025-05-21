@@ -27,16 +27,19 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/internal/proto/querypb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	"github.com/milvus-io/milvus/internal/querycoordv2/observers"
 	"github.com/milvus-io/milvus/internal/querycoordv2/session"
 	"github.com/milvus-io/milvus/internal/querycoordv2/utils"
-	"github.com/milvus-io/milvus/pkg/eventlog"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/metrics"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/eventlog"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/metrics"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 type LoadCollectionJob struct {
@@ -47,11 +50,11 @@ type LoadCollectionJob struct {
 	dist               *meta.DistributionManager
 	meta               *meta.Meta
 	broker             meta.Broker
-	cluster            session.Cluster
-	targetMgr          *meta.TargetManager
+	targetMgr          meta.TargetManagerInterface
 	targetObserver     *observers.TargetObserver
 	collectionObserver *observers.CollectionObserver
 	nodeMgr            *session.NodeManager
+	collInfo           *milvuspb.DescribeCollectionResponse
 }
 
 func NewLoadCollectionJob(
@@ -60,8 +63,7 @@ func NewLoadCollectionJob(
 	dist *meta.DistributionManager,
 	meta *meta.Meta,
 	broker meta.Broker,
-	cluster session.Cluster,
-	targetMgr *meta.TargetManager,
+	targetMgr meta.TargetManagerInterface,
 	targetObserver *observers.TargetObserver,
 	collectionObserver *observers.CollectionObserver,
 	nodeMgr *session.NodeManager,
@@ -69,11 +71,10 @@ func NewLoadCollectionJob(
 	return &LoadCollectionJob{
 		BaseJob:            NewBaseJob(ctx, req.Base.GetMsgID(), req.GetCollectionID()),
 		req:                req,
-		undo:               NewUndoList(ctx, meta, cluster, targetMgr, targetObserver),
+		undo:               NewUndoList(ctx, meta, targetMgr, targetObserver),
 		dist:               dist,
 		meta:               meta,
 		broker:             broker,
-		cluster:            cluster,
 		targetMgr:          targetMgr,
 		targetObserver:     targetObserver,
 		collectionObserver: collectionObserver,
@@ -91,22 +92,53 @@ func (job *LoadCollectionJob) PreExecute() error {
 		req.ReplicaNumber = 1
 	}
 
-	collection := job.meta.GetCollection(req.GetCollectionID())
+	if len(req.GetResourceGroups()) == 0 {
+		req.ResourceGroups = []string{meta.DefaultResourceGroupName}
+	}
+
+	var err error
+	job.collInfo, err = job.broker.DescribeCollection(job.ctx, req.GetCollectionID())
+	if err != nil {
+		log.Warn("failed to describe collection from RootCoord", zap.Error(err))
+		return err
+	}
+
+	collection := job.meta.GetCollection(job.ctx, req.GetCollectionID())
 	if collection == nil {
 		return nil
 	}
 
 	if collection.GetReplicaNumber() != req.GetReplicaNumber() {
 		msg := fmt.Sprintf("collection with different replica number %d existed, release this collection first before changing its replica number",
-			job.meta.GetReplicaNumber(req.GetCollectionID()),
+			job.meta.GetReplicaNumber(job.ctx, req.GetCollectionID()),
 		)
 		log.Warn(msg)
 		return merr.WrapErrParameterInvalid(collection.GetReplicaNumber(), req.GetReplicaNumber(), "can't change the replica number for loaded collection")
-	} else if !typeutil.MapEqual(collection.GetFieldIndexID(), req.GetFieldIndexID()) {
-		msg := fmt.Sprintf("collection with different index %v existed, release this collection first before changing its index",
-			collection.GetFieldIndexID())
+	}
+
+	reqFieldIDs := req.GetLoadFields()
+	if !funcutil.SliceSetEqual(collection.GetLoadFields(), reqFieldIDs) && len(req.GetLoadFields()) == 0 {
+		// here is a compatible logic: meta is still old, but req was sent in new version
+		// in older versions, a full load will be saved all field id, in newer version, use empty loaded list as all loaded
+		reqFieldIDs = lo.Map(job.collInfo.GetSchema().GetFields(), func(field *schemapb.FieldSchema, _ int) int64 {
+			return field.GetFieldID()
+		})
+	}
+
+	if !funcutil.SliceSetEqual(collection.GetLoadFields(), reqFieldIDs) {
+		log.Warn("collection with different load field list exists, release this collection first before chaning its load fields",
+			zap.Int64s("loadedFieldIDs", collection.GetLoadFields()),
+			zap.Int64s("reqFieldIDs", req.GetLoadFields()),
+		)
+		return merr.WrapErrParameterInvalid(collection.GetLoadFields(), req.GetLoadFields(), "can't change the load field list for loaded collection")
+	}
+	collectionUsedRG := job.meta.ReplicaManager.GetResourceGroupByCollection(job.ctx, collection.GetCollectionID()).Collect()
+	left, right := lo.Difference(collectionUsedRG, req.GetResourceGroups())
+	if len(left) > 0 || len(right) > 0 {
+		msg := fmt.Sprintf("collection with different resource groups %v existed, release this collection first before changing its resource groups",
+			collectionUsedRG)
 		log.Warn(msg)
-		return merr.WrapErrParameterInvalid(collection.GetFieldIndexID(), req.GetFieldIndexID(), "can't change the index for loaded collection")
+		return merr.WrapErrParameterInvalid(collectionUsedRG, req.GetResourceGroups(), "can't change the resource groups for loaded partitions")
 	}
 
 	return nil
@@ -124,7 +156,7 @@ func (job *LoadCollectionJob) Execute() error {
 		log.Warn(msg, zap.Error(err))
 		return errors.Wrap(err, msg)
 	}
-	loadedPartitionIDs := lo.Map(job.meta.CollectionManager.GetPartitionsByCollection(req.GetCollectionID()),
+	loadedPartitionIDs := lo.Map(job.meta.CollectionManager.GetPartitionsByCollection(job.ctx, req.GetCollectionID()),
 		func(partition *meta.Partition, _ int) int64 {
 			return partition.GetPartitionID()
 		})
@@ -138,10 +170,10 @@ func (job *LoadCollectionJob) Execute() error {
 	job.undo.LackPartitions = lackPartitionIDs
 	log.Info("find partitions to load", zap.Int64s("partitions", lackPartitionIDs))
 
-	colExisted := job.meta.CollectionManager.Exist(req.GetCollectionID())
+	colExisted := job.meta.CollectionManager.Exist(job.ctx, req.GetCollectionID())
 	if !colExisted {
 		// Clear stale replicas, https://github.com/milvus-io/milvus/issues/20444
-		err = job.meta.ReplicaManager.RemoveCollection(req.GetCollectionID())
+		err = job.meta.ReplicaManager.RemoveCollection(job.ctx, req.GetCollectionID())
 		if err != nil {
 			msg := "failed to clear stale replicas"
 			log.Warn(msg, zap.Error(err))
@@ -150,28 +182,17 @@ func (job *LoadCollectionJob) Execute() error {
 	}
 
 	// 2. create replica if not exist
-	replicas := job.meta.ReplicaManager.GetByCollection(req.GetCollectionID())
+	replicas := job.meta.ReplicaManager.GetByCollection(job.ctx, req.GetCollectionID())
 	if len(replicas) == 0 {
-		collectionInfo, err := job.broker.DescribeCollection(job.ctx, req.GetCollectionID())
-		if err != nil {
-			return err
-		}
-
 		// API of LoadCollection is wired, we should use map[resourceGroupNames]replicaNumber as input, to keep consistency with `TransferReplica` API.
 		// Then we can implement dynamic replica changed in different resource group independently.
-		_, err = utils.SpawnReplicasWithRG(job.meta, req.GetCollectionID(), req.GetResourceGroups(), req.GetReplicaNumber(), collectionInfo.GetVirtualChannelNames())
+		_, err = utils.SpawnReplicasWithRG(job.ctx, job.meta, req.GetCollectionID(), req.GetResourceGroups(), req.GetReplicaNumber(), job.collInfo.GetVirtualChannelNames())
 		if err != nil {
 			msg := "failed to spawn replica for collection"
 			log.Warn(msg, zap.Error(err))
 			return errors.Wrap(err, msg)
 		}
 		job.undo.IsReplicaCreated = true
-	}
-
-	// 3. loadPartitions on QueryNodes
-	err = loadPartitions(job.ctx, job.meta, job.cluster, job.broker, true, req.GetCollectionID(), lackPartitionIDs...)
-	if err != nil {
-		return err
 	}
 
 	// 4. put collection/partitions meta
@@ -196,12 +217,15 @@ func (job *LoadCollectionJob) Execute() error {
 			Status:        querypb.LoadStatus_Loading,
 			FieldIndexID:  req.GetFieldIndexID(),
 			LoadType:      querypb.LoadType_LoadCollection,
+			LoadFields:    req.GetLoadFields(),
+			DbID:          job.collInfo.GetDbId(),
 		},
 		CreatedAt: time.Now(),
 		LoadSpan:  sp,
+		Schema:    job.collInfo.GetSchema(),
 	}
 	job.undo.IsNewCollection = true
-	err = job.meta.CollectionManager.PutCollection(collection, partitions...)
+	err = job.meta.CollectionManager.PutCollection(job.ctx, collection, partitions...)
 	if err != nil {
 		msg := "failed to store collection and partitions"
 		log.Warn(msg, zap.Error(err))
@@ -238,11 +262,11 @@ type LoadPartitionJob struct {
 	dist               *meta.DistributionManager
 	meta               *meta.Meta
 	broker             meta.Broker
-	cluster            session.Cluster
-	targetMgr          *meta.TargetManager
+	targetMgr          meta.TargetManagerInterface
 	targetObserver     *observers.TargetObserver
 	collectionObserver *observers.CollectionObserver
 	nodeMgr            *session.NodeManager
+	collInfo           *milvuspb.DescribeCollectionResponse
 }
 
 func NewLoadPartitionJob(
@@ -251,8 +275,7 @@ func NewLoadPartitionJob(
 	dist *meta.DistributionManager,
 	meta *meta.Meta,
 	broker meta.Broker,
-	cluster session.Cluster,
-	targetMgr *meta.TargetManager,
+	targetMgr meta.TargetManagerInterface,
 	targetObserver *observers.TargetObserver,
 	collectionObserver *observers.CollectionObserver,
 	nodeMgr *session.NodeManager,
@@ -260,11 +283,10 @@ func NewLoadPartitionJob(
 	return &LoadPartitionJob{
 		BaseJob:            NewBaseJob(ctx, req.Base.GetMsgID(), req.GetCollectionID()),
 		req:                req,
-		undo:               NewUndoList(ctx, meta, cluster, targetMgr, targetObserver),
+		undo:               NewUndoList(ctx, meta, targetMgr, targetObserver),
 		dist:               dist,
 		meta:               meta,
 		broker:             broker,
-		cluster:            cluster,
 		targetMgr:          targetMgr,
 		targetObserver:     targetObserver,
 		collectionObserver: collectionObserver,
@@ -282,7 +304,18 @@ func (job *LoadPartitionJob) PreExecute() error {
 		req.ReplicaNumber = 1
 	}
 
-	collection := job.meta.GetCollection(req.GetCollectionID())
+	if len(req.GetResourceGroups()) == 0 {
+		req.ResourceGroups = []string{meta.DefaultResourceGroupName}
+	}
+
+	var err error
+	job.collInfo, err = job.broker.DescribeCollection(job.ctx, req.GetCollectionID())
+	if err != nil {
+		log.Warn("failed to describe collection from RootCoord", zap.Error(err))
+		return err
+	}
+
+	collection := job.meta.GetCollection(job.ctx, req.GetCollectionID())
 	if collection == nil {
 		return nil
 	}
@@ -291,11 +324,29 @@ func (job *LoadPartitionJob) PreExecute() error {
 		msg := "collection with different replica number existed, release this collection first before changing its replica number"
 		log.Warn(msg)
 		return merr.WrapErrParameterInvalid(collection.GetReplicaNumber(), req.GetReplicaNumber(), "can't change the replica number for loaded partitions")
-	} else if !typeutil.MapEqual(collection.GetFieldIndexID(), req.GetFieldIndexID()) {
-		msg := fmt.Sprintf("collection with different index %v existed, release this collection first before changing its index",
-			job.meta.GetFieldIndex(req.GetCollectionID()))
+	}
+
+	reqFieldIDs := req.GetLoadFields()
+	if !funcutil.SliceSetEqual(collection.GetLoadFields(), reqFieldIDs) && len(req.GetLoadFields()) == 0 {
+		// here is a compatible logic: meta is still old, but req was sent in new version
+		// in older versions, a full load will be saved all field id, in newer version, use empty loaded list as all loaded
+		reqFieldIDs = lo.Map(job.collInfo.GetSchema().GetFields(), func(field *schemapb.FieldSchema, _ int) int64 { return field.GetFieldID() })
+	}
+
+	if !funcutil.SliceSetEqual(collection.GetLoadFields(), reqFieldIDs) {
+		log.Warn("collection with different load field list exists, release this collection first before chaning its load fields",
+			zap.Int64s("loadedFieldIDs", collection.GetLoadFields()),
+			zap.Int64s("reqFieldIDs", req.GetLoadFields()),
+		)
+		return merr.WrapErrParameterInvalid(collection.GetLoadFields(), req.GetLoadFields(), "can't change the load field list for loaded collection")
+	}
+	collectionUsedRG := job.meta.ReplicaManager.GetResourceGroupByCollection(job.ctx, collection.GetCollectionID()).Collect()
+	left, right := lo.Difference(collectionUsedRG, req.GetResourceGroups())
+	if len(left) > 0 || len(right) > 0 {
+		msg := fmt.Sprintf("collection with different resource groups %v existed, release this collection first before changing its resource groups",
+			collectionUsedRG)
 		log.Warn(msg)
-		return merr.WrapErrParameterInvalid(collection.GetFieldIndexID(), req.GetFieldIndexID(), "can't change the index for loaded partitions")
+		return merr.WrapErrParameterInvalid(collectionUsedRG, req.GetResourceGroups(), "can't change the resource groups for loaded partitions")
 	}
 
 	return nil
@@ -310,7 +361,7 @@ func (job *LoadPartitionJob) Execute() error {
 	meta.GlobalFailedLoadCache.Remove(req.GetCollectionID())
 
 	// 1. Fetch target partitions
-	loadedPartitionIDs := lo.Map(job.meta.CollectionManager.GetPartitionsByCollection(req.GetCollectionID()),
+	loadedPartitionIDs := lo.Map(job.meta.CollectionManager.GetPartitionsByCollection(job.ctx, req.GetCollectionID()),
 		func(partition *meta.Partition, _ int) int64 {
 			return partition.GetPartitionID()
 		})
@@ -325,9 +376,9 @@ func (job *LoadPartitionJob) Execute() error {
 	log.Info("find partitions to load", zap.Int64s("partitions", lackPartitionIDs))
 
 	var err error
-	if !job.meta.CollectionManager.Exist(req.GetCollectionID()) {
+	if !job.meta.CollectionManager.Exist(job.ctx, req.GetCollectionID()) {
 		// Clear stale replicas, https://github.com/milvus-io/milvus/issues/20444
-		err = job.meta.ReplicaManager.RemoveCollection(req.GetCollectionID())
+		err = job.meta.ReplicaManager.RemoveCollection(job.ctx, req.GetCollectionID())
 		if err != nil {
 			msg := "failed to clear stale replicas"
 			log.Warn(msg, zap.Error(err))
@@ -336,25 +387,15 @@ func (job *LoadPartitionJob) Execute() error {
 	}
 
 	// 2. create replica if not exist
-	replicas := job.meta.ReplicaManager.GetByCollection(req.GetCollectionID())
+	replicas := job.meta.ReplicaManager.GetByCollection(context.TODO(), req.GetCollectionID())
 	if len(replicas) == 0 {
-		collectionInfo, err := job.broker.DescribeCollection(job.ctx, req.GetCollectionID())
-		if err != nil {
-			return err
-		}
-		_, err = utils.SpawnReplicasWithRG(job.meta, req.GetCollectionID(), req.GetResourceGroups(), req.GetReplicaNumber(), collectionInfo.GetVirtualChannelNames())
+		_, err = utils.SpawnReplicasWithRG(job.ctx, job.meta, req.GetCollectionID(), req.GetResourceGroups(), req.GetReplicaNumber(), job.collInfo.GetVirtualChannelNames())
 		if err != nil {
 			msg := "failed to spawn replica for collection"
 			log.Warn(msg, zap.Error(err))
 			return errors.Wrap(err, msg)
 		}
 		job.undo.IsReplicaCreated = true
-	}
-
-	// 3. loadPartitions on QueryNodes
-	err = loadPartitions(job.ctx, job.meta, job.cluster, job.broker, true, req.GetCollectionID(), lackPartitionIDs...)
-	if err != nil {
-		return err
 	}
 
 	// 4. put collection/partitions meta
@@ -371,7 +412,7 @@ func (job *LoadPartitionJob) Execute() error {
 		}
 	})
 	ctx, sp := otel.Tracer(typeutil.QueryCoordRole).Start(job.ctx, "LoadPartition", trace.WithNewRoot())
-	if !job.meta.CollectionManager.Exist(req.GetCollectionID()) {
+	if !job.meta.CollectionManager.Exist(job.ctx, req.GetCollectionID()) {
 		job.undo.IsNewCollection = true
 
 		collection := &meta.Collection{
@@ -381,18 +422,21 @@ func (job *LoadPartitionJob) Execute() error {
 				Status:        querypb.LoadStatus_Loading,
 				FieldIndexID:  req.GetFieldIndexID(),
 				LoadType:      querypb.LoadType_LoadPartition,
+				LoadFields:    req.GetLoadFields(),
+				DbID:          job.collInfo.GetDbId(),
 			},
 			CreatedAt: time.Now(),
 			LoadSpan:  sp,
+			Schema:    job.collInfo.GetSchema(),
 		}
-		err = job.meta.CollectionManager.PutCollection(collection, partitions...)
+		err = job.meta.CollectionManager.PutCollection(job.ctx, collection, partitions...)
 		if err != nil {
 			msg := "failed to store collection and partitions"
 			log.Warn(msg, zap.Error(err))
 			return errors.Wrap(err, msg)
 		}
 	} else { // collection exists, put partitions only
-		err = job.meta.CollectionManager.PutPartition(partitions...)
+		err = job.meta.CollectionManager.PutPartition(job.ctx, partitions...)
 		if err != nil {
 			msg := "failed to store partitions"
 			log.Warn(msg, zap.Error(err))

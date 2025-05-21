@@ -26,11 +26,17 @@
 #include <tuple>
 #include <map>
 #include <string>
+#include <boost/algorithm/string.hpp>
 
+#include "common/Common.h"
 #include "common/Types.h"
 #include "common/FieldData.h"
+#include "common/QueryInfo.h"
+#include "common/RangeSearchHelper.h"
 #include "index/IndexInfo.h"
 #include "storage/Types.h"
+#include "storage/DataCodec.h"
+#include "log/Log.h"
 
 namespace milvus::index {
 
@@ -79,8 +85,39 @@ void inline CheckParameter(Config& conf,
 template <typename T>
 inline std::optional<T>
 GetValueFromConfig(const Config& cfg, const std::string& key) {
-    if (cfg.contains(key)) {
-        return cfg.at(key).get<T>();
+    if (!cfg.contains(key)) {
+        return std::nullopt;
+    }
+
+    const auto& value = cfg.at(key);
+    if (value.is_null()) {
+        return std::nullopt;
+    }
+
+    try {
+        if constexpr (std::is_same_v<T, bool>) {
+            if (value.is_boolean()) {
+                return value.get<bool>();
+            }
+            // compatibility for boolean string
+            return boost::algorithm::to_lower_copy(value.get<std::string>()) ==
+                   "true";
+        }
+        return value.get<T>();
+    } catch (const nlohmann::json::type_error& e) {
+        if (!CONFIG_PARAM_TYPE_CHECK_ENABLED) {
+            LOG_WARN("config type mismatch for key {}: {}", key, e.what());
+            return std::nullopt;
+        }
+        PanicInfo(ErrorCode::UnexpectedError,
+                  "config type error for key {}: {}",
+                  key,
+                  e.what());
+    } catch (const std::exception& e) {
+        PanicInfo(ErrorCode::UnexpectedError,
+                  "Unexpected error for key {}: {}",
+                  key,
+                  e.what());
     }
     return std::nullopt;
 }
@@ -97,11 +134,13 @@ CheckMetricTypeSupport(const MetricType& metric_type) {
     if constexpr (std::is_same_v<T, bin1>) {
         AssertInfo(
             IsBinaryVectorMetricType(metric_type),
-            "binary vector does not float vector metric type: " + metric_type);
+            "binary vector does not support metric type: " + metric_type);
+    } else if constexpr (std::is_same_v<T, int8>) {
+        AssertInfo(IsIntVectorMetricType(metric_type),
+                   "int vector does not support metric type: " + metric_type);
     } else {
-        AssertInfo(
-            IsFloatVectorMetricType(metric_type),
-            "float vector does not binary vector metric type: " + metric_type);
+        AssertInfo(IsFloatVectorMetricType(metric_type),
+                   "float vector does not support metric type: " + metric_type);
     }
 }
 
@@ -130,8 +169,23 @@ Config
 ParseConfigFromIndexParams(
     const std::map<std::string, std::string>& index_params);
 
+struct IndexDataCodec {
+    std::list<std::unique_ptr<storage::DataCodec>> codecs_{};
+    int64_t size_{0};
+};
+
+std::map<std::string, IndexDataCodec>
+CompactIndexDatas(
+    std::map<std::string, std::unique_ptr<storage::DataCodec>>& index_datas);
+
 void
-AssembleIndexDatas(std::map<std::string, FieldDataPtr>& index_datas);
+AssembleIndexDatas(
+    std::map<std::string, std::unique_ptr<storage::DataCodec>>& index_datas,
+    BinarySet& index_binary_set);
+
+void
+AssembleIndexDatas(std::map<std::string, IndexDataCodec>& index_datas,
+                   BinarySet& index_binary_set);
 
 void
 AssembleIndexDatas(std::map<std::string, FieldDataChannelPtr>& index_datas,
@@ -141,4 +195,37 @@ AssembleIndexDatas(std::map<std::string, FieldDataChannelPtr>& index_datas,
 void
 ReadDataFromFD(int fd, void* buf, size_t size, size_t chunk_size = 0x7ffff000);
 
+bool
+CheckAndUpdateKnowhereRangeSearchParam(const SearchInfo& search_info,
+                                       const int64_t topk,
+                                       const MetricType& metric_type,
+                                       knowhere::Json& search_config);
+
+void inline SetBitset(void* bitset, const uint32_t* doc_id, uintptr_t n) {
+    TargetBitmap* bitmap = static_cast<TargetBitmap*>(bitset);
+
+    uintptr_t i = 0;
+    while (i + 3 < n) {
+        uint32_t doc_id_0 = doc_id[i];
+        uint32_t doc_id_1 = doc_id[i + 1];
+        uint32_t doc_id_2 = doc_id[i + 2];
+        uint32_t doc_id_3 = doc_id[i + 3];
+        assert(doc_id_3 < bitmap->size());
+
+        (*bitmap)[doc_id_0] = true;
+        (*bitmap)[doc_id_1] = true;
+        (*bitmap)[doc_id_2] = true;
+        (*bitmap)[doc_id_3] = true;
+
+        i += 4;
+    }
+
+    while (i < n) {
+        uint32_t doc_id_0 = doc_id[i];
+        assert(doc_id_0 < bitmap->size());
+
+        (*bitmap)[doc_id_0] = true;
+        i++;
+    }
+}
 }  // namespace milvus::index

@@ -12,13 +12,15 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/allocator"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/metrics"
-	"github.com/milvus-io/milvus/pkg/mq/msgstream"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/timerecord"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/internal/util/function"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/metrics"
+	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/v2/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/timerecord"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 type insertTask struct {
@@ -28,15 +30,16 @@ type insertTask struct {
 	insertMsg *BaseInsertTask
 	ctx       context.Context
 
-	result        *milvuspb.MutationResult
-	idAllocator   *allocator.IDAllocator
-	segIDAssigner *segIDAssigner
-	chMgr         channelsMgr
-	chTicker      channelsTimeTicker
-	vChannels     []vChan
-	pChannels     []pChan
-	schema        *schemapb.CollectionSchema
-	partitionKeys *schemapb.FieldData
+	result          *milvuspb.MutationResult
+	idAllocator     *allocator.IDAllocator
+	segIDAssigner   *segIDAssigner
+	chMgr           channelsMgr
+	chTicker        channelsTimeTicker
+	vChannels       []vChan
+	pChannels       []pChan
+	schema          *schemapb.CollectionSchema
+	partitionKeys   *schemapb.FieldData
+	schemaTimestamp uint64
 }
 
 // TraceCtx returns insertTask context
@@ -91,6 +94,11 @@ func (it *insertTask) getChannels() []pChan {
 }
 
 func (it *insertTask) OnEnqueue() error {
+	if it.insertMsg.Base == nil {
+		it.insertMsg.Base = commonpbutil.NewMsgBase()
+	}
+	it.insertMsg.Base.MsgType = commonpb.MsgType_Insert
+	it.insertMsg.Base.SourceID = paramtable.GetNodeID()
 	return nil
 }
 
@@ -108,24 +116,65 @@ func (it *insertTask) PreExecute(ctx context.Context) error {
 
 	collectionName := it.insertMsg.CollectionName
 	if err := validateCollectionName(collectionName); err != nil {
-		log.Warn("valid collection name failed", zap.String("collectionName", collectionName), zap.Error(err))
+		log.Ctx(ctx).Warn("valid collection name failed", zap.String("collectionName", collectionName), zap.Error(err))
 		return err
 	}
 
 	maxInsertSize := Params.QuotaConfig.MaxInsertSize.GetAsInt()
 	if maxInsertSize != -1 && it.insertMsg.Size() > maxInsertSize {
-		log.Warn("insert request size exceeds maxInsertSize",
+		log.Ctx(ctx).Warn("insert request size exceeds maxInsertSize",
 			zap.Int("request size", it.insertMsg.Size()), zap.Int("maxInsertSize", maxInsertSize))
-		return merr.WrapErrParameterTooLarge("insert request size exceeds maxInsertSize")
+		return merr.WrapErrAsInputError(merr.WrapErrParameterTooLarge("insert request size exceeds maxInsertSize"))
+	}
+
+	replicateID, err := GetReplicateID(it.ctx, it.insertMsg.GetDbName(), collectionName)
+	if err != nil {
+		log.Warn("get replicate id failed", zap.String("collectionName", collectionName), zap.Error(err))
+		return merr.WrapErrAsInputError(err)
+	}
+	if replicateID != "" {
+		return merr.WrapErrCollectionReplicateMode("insert")
+	}
+
+	collID, err := globalMetaCache.GetCollectionID(context.Background(), it.insertMsg.GetDbName(), collectionName)
+	if err != nil {
+		log.Ctx(ctx).Warn("fail to get collection id", zap.Error(err))
+		return err
+	}
+	colInfo, err := globalMetaCache.GetCollectionInfo(ctx, it.insertMsg.GetDbName(), collectionName, collID)
+	if err != nil {
+		log.Ctx(ctx).Warn("fail to get collection info", zap.Error(err))
+		return err
+	}
+	if it.schemaTimestamp != 0 {
+		if it.schemaTimestamp != colInfo.updateTimestamp {
+			err := merr.WrapErrCollectionSchemaMisMatch(collectionName)
+			log.Ctx(ctx).Info("collection schema mismatch", zap.String("collectionName", collectionName), zap.Error(err))
+			return err
+		}
 	}
 
 	schema, err := globalMetaCache.GetCollectionSchema(ctx, it.insertMsg.GetDbName(), collectionName)
 	if err != nil {
-		log.Warn("get collection schema from global meta cache failed", zap.String("collectionName", collectionName), zap.Error(err))
-		return err
+		log.Ctx(ctx).Warn("get collection schema from global meta cache failed", zap.String("collectionName", collectionName), zap.Error(err))
+		return merr.WrapErrAsInputErrorWhen(err, merr.ErrCollectionNotFound, merr.ErrDatabaseNotFound)
 	}
 	it.schema = schema.CollectionSchema
 
+	// Calculate embedding fields
+	if function.HasNonBM25Functions(schema.CollectionSchema.Functions, []int64{}) {
+		ctx, sp := otel.Tracer(typeutil.ProxyRole).Start(ctx, "Proxy-Insert-call-function-udf")
+		defer sp.End()
+		exec, err := function.NewFunctionExecutor(schema.CollectionSchema)
+		if err != nil {
+			return err
+		}
+		sp.AddEvent("Create-function-udf")
+		if err := exec.ProcessInsert(ctx, it.insertMsg); err != nil {
+			return err
+		}
+		sp.AddEvent("Call-function-udf")
+	}
 	rowNums := uint32(it.insertMsg.NRows())
 	// set insertTask.rowIDs
 	var rowIDBegin UniqueID
@@ -163,7 +212,7 @@ func (it *insertTask) PreExecute(ctx context.Context) error {
 	// check primaryFieldData whether autoID is true or not
 	// set rowIDs as primary data if autoID == true
 	// TODO(dragondriver): in fact, NumRows is not trustable, we should check all input fields
-	it.result.IDs, err = checkPrimaryFieldData(it.schema, it.result, it.insertMsg, true)
+	it.result.IDs, err = checkPrimaryFieldData(it.schema, it.insertMsg)
 	log := log.Ctx(ctx).With(zap.String("collectionName", collectionName))
 	if err != nil {
 		log.Warn("check primary field data and hash primary key failed",
@@ -171,8 +220,15 @@ func (it *insertTask) PreExecute(ctx context.Context) error {
 		return err
 	}
 
+	// check varchar/text with analyzer was utf-8 format
+	err = checkInputUtf8Compatiable(it.schema, it.insertMsg)
+	if err != nil {
+		log.Warn("check varchar/text format failed", zap.Error(err))
+		return err
+	}
+
 	// set field ID to insert field data
-	err = fillFieldIDBySchema(it.insertMsg.GetFieldsData(), schema.CollectionSchema)
+	err = fillFieldPropertiesBySchema(it.insertMsg.GetFieldsData(), schema.CollectionSchema)
 	if err != nil {
 		log.Info("set fieldID to fieldData failed",
 			zap.Error(err))
@@ -196,7 +252,12 @@ func (it *insertTask) PreExecute(ctx context.Context) error {
 		// insert to _default partition
 		partitionTag := it.insertMsg.GetPartitionName()
 		if len(partitionTag) <= 0 {
-			partitionTag = Params.CommonCfg.DefaultPartitionName.GetValue()
+			pinfo, err := globalMetaCache.GetPartitionInfo(ctx, it.insertMsg.GetDbName(), collectionName, "")
+			if err != nil {
+				log.Warn("get partition info failed", zap.String("collectionName", collectionName), zap.Error(err))
+				return err
+			}
+			partitionTag = pinfo.name
 			it.insertMsg.PartitionName = partitionTag
 		}
 
@@ -207,8 +268,8 @@ func (it *insertTask) PreExecute(ctx context.Context) error {
 	}
 
 	if err := newValidateUtil(withNANCheck(), withOverflowCheck(), withMaxLenCheck(), withMaxCapCheck()).
-		Validate(it.insertMsg.GetFieldsData(), schema.CollectionSchema, it.insertMsg.NRows()); err != nil {
-		return err
+		Validate(it.insertMsg.GetFieldsData(), schema.schemaHelper, it.insertMsg.NRows()); err != nil {
+		return merr.WrapErrAsInputError(err)
 	}
 
 	log.Debug("Proxy Insert PreExecute done")
@@ -230,9 +291,11 @@ func (it *insertTask) Execute(ctx context.Context) error {
 		return err
 	}
 	it.insertMsg.CollectionID = collID
+	it.insertMsg.BeginTimestamp = it.BeginTs()
+	it.insertMsg.EndTimestamp = it.EndTs()
 
 	getCacheDur := tr.RecordSpan()
-	stream, err := it.chMgr.getOrCreateDmlStream(collID)
+	stream, err := it.chMgr.getOrCreateDmlStream(ctx, collID)
 	if err != nil {
 		return err
 	}
@@ -269,7 +332,7 @@ func (it *insertTask) Execute(ctx context.Context) error {
 
 	log.Debug("assign segmentID for insert data success",
 		zap.Duration("assign segmentID duration", assignSegmentIDDur))
-	err = stream.Produce(msgPack)
+	err = stream.Produce(ctx, msgPack)
 	if err != nil {
 		log.Warn("fail to produce insert msg", zap.Error(err))
 		it.result.Status = merr.Status(err)

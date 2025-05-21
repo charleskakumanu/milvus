@@ -9,10 +9,11 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
-	clientv2 "github.com/milvus-io/milvus/client/v2"
 	"github.com/milvus-io/milvus/client/v2/column"
 	"github.com/milvus-io/milvus/client/v2/entity"
-	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/client/v2/index"
+	client "github.com/milvus-io/milvus/client/v2/milvusclient"
+	"github.com/milvus-io/milvus/pkg/v2/log"
 )
 
 func CheckErr(t *testing.T, actualErr error, expErrNil bool, expErrorMsg ...string) {
@@ -33,7 +34,7 @@ func CheckErr(t *testing.T, actualErr error, expErrNil bool, expErrorMsg ...stri
 				}
 			}
 			if !contains {
-				t.Fatalf("CheckErr failed, actualErr doesn contains any expErrorMsg, please check test cases!")
+				t.Fatalf("CheckErr failed, actualErr doesn't contains any expErrorMsg, actual msg:%s", actualErr)
 			}
 		}
 	}
@@ -43,7 +44,8 @@ func CheckErr(t *testing.T, actualErr error, expErrNil bool, expErrorMsg ...stri
 func EqualColumn(t *testing.T, columnA column.Column, columnB column.Column) {
 	require.Equal(t, columnA.Name(), columnB.Name())
 	require.Equal(t, columnA.Type(), columnB.Type())
-	switch columnA.Type() {
+	_type := columnA.Type()
+	switch _type {
 	case entity.FieldTypeBool:
 		require.ElementsMatch(t, columnA.(*column.ColumnBool).Data(), columnB.(*column.ColumnBool).Data())
 	case entity.FieldTypeInt8:
@@ -64,11 +66,13 @@ func EqualColumn(t *testing.T, columnA column.Column, columnB column.Column) {
 		log.Debug("data", zap.String("name", columnA.Name()), zap.Any("type", columnA.Type()), zap.Any("data", columnA.FieldData()))
 		log.Debug("data", zap.String("name", columnB.Name()), zap.Any("type", columnB.Type()), zap.Any("data", columnB.FieldData()))
 		require.Equal(t, reflect.TypeOf(columnA), reflect.TypeOf(columnB))
-		switch columnA.(type) {
+		switch _v := columnA.(type) {
 		case *column.ColumnDynamic:
 			require.ElementsMatch(t, columnA.(*column.ColumnDynamic).Data(), columnB.(*column.ColumnDynamic).Data())
 		case *column.ColumnJSONBytes:
 			require.ElementsMatch(t, columnA.(*column.ColumnJSONBytes).Data(), columnB.(*column.ColumnJSONBytes).Data())
+		default:
+			log.Warn("columnA type", zap.String("name", columnB.Name()), zap.Any("type", _v))
 		}
 	case entity.FieldTypeFloatVector:
 		require.ElementsMatch(t, columnA.(*column.ColumnFloatVector).Data(), columnB.(*column.ColumnFloatVector).Data())
@@ -97,7 +101,7 @@ func EqualArrayColumn(t *testing.T, columnA column.Column, columnB column.Column
 	require.Equal(t, columnA.Name(), columnB.Name())
 	require.IsType(t, columnA.Type(), entity.FieldTypeArray)
 	require.IsType(t, columnB.Type(), entity.FieldTypeArray)
-	switch columnA.(type) {
+	switch _type := columnA.(type) {
 	case *column.ColumnBoolArray:
 		require.ElementsMatch(t, columnA.(*column.ColumnBoolArray).Data(), columnB.(*column.ColumnBoolArray).Data())
 	case *column.ColumnInt8Array:
@@ -115,6 +119,7 @@ func EqualArrayColumn(t *testing.T, columnA column.Column, columnB column.Column
 	case *column.ColumnVarCharArray:
 		require.ElementsMatch(t, columnA.(*column.ColumnVarCharArray).Data(), columnB.(*column.ColumnVarCharArray).Data())
 	default:
+		log.Debug("columnA type is", zap.Any("type", _type))
 		log.Info("Support array element type is:", zap.Any("FieldType", []entity.FieldType{
 			entity.FieldTypeBool, entity.FieldTypeInt8, entity.FieldTypeInt16,
 			entity.FieldTypeInt32, entity.FieldTypeInt64, entity.FieldTypeFloat, entity.FieldTypeDouble, entity.FieldTypeVarChar,
@@ -123,16 +128,16 @@ func EqualArrayColumn(t *testing.T, columnA column.Column, columnB column.Column
 }
 
 // CheckInsertResult check insert result, ids len (insert count), ids data (pks, but no auto ids)
-func CheckInsertResult(t *testing.T, expIds column.Column, insertRes clientv2.InsertResult) {
-	require.Equal(t, expIds.Len(), insertRes.IDs.Len())
-	require.Equal(t, expIds.Len(), int(insertRes.InsertCount))
-	actualIds := insertRes.IDs
-	switch expIds.Type() {
+func CheckInsertResult(t *testing.T, expIDs column.Column, insertRes client.InsertResult) {
+	require.Equal(t, expIDs.Len(), insertRes.IDs.Len())
+	require.Equal(t, expIDs.Len(), int(insertRes.InsertCount))
+	actualIDs := insertRes.IDs
+	switch expIDs.Type() {
 	// pk field support int64 and varchar type
 	case entity.FieldTypeInt64:
-		require.ElementsMatch(t, actualIds.(*column.ColumnInt64).Data(), expIds.(*column.ColumnInt64).Data())
+		require.ElementsMatch(t, actualIDs.(*column.ColumnInt64).Data(), expIDs.(*column.ColumnInt64).Data())
 	case entity.FieldTypeVarChar:
-		require.ElementsMatch(t, actualIds.(*column.ColumnVarChar).Data(), expIds.(*column.ColumnVarChar).Data())
+		require.ElementsMatch(t, actualIDs.(*column.ColumnVarChar).Data(), expIDs.(*column.ColumnVarChar).Data())
 	default:
 		log.Info("The primary field only support ", zap.Any("type", []entity.FieldType{entity.FieldTypeInt64, entity.FieldTypeVarChar}))
 	}
@@ -149,11 +154,13 @@ func CheckOutputFields(t *testing.T, expFields []string, actualColumns []column.
 }
 
 // CheckSearchResult check search result, check nq, topk, ids, score
-func CheckSearchResult(t *testing.T, actualSearchResults []clientv2.ResultSet, expNq int, expTopK int) {
-	require.Equal(t, len(actualSearchResults), expNq)
+func CheckSearchResult(t *testing.T, actualSearchResults []client.ResultSet, expNq int, expTopK int) {
+	require.Equalf(t, len(actualSearchResults), expNq, fmt.Sprintf("Expected nq=%d, actual SearchResultsLen=%d", expNq, len(actualSearchResults)))
 	require.Len(t, actualSearchResults, expNq)
 	for _, actualSearchResult := range actualSearchResults {
-		require.Equal(t, actualSearchResult.ResultCount, expTopK)
+		require.Equalf(t, actualSearchResult.ResultCount, expTopK, fmt.Sprintf("Expected topK=%d, actual ResultCount=%d", expTopK, actualSearchResult.ResultCount))
+		require.Equalf(t, actualSearchResult.IDs.Len(), expTopK, fmt.Sprintf("Expected topK=%d, actual IDsLen=%d", expTopK, actualSearchResult.IDs.Len()))
+		require.Equalf(t, len(actualSearchResult.Scores), expTopK, fmt.Sprintf("Expected topK=%d, actual ScoresLen=%d", expTopK, len(actualSearchResult.Scores)))
 	}
 }
 
@@ -172,5 +179,99 @@ func CheckQueryResult(t *testing.T, expColumns []column.Column, actualColumns []
 		if !exist {
 			log.Error("CheckQueryResult actualColumns no column", zap.String("name", expColumn.Name()))
 		}
+	}
+}
+
+// GenColumnDataOption -- create column data --
+type checkIndexOpt struct {
+	state            index.IndexState
+	pendingIndexRows int64
+	totalRows        int64
+	indexedRows      int64
+}
+
+func TNewCheckIndexOpt(totalRows int64) *checkIndexOpt {
+	return &checkIndexOpt{
+		state:            IndexStateFinished,
+		totalRows:        totalRows,
+		pendingIndexRows: 0,
+		indexedRows:      totalRows,
+	}
+}
+
+func (opt *checkIndexOpt) TWithIndexState(state index.IndexState) *checkIndexOpt {
+	opt.state = state
+	return opt
+}
+
+func (opt *checkIndexOpt) TWithIndexRows(totalRows int64, indexedRows int64, pendingIndexRows int64) *checkIndexOpt {
+	opt.totalRows = totalRows
+	opt.indexedRows = indexedRows
+	opt.pendingIndexRows = pendingIndexRows
+	return opt
+}
+
+func CheckIndex(t *testing.T, actualIdxDesc client.IndexDescription, idx index.Index, opt *checkIndexOpt) {
+	require.EqualValuesf(t, idx, actualIdxDesc.Index, "Actual index is not same with expected index")
+	require.Equal(t, actualIdxDesc.TotalRows, actualIdxDesc.PendingIndexRows+actualIdxDesc.IndexedRows)
+	if opt != nil {
+		require.Equal(t, opt.totalRows, opt.pendingIndexRows+opt.indexedRows)
+		require.Equal(t, opt.state, actualIdxDesc.State)
+		require.Equal(t, opt.totalRows, actualIdxDesc.TotalRows)
+		require.Equal(t, opt.indexedRows, actualIdxDesc.IndexedRows)
+		require.Equal(t, opt.pendingIndexRows, actualIdxDesc.PendingIndexRows)
+	}
+}
+
+func CheckTransfer(t *testing.T, actualRgs []*entity.ResourceGroupTransfer, expRgs []*entity.ResourceGroupTransfer) {
+	if len(expRgs) == 0 {
+		require.Len(t, actualRgs, 0)
+	} else {
+		_expRgs := make([]string, 0, len(expRgs))
+		_actualRgs := make([]string, 0, len(actualRgs))
+		for _, rg := range expRgs {
+			_expRgs = append(_expRgs, rg.ResourceGroup)
+		}
+		for _, rg := range actualRgs {
+			_actualRgs = append(_actualRgs, rg.ResourceGroup)
+		}
+		require.ElementsMatch(t, _expRgs, _actualRgs)
+	}
+}
+
+func CheckResourceGroupConfig(t *testing.T, actualConfig *entity.ResourceGroupConfig, expConfig *entity.ResourceGroupConfig) {
+	if expConfig.Requests.NodeNum != 0 {
+		require.EqualValuesf(t, expConfig.Requests.NodeNum, actualConfig.Requests.NodeNum, "Requests.NodeNum mismatch")
+	}
+
+	if expConfig.Limits.NodeNum != 0 {
+		require.EqualValuesf(t, expConfig.Limits.NodeNum, actualConfig.Limits.NodeNum, "Limits.NodeNum mismatch")
+	}
+
+	if expConfig.TransferFrom != nil {
+		CheckTransfer(t, expConfig.TransferFrom, actualConfig.TransferFrom)
+	}
+
+	if expConfig.TransferTo != nil {
+		CheckTransfer(t, expConfig.TransferTo, actualConfig.TransferTo)
+	}
+	if expConfig.NodeFilter.NodeLabels != nil {
+		require.EqualValues(t, expConfig.NodeFilter, actualConfig.NodeFilter)
+	}
+}
+
+func CheckResourceGroup(t *testing.T, actualRg *entity.ResourceGroup, expRg *entity.ResourceGroup) {
+	require.EqualValues(t, expRg.Name, actualRg.Name, "ResourceGroup name mismatch")
+	require.EqualValues(t, expRg.Capacity, actualRg.Capacity, "ResourceGroup capacity mismatch")
+	if expRg.NumAvailableNode >= 0 {
+		require.EqualValues(t, expRg.NumAvailableNode, len(actualRg.Nodes), "AvailableNodesNumber mismatch")
+	}
+
+	if expRg.Config != nil {
+		CheckResourceGroupConfig(t, actualRg.Config, expRg.Config)
+	}
+
+	if expRg.Nodes != nil {
+		require.ElementsMatch(t, expRg.Nodes, actualRg.Nodes, "Nodes count mismatch")
 	}
 }

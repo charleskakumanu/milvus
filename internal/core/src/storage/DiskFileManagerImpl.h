@@ -24,10 +24,9 @@
 
 #include "storage/IndexData.h"
 #include "storage/FileManager.h"
-#include "storage/ChunkManager.h"
-#include "storage/space.h"
-
+#include "storage/LocalChunkManager.h"
 #include "common/Consts.h"
+#include "storage/Types.h"
 
 namespace milvus::storage {
 
@@ -35,31 +34,60 @@ class DiskFileManagerImpl : public FileManagerImpl {
  public:
     explicit DiskFileManagerImpl(const FileManagerContext& fileManagerContext);
 
-    explicit DiskFileManagerImpl(const FileManagerContext& fileManagerContext,
-                                 std::shared_ptr<milvus_storage::Space> space);
+    ~DiskFileManagerImpl() override;
 
-    virtual ~DiskFileManagerImpl();
+    bool
+    LoadFile(const std::string& filename) noexcept override;
 
-    virtual bool
-    LoadFile(const std::string& filename) noexcept;
+    bool
+    AddFile(const std::string& filename) noexcept override;
 
-    virtual bool
-    AddFile(const std::string& filename) noexcept;
+    std::optional<bool>
+    IsExisted(const std::string& filename) noexcept override;
 
-    virtual std::optional<bool>
-    IsExisted(const std::string& filename) noexcept;
-
-    virtual bool
-    RemoveFile(const std::string& filename) noexcept;
+    bool
+    RemoveFile(const std::string& filename) noexcept override;
 
  public:
-    virtual std::string
-    GetName() const {
+    bool
+    AddTextLog(const std::string& filename) noexcept;
+
+    bool
+    AddJsonKeyIndexLog(const std::string& filename) noexcept;
+
+ public:
+    std::string
+    GetName() const override {
         return "DiskFileManagerImpl";
     }
 
     std::string
+    GetIndexIdentifier();
+
+    std::string
     GetLocalIndexObjectPrefix();
+
+    // Different from user index, a text index task may have multiple text fields sharing same build_id/task_id. So
+    // segment_id and field_id are required to identify a unique text index, in case that we support multiple index task
+    // in the same indexnode at the same time later.
+    std::string
+    GetTextIndexIdentifier();
+
+    // Similar to GetTextIndexIdentifier, segment_id and field_id is also required.
+    std::string
+    GetLocalTextIndexPrefix();
+
+    // Used for building index, using this index identifier mode to construct tmp building-index dir.
+    std::string
+    GetJsonKeyIndexIdentifier();
+
+    // Used for loading index, using this index prefix dir to store index.
+    std::string
+    GetLocalJsonKeyIndexPrefix();
+
+    // Used for upload index to remote storage, using this index prefix dir as remote storage directory
+    std::string
+    GetRemoteJsonKeyLogPrefix();
 
     std::string
     GetLocalRawDataObjectPrefix();
@@ -78,17 +106,10 @@ class DiskFileManagerImpl : public FileManagerImpl {
     CacheIndexToDisk(const std::vector<std::string>& remote_files);
 
     void
-    CacheIndexToDisk();
+    CacheTextLogToDisk(const std::vector<std::string>& remote_files);
 
-    uint64_t
-    CacheBatchIndexFilesToDisk(const std::vector<std::string>& remote_files,
-                               const std::string& local_file_name,
-                               uint64_t local_file_init_offfset);
-
-    uint64_t
-    CacheBatchIndexFilesToDiskV2(const std::vector<std::string>& remote_files,
-                                 const std::string& local_file_name,
-                                 uint64_t local_file_init_offfset);
+    void
+    CacheJsonKeyIndexToDisk(const std::vector<std::string>& remote_files);
 
     void
     AddBatchIndexFiles(const std::string& local_file_name,
@@ -98,24 +119,23 @@ class DiskFileManagerImpl : public FileManagerImpl {
 
     template <typename DataType>
     std::string
-    CacheRawDataToDisk(std::vector<std::string> remote_files);
-
-    template <typename DataType>
-    std::string
-    CacheRawDataToDisk(std::shared_ptr<milvus_storage::Space> space);
+    CacheRawDataToDisk(const Config& config);
 
     std::string
     CacheOptFieldToDisk(OptFieldT& fields_map);
 
     std::string
-    CacheOptFieldToDisk(std::shared_ptr<milvus_storage::Space> space,
-                        OptFieldT& fields_map);
+    GetRemoteIndexPrefix() const {
+        return GetRemoteIndexObjectPrefix();
+    }
 
-    virtual bool
-    AddFileUsingSpace(const std::string& local_file_name,
-                      const std::vector<int64_t>& local_file_offsets,
-                      const std::vector<std::string>& remote_files,
-                      const std::vector<int64_t>& remote_file_sizes);
+    size_t
+    GetAddedTotalFileSize() const {
+        return added_total_file_size_;
+    }
+
+    std::string
+    GetFileName(const std::string& localfile);
 
  private:
     int64_t
@@ -124,10 +144,41 @@ class DiskFileManagerImpl : public FileManagerImpl {
     }
 
     std::string
-    GetFileName(const std::string& localfile);
+    GetRemoteIndexPath(const std::string& file_name, int64_t slice_num) const;
 
     std::string
-    GetRemoteIndexPath(const std::string& file_name, int64_t slice_num) const;
+    GetRemoteTextLogPath(const std::string& file_name, int64_t slice_num) const;
+
+    std::string
+    GetRemoteJsonKeyIndexPath(const std::string& file_name, int64_t slice_num);
+
+    bool
+    AddFileInternal(const std::string& file_name,
+                    const std::function<std::string(const std::string&, int)>&
+                        get_remote_path) noexcept;
+
+    void
+    CacheIndexToDiskInternal(
+        const std::vector<std::string>& remote_files,
+        const std::function<std::string()>& get_local_index_prefix);
+
+    template <typename DataType>
+    std::string
+    cache_raw_data_to_disk_internal(const Config& config);
+
+    template <typename T>
+    std::string
+    cache_raw_data_to_disk_storage_v2(const Config& config);
+
+    template <typename DataType>
+    void
+    cache_raw_data_to_disk_common(
+        const FieldDataPtr& field_data,
+        const std::shared_ptr<LocalChunkManager>& local_chunk_manager,
+        std::string& local_data_path,
+        bool& file_created,
+        uint32_t& dim,
+        int64_t& write_offset);
 
  private:
     // local file path (abs path)
@@ -136,7 +187,7 @@ class DiskFileManagerImpl : public FileManagerImpl {
     // remote file path
     std::map<std::string, int64_t> remote_paths_to_size_;
 
-    std::shared_ptr<milvus_storage::Space> space_;
+    size_t added_total_file_size_ = 0;
 };
 
 using DiskANNFileManagerImplPtr = std::shared_ptr<DiskFileManagerImpl>;

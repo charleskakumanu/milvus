@@ -2,20 +2,23 @@ package querycoord
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 
 	"github.com/cockroachdb/errors"
-	"github.com/golang/protobuf/proto"
 	"github.com/klauspost/compress/zstd"
-	"github.com/pingcap/log"
 	"github.com/samber/lo"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
-	"github.com/milvus-io/milvus/pkg/kv"
-	"github.com/milvus-io/milvus/pkg/util/compressor"
+	"github.com/milvus-io/milvus/pkg/v2/kv"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/compressor"
+	"github.com/milvus-io/milvus/pkg/v2/util/conc"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 var ErrInvalidKey = errors.New("invalid load info key")
@@ -33,36 +36,42 @@ const (
 )
 
 type Catalog struct {
-	cli kv.MetaKv
+	cli            kv.MetaKv
+	paginationSize int
+
+	pool *conc.Pool[any]
 }
 
 func NewCatalog(cli kv.MetaKv) Catalog {
+	ioPool := conc.NewPool[any](paramtable.Get().MetaStoreCfg.ReadConcurrency.GetAsInt())
 	return Catalog{
-		cli: cli,
+		cli:            cli,
+		paginationSize: paramtable.Get().MetaStoreCfg.PaginationSize.GetAsInt(),
+		pool:           ioPool,
 	}
 }
 
-func (s Catalog) SaveCollection(collection *querypb.CollectionLoadInfo, partitions ...*querypb.PartitionLoadInfo) error {
+func (s Catalog) SaveCollection(ctx context.Context, collection *querypb.CollectionLoadInfo, partitions ...*querypb.PartitionLoadInfo) error {
 	k := EncodeCollectionLoadInfoKey(collection.GetCollectionID())
 	v, err := proto.Marshal(collection)
 	if err != nil {
 		return err
 	}
-	err = s.cli.Save(k, string(v))
+	err = s.cli.Save(ctx, k, string(v))
 	if err != nil {
 		return err
 	}
-	return s.SavePartition(partitions...)
+	return s.SavePartition(ctx, partitions...)
 }
 
-func (s Catalog) SavePartition(info ...*querypb.PartitionLoadInfo) error {
+func (s Catalog) SavePartition(ctx context.Context, info ...*querypb.PartitionLoadInfo) error {
 	for _, partition := range info {
 		k := EncodePartitionLoadInfoKey(partition.GetCollectionID(), partition.GetPartitionID())
 		v, err := proto.Marshal(partition)
 		if err != nil {
 			return err
 		}
-		err = s.cli.Save(k, string(v))
+		err = s.cli.Save(ctx, k, string(v))
 		if err != nil {
 			return err
 		}
@@ -70,7 +79,7 @@ func (s Catalog) SavePartition(info ...*querypb.PartitionLoadInfo) error {
 	return nil
 }
 
-func (s Catalog) SaveReplica(replicas ...*querypb.Replica) error {
+func (s Catalog) SaveReplica(ctx context.Context, replicas ...*querypb.Replica) error {
 	kvs := make(map[string]string)
 	for _, replica := range replicas {
 		key := encodeReplicaKey(replica.GetCollectionID(), replica.GetID())
@@ -80,10 +89,10 @@ func (s Catalog) SaveReplica(replicas ...*querypb.Replica) error {
 		}
 		kvs[key] = string(value)
 	}
-	return s.cli.MultiSave(kvs)
+	return s.cli.MultiSave(ctx, kvs)
 }
 
-func (s Catalog) SaveResourceGroup(rgs ...*querypb.ResourceGroup) error {
+func (s Catalog) SaveResourceGroup(ctx context.Context, rgs ...*querypb.ResourceGroup) error {
 	ret := make(map[string]string)
 	for _, rg := range rgs {
 		key := encodeResourceGroupKey(rg.GetName())
@@ -95,63 +104,86 @@ func (s Catalog) SaveResourceGroup(rgs ...*querypb.ResourceGroup) error {
 		ret[key] = string(value)
 	}
 
-	return s.cli.MultiSave(ret)
+	return s.cli.MultiSave(ctx, ret)
 }
 
-func (s Catalog) RemoveResourceGroup(rgName string) error {
+func (s Catalog) RemoveResourceGroup(ctx context.Context, rgName string) error {
 	key := encodeResourceGroupKey(rgName)
-	return s.cli.Remove(key)
+	return s.cli.Remove(ctx, key)
 }
 
-func (s Catalog) GetCollections() ([]*querypb.CollectionLoadInfo, error) {
-	_, values, err := s.cli.LoadWithPrefix(CollectionLoadInfoPrefix)
-	if err != nil {
-		return nil, err
-	}
-	ret := make([]*querypb.CollectionLoadInfo, 0, len(values))
-	for _, v := range values {
+func (s Catalog) GetCollections(ctx context.Context) ([]*querypb.CollectionLoadInfo, error) {
+	ret := make([]*querypb.CollectionLoadInfo, 0)
+	applyFn := func(key []byte, value []byte) error {
 		info := querypb.CollectionLoadInfo{}
-		if err := proto.Unmarshal([]byte(v), &info); err != nil {
-			return nil, err
+		if err := proto.Unmarshal(value, &info); err != nil {
+			return err
 		}
 		ret = append(ret, &info)
+		return nil
+	}
+
+	err := s.cli.WalkWithPrefix(ctx, CollectionLoadInfoPrefix, s.paginationSize, applyFn)
+	if err != nil {
+		return nil, err
 	}
 
 	return ret, nil
 }
 
-func (s Catalog) GetPartitions() (map[int64][]*querypb.PartitionLoadInfo, error) {
-	_, values, err := s.cli.LoadWithPrefix(PartitionLoadInfoPrefix)
+func (s Catalog) GetPartitions(ctx context.Context, collectionIDs []int64) (map[int64][]*querypb.PartitionLoadInfo, error) {
+	collectionPartitions := make([][]*querypb.PartitionLoadInfo, len(collectionIDs))
+	futures := make([]*conc.Future[any], 0, len(collectionIDs))
+	for i, collectionID := range collectionIDs {
+		i := i
+		collectionID := collectionID
+		futures = append(futures, s.pool.Submit(func() (any, error) {
+			prefix := EncodePartitionLoadInfoPrefix(collectionID)
+			_, values, err := s.cli.LoadWithPrefix(ctx, prefix)
+			if err != nil {
+				return nil, err
+			}
+			ret := make([]*querypb.PartitionLoadInfo, 0, len(values))
+			for _, v := range values {
+				info := querypb.PartitionLoadInfo{}
+				if err = proto.Unmarshal([]byte(v), &info); err != nil {
+					return nil, err
+				}
+				ret = append(ret, &info)
+			}
+			collectionPartitions[i] = ret
+			return nil, nil
+		}))
+	}
+	err := conc.AwaitAll(futures...)
 	if err != nil {
 		return nil, err
 	}
-	ret := make(map[int64][]*querypb.PartitionLoadInfo)
-	for _, v := range values {
-		info := querypb.PartitionLoadInfo{}
-		if err := proto.Unmarshal([]byte(v), &info); err != nil {
-			return nil, err
-		}
-		ret[info.GetCollectionID()] = append(ret[info.GetCollectionID()], &info)
-	}
 
-	return ret, nil
+	result := make(map[int64][]*querypb.PartitionLoadInfo, len(collectionIDs))
+	for i, partitions := range collectionPartitions {
+		result[collectionIDs[i]] = partitions
+	}
+	return result, nil
 }
 
-func (s Catalog) GetReplicas() ([]*querypb.Replica, error) {
-	_, values, err := s.cli.LoadWithPrefix(ReplicaPrefix)
-	if err != nil {
-		return nil, err
-	}
-	ret := make([]*querypb.Replica, 0, len(values))
-	for _, v := range values {
+func (s Catalog) GetReplicas(ctx context.Context) ([]*querypb.Replica, error) {
+	ret := make([]*querypb.Replica, 0)
+	applyFn := func(key []byte, value []byte) error {
 		info := querypb.Replica{}
-		if err := proto.Unmarshal([]byte(v), &info); err != nil {
-			return nil, err
+		if err := proto.Unmarshal(value, &info); err != nil {
+			return err
 		}
 		ret = append(ret, &info)
+		return nil
 	}
 
-	replicasV1, err := s.getReplicasFromV1()
+	err := s.cli.WalkWithPrefix(ctx, ReplicaPrefix, s.paginationSize, applyFn)
+	if err != nil {
+		return nil, err
+	}
+
+	replicasV1, err := s.getReplicasFromV1(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -160,8 +192,8 @@ func (s Catalog) GetReplicas() ([]*querypb.Replica, error) {
 	return ret, nil
 }
 
-func (s Catalog) getReplicasFromV1() ([]*querypb.Replica, error) {
-	_, replicaValues, err := s.cli.LoadWithPrefix(ReplicaMetaPrefixV1)
+func (s Catalog) getReplicasFromV1(ctx context.Context) ([]*querypb.Replica, error) {
+	_, replicaValues, err := s.cli.LoadWithPrefix(ctx, ReplicaMetaPrefixV1)
 	if err != nil {
 		return nil, err
 	}
@@ -183,8 +215,8 @@ func (s Catalog) getReplicasFromV1() ([]*querypb.Replica, error) {
 	return ret, nil
 }
 
-func (s Catalog) GetResourceGroups() ([]*querypb.ResourceGroup, error) {
-	_, rgs, err := s.cli.LoadWithPrefix(ResourceGroupPrefix)
+func (s Catalog) GetResourceGroups(ctx context.Context) ([]*querypb.ResourceGroup, error) {
+	_, rgs, err := s.cli.LoadWithPrefix(ctx, ResourceGroupPrefix)
 	if err != nil {
 		return nil, err
 	}
@@ -202,18 +234,18 @@ func (s Catalog) GetResourceGroups() ([]*querypb.ResourceGroup, error) {
 	return ret, nil
 }
 
-func (s Catalog) ReleaseCollection(collection int64) error {
+func (s Catalog) ReleaseCollection(ctx context.Context, collection int64) error {
 	// remove collection and obtained partitions
 	collectionKey := EncodeCollectionLoadInfoKey(collection)
-	err := s.cli.Remove(collectionKey)
+	err := s.cli.Remove(ctx, collectionKey)
 	if err != nil {
 		return err
 	}
 	partitionsPrefix := fmt.Sprintf("%s/%d", PartitionLoadInfoPrefix, collection)
-	return s.cli.RemoveWithPrefix(partitionsPrefix)
+	return s.cli.RemoveWithPrefix(ctx, partitionsPrefix)
 }
 
-func (s Catalog) ReleasePartition(collection int64, partitions ...int64) error {
+func (s Catalog) ReleasePartition(ctx context.Context, collection int64, partitions ...int64) error {
 	keys := lo.Map(partitions, func(partition int64, _ int) string {
 		return EncodePartitionLoadInfoKey(collection, partition)
 	})
@@ -224,7 +256,7 @@ func (s Catalog) ReleasePartition(collection int64, partitions ...int64) error {
 			if endIndex > len(partitions) {
 				endIndex = len(partitions)
 			}
-			err := s.cli.MultiRemove(keys[index:endIndex])
+			err := s.cli.MultiRemove(ctx, keys[index:endIndex])
 			if err != nil {
 				return err
 			}
@@ -232,20 +264,37 @@ func (s Catalog) ReleasePartition(collection int64, partitions ...int64) error {
 		}
 		return nil
 	}
-	return s.cli.MultiRemove(keys)
+	return s.cli.MultiRemove(ctx, keys)
 }
 
-func (s Catalog) ReleaseReplicas(collectionID int64) error {
+func (s Catalog) ReleaseReplicas(ctx context.Context, collectionID int64) error {
 	key := encodeCollectionReplicaKey(collectionID)
-	return s.cli.RemoveWithPrefix(key)
+	return s.cli.RemoveWithPrefix(ctx, key)
 }
 
-func (s Catalog) ReleaseReplica(collection, replica int64) error {
-	key := encodeReplicaKey(collection, replica)
-	return s.cli.Remove(key)
+func (s Catalog) ReleaseReplica(ctx context.Context, collection int64, replicas ...int64) error {
+	keys := lo.Map(replicas, func(replica int64, _ int) string {
+		return encodeReplicaKey(collection, replica)
+	})
+	if len(replicas) >= MetaOpsBatchSize {
+		index := 0
+		for index < len(replicas) {
+			endIndex := index + MetaOpsBatchSize
+			if endIndex > len(replicas) {
+				endIndex = len(replicas)
+			}
+			err := s.cli.MultiRemove(ctx, keys[index:endIndex])
+			if err != nil {
+				return err
+			}
+			index = endIndex
+		}
+		return nil
+	}
+	return s.cli.MultiRemove(ctx, keys)
 }
 
-func (s Catalog) SaveCollectionTargets(targets ...*querypb.CollectionTarget) error {
+func (s Catalog) SaveCollectionTargets(ctx context.Context, targets ...*querypb.CollectionTarget) error {
 	kvs := make(map[string]string)
 	for _, target := range targets {
 		k := encodeCollectionTargetKey(target.GetCollectionID())
@@ -253,40 +302,48 @@ func (s Catalog) SaveCollectionTargets(targets ...*querypb.CollectionTarget) err
 		if err != nil {
 			return err
 		}
+
+		// only compress data when size is larger than 1MB
+		compressLevel := zstd.SpeedFastest
+		if len(v) > 1024*1024 {
+			compressLevel = zstd.SpeedBetterCompression
+		}
 		var compressed bytes.Buffer
-		compressor.ZstdCompress(bytes.NewReader(v), io.Writer(&compressed), zstd.WithEncoderLevel(zstd.SpeedBetterCompression))
+		compressor.ZstdCompress(bytes.NewReader(v), io.Writer(&compressed), zstd.WithEncoderLevel(compressLevel))
 		kvs[k] = compressed.String()
 	}
 
 	// to reduce the target size, we do compress before write to etcd
-	err := s.cli.MultiSave(kvs)
+	err := s.cli.MultiSave(ctx, kvs)
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
-func (s Catalog) RemoveCollectionTarget(collectionID int64) error {
+func (s Catalog) RemoveCollectionTarget(ctx context.Context, collectionID int64) error {
 	k := encodeCollectionTargetKey(collectionID)
-	return s.cli.Remove(k)
+	return s.cli.Remove(ctx, k)
 }
 
-func (s Catalog) GetCollectionTargets() (map[int64]*querypb.CollectionTarget, error) {
-	keys, values, err := s.cli.LoadWithPrefix(CollectionTargetPrefix)
-	if err != nil {
-		return nil, err
-	}
+func (s Catalog) GetCollectionTargets(ctx context.Context) (map[int64]*querypb.CollectionTarget, error) {
 	ret := make(map[int64]*querypb.CollectionTarget)
-	for i, v := range values {
+	applyFn := func(key []byte, value []byte) error {
 		var decompressed bytes.Buffer
-		compressor.ZstdDecompress(bytes.NewReader([]byte(v)), io.Writer(&decompressed))
+		compressor.ZstdDecompress(bytes.NewReader(value), io.Writer(&decompressed))
 		target := &querypb.CollectionTarget{}
 		if err := proto.Unmarshal(decompressed.Bytes(), target); err != nil {
 			// recover target from meta is a optimize policy, skip when failure happens
-			log.Warn("failed to unmarshal collection target", zap.String("key", keys[i]), zap.Error(err))
-			continue
+			log.Warn("failed to unmarshal collection target", zap.String("key", string(key)), zap.Error(err))
+			return nil
 		}
 		ret[target.GetCollectionID()] = target
+		return nil
+	}
+
+	err := s.cli.WalkWithPrefix(ctx, CollectionTargetPrefix, s.paginationSize, applyFn)
+	if err != nil {
+		return nil, err
 	}
 
 	return ret, nil
@@ -298,6 +355,10 @@ func EncodeCollectionLoadInfoKey(collection int64) string {
 
 func EncodePartitionLoadInfoKey(collection, partition int64) string {
 	return fmt.Sprintf("%s/%d/%d", PartitionLoadInfoPrefix, collection, partition)
+}
+
+func EncodePartitionLoadInfoPrefix(collection int64) string {
+	return fmt.Sprintf("%s/%d/", PartitionLoadInfoPrefix, collection)
 }
 
 func encodeReplicaKey(collection, replica int64) string {

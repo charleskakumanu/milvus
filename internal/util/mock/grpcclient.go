@@ -18,6 +18,7 @@ package mock
 
 import (
 	"context"
+	"crypto/x509"
 	"fmt"
 	"sync"
 
@@ -25,11 +26,11 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/tracer"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/util/generic"
-	"github.com/milvus-io/milvus/pkg/util/retry"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/tracer"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/generic"
+	"github.com/milvus-io/milvus/pkg/v2/util/retry"
 )
 
 type GRPCClientBase[T any] struct {
@@ -37,6 +38,8 @@ type GRPCClientBase[T any] struct {
 	newGrpcClient func(cc *grpc.ClientConn) T
 
 	grpcClient       T
+	cpInternalTLS    *x509.CertPool
+	cpInternalSNI    string
 	conn             *grpc.ClientConn
 	grpcClientMtx    sync.RWMutex
 	GetGrpcClientErr error
@@ -58,6 +61,14 @@ func (c *GRPCClientBase[T]) SetRole(role string) {
 }
 
 func (c *GRPCClientBase[T]) EnableEncryption() {
+}
+
+func (c *GRPCClientBase[T]) SetInternalTLSCertPool(cp *x509.CertPool) {
+	c.cpInternalTLS = cp
+}
+
+func (c *GRPCClientBase[T]) SetInternalTLSServerName(cp string) {
+	c.cpInternalSNI = cp
 }
 
 func (c *GRPCClientBase[T]) SetNewGrpcClientFunc(f func(cc *grpc.ClientConn) T) {
@@ -118,9 +129,8 @@ func (c *GRPCClientBase[T]) Call(ctx context.Context, caller func(client T) (any
 
 	ret, err := c.callOnce(ctx, caller)
 	if err != nil {
-		traceErr := fmt.Errorf("err: %s\n, %s", err.Error(), tracer.StackTrace())
-		log.Error("GRPCClientBase[T] Call grpc first call get error ", zap.Error(traceErr))
-		return nil, traceErr
+		log.Error("GRPCClientBase[T] Call grpc first call get error ", zap.Error(err))
+		return nil, err
 	}
 	return ret, err
 }

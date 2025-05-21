@@ -16,6 +16,8 @@
 
 package datacoord
 
+import "github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+
 // SegmentOperator is function type to update segment info.
 type SegmentOperator func(segment *SegmentInfo) bool
 
@@ -25,6 +27,30 @@ func SetMaxRowCount(maxRow int64) SegmentOperator {
 			return false
 		}
 		segment.MaxRowNum = maxRow
+		return true
+	}
+}
+
+func SetTextIndexLogs(textIndexLogs map[int64]*datapb.TextIndexStats) SegmentOperator {
+	return func(segment *SegmentInfo) bool {
+		if segment.TextStatsLogs == nil {
+			segment.TextStatsLogs = make(map[int64]*datapb.TextIndexStats)
+		}
+		for field, logs := range textIndexLogs {
+			segment.TextStatsLogs[field] = logs
+		}
+		return true
+	}
+}
+
+func SetJsonKeyIndexLogs(jsonKeyIndexLogs map[int64]*datapb.JsonKeyStats) SegmentOperator {
+	return func(segment *SegmentInfo) bool {
+		if segment.JsonKeyStats == nil {
+			segment.JsonKeyStats = make(map[int64]*datapb.JsonKeyStats)
+		}
+		for field, logs := range jsonKeyIndexLogs {
+			segment.JsonKeyStats[field] = logs
+		}
 		return true
 	}
 }

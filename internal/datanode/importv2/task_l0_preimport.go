@@ -27,15 +27,15 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/util/importutilv2/binlog"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/conc"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v2/util/conc"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 type L0PreImportTask struct {
@@ -94,6 +94,10 @@ func (t *L0PreImportTask) GetSchema() *schemapb.CollectionSchema {
 	return t.schema
 }
 
+func (t *L0PreImportTask) GetSlots() int64 {
+	return 1
+}
+
 func (t *L0PreImportTask) Cancel() {
 	t.cancel()
 }
@@ -142,7 +146,7 @@ func (t *L0PreImportTask) Execute() []*conc.Future[any] {
 			return
 		}
 		start := time.Now()
-		err = t.readL0Stat(reader, t)
+		err = t.readL0Stat(reader)
 		if err != nil {
 			return
 		}
@@ -159,7 +163,7 @@ func (t *L0PreImportTask) Execute() []*conc.Future[any] {
 	return []*conc.Future[any]{f}
 }
 
-func (t *L0PreImportTask) readL0Stat(reader binlog.L0Reader, task Task) error {
+func (t *L0PreImportTask) readL0Stat(reader binlog.L0Reader) error {
 	totalRows := 0
 	totalSize := 0
 	hashedStats := make(map[string]*datapb.PartitionImportStats)
@@ -171,7 +175,7 @@ func (t *L0PreImportTask) readL0Stat(reader binlog.L0Reader, task Task) error {
 			}
 			return err
 		}
-		stats, err := GetDeleteStats(task, data)
+		stats, err := GetDeleteStats(t, data)
 		if err != nil {
 			return err
 		}
@@ -180,7 +184,7 @@ func (t *L0PreImportTask) readL0Stat(reader binlog.L0Reader, task Task) error {
 		size := int(data.Size())
 		totalRows += rows
 		totalSize += size
-		log.Info("reading l0 stat...", WrapLogFields(task, zap.Int("readRows", rows), zap.Int("readSize", size))...)
+		log.Info("reading l0 stat...", WrapLogFields(t, zap.Int("readRows", rows), zap.Int("readSize", size))...)
 	}
 
 	stat := &datapb.ImportFileStats{
@@ -188,6 +192,6 @@ func (t *L0PreImportTask) readL0Stat(reader binlog.L0Reader, task Task) error {
 		TotalMemorySize: int64(totalSize),
 		HashedStats:     hashedStats,
 	}
-	t.manager.Update(task.GetTaskID(), UpdateFileStat(0, stat))
+	t.manager.Update(t.GetTaskID(), UpdateFileStat(0, stat))
 	return nil
 }

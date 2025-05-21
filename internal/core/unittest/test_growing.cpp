@@ -42,7 +42,7 @@ TEST(Growing, DeleteCount) {
     Timestamp begin_ts = 100;
     auto tss = GenTss(c, begin_ts);
     auto del_pks = GenPKs(pks.begin(), pks.end());
-    auto status = segment->Delete(offset, c, del_pks.get(), tss.data());
+    auto status = segment->Delete(c, del_pks.get(), tss.data());
     ASSERT_TRUE(status.ok());
 
     auto cnt = segment->get_deleted_count();
@@ -70,11 +70,9 @@ TEST(Growing, RealCount) {
 
     // delete half.
     auto half = c / 2;
-    auto del_offset1 = 0;
     auto del_ids1 = GenPKs(pks.begin(), pks.begin() + half);
     auto del_tss1 = GenTss(half, c);
-    auto status =
-        segment->Delete(del_offset1, half, del_ids1.get(), del_tss1.data());
+    auto status = segment->Delete(half, del_ids1.get(), del_tss1.data());
     ASSERT_TRUE(status.ok());
     ASSERT_EQ(c - half, segment->get_real_count());
 
@@ -82,17 +80,16 @@ TEST(Growing, RealCount) {
     auto del_offset2 = segment->get_deleted_count();
     ASSERT_EQ(del_offset2, half);
     auto del_tss2 = GenTss(half, c + half);
-    status =
-        segment->Delete(del_offset2, half, del_ids1.get(), del_tss2.data());
+    status = segment->Delete(half, del_ids1.get(), del_tss2.data());
     ASSERT_TRUE(status.ok());
     ASSERT_EQ(c - half, segment->get_real_count());
 
     // delete all.
     auto del_offset3 = segment->get_deleted_count();
-    ASSERT_EQ(del_offset3, half * 2);
+    ASSERT_EQ(del_offset3, half);
     auto del_ids3 = GenPKs(pks.begin(), pks.end());
     auto del_tss3 = GenTss(c, c + half * 2);
-    status = segment->Delete(del_offset3, c, del_ids3.get(), del_tss3.data());
+    status = segment->Delete(c, del_ids3.get(), del_tss3.data());
     ASSERT_TRUE(status.ok());
     ASSERT_EQ(0, segment->get_real_count());
 }
@@ -263,5 +260,157 @@ TEST_P(GrowingTest, FillData) {
                   num_inserted);
         EXPECT_EQ(float_array_result->scalars().array_data().data_size(),
                   num_inserted);
+
+        EXPECT_EQ(bool_result->valid_data_size(), 0);
+        EXPECT_EQ(int8_result->valid_data_size(), 0);
+        EXPECT_EQ(int16_result->valid_data_size(), 0);
+        EXPECT_EQ(int32_result->valid_data_size(), 0);
+        EXPECT_EQ(int64_result->valid_data_size(), 0);
+        EXPECT_EQ(float_result->valid_data_size(), 0);
+        EXPECT_EQ(double_result->valid_data_size(), 0);
+        EXPECT_EQ(varchar_result->valid_data_size(), 0);
+        EXPECT_EQ(json_result->valid_data_size(), 0);
+        EXPECT_EQ(int_array_result->valid_data_size(), 0);
+        EXPECT_EQ(long_array_result->valid_data_size(), 0);
+        EXPECT_EQ(bool_array_result->valid_data_size(), 0);
+        EXPECT_EQ(string_array_result->valid_data_size(), 0);
+        EXPECT_EQ(double_array_result->valid_data_size(), 0);
+        EXPECT_EQ(float_array_result->valid_data_size(), 0);
+    }
+}
+
+TEST(Growing, FillNullableData) {
+    auto schema = std::make_shared<Schema>();
+    auto metric_type = knowhere::metric::L2;
+    auto bool_field = schema->AddDebugField("bool", DataType::BOOL, true);
+    auto int8_field = schema->AddDebugField("int8", DataType::INT8, true);
+    auto int16_field = schema->AddDebugField("int16", DataType::INT16, true);
+    auto int32_field = schema->AddDebugField("int32", DataType::INT32, true);
+    auto int64_field = schema->AddDebugField("int64", DataType::INT64);
+    auto float_field = schema->AddDebugField("float", DataType::FLOAT, true);
+    auto double_field = schema->AddDebugField("double", DataType::DOUBLE, true);
+    auto varchar_field =
+        schema->AddDebugField("varchar", DataType::VARCHAR, true);
+    auto json_field = schema->AddDebugField("json", DataType::JSON, true);
+    auto int_array_field = schema->AddDebugField(
+        "int_array", DataType::ARRAY, DataType::INT8, true);
+    auto long_array_field = schema->AddDebugField(
+        "long_array", DataType::ARRAY, DataType::INT64, true);
+    auto bool_array_field = schema->AddDebugField(
+        "bool_array", DataType::ARRAY, DataType::BOOL, true);
+    auto string_array_field = schema->AddDebugField(
+        "string_array", DataType::ARRAY, DataType::VARCHAR, true);
+    auto double_array_field = schema->AddDebugField(
+        "double_array", DataType::ARRAY, DataType::DOUBLE, true);
+    auto float_array_field = schema->AddDebugField(
+        "float_array", DataType::ARRAY, DataType::FLOAT, true);
+    auto vec = schema->AddDebugField(
+        "embeddings", DataType::VECTOR_FLOAT, 128, metric_type);
+    schema->set_primary_field_id(int64_field);
+
+    std::map<std::string, std::string> index_params = {
+        {"index_type", "IVF_FLAT"},
+        {"metric_type", metric_type},
+        {"nlist", "128"}};
+    std::map<std::string, std::string> type_params = {{"dim", "128"}};
+    FieldIndexMeta fieldIndexMeta(
+        vec, std::move(index_params), std::move(type_params));
+    auto config = SegcoreConfig::default_config();
+    config.set_chunk_rows(1024);
+    config.set_enable_interim_segment_index(true);
+    std::map<FieldId, FieldIndexMeta> filedMap = {{vec, fieldIndexMeta}};
+    IndexMetaPtr metaPtr =
+        std::make_shared<CollectionIndexMeta>(100000, std::move(filedMap));
+    auto segment_growing = CreateGrowingSegment(schema, metaPtr, 1, config);
+    auto segment = dynamic_cast<SegmentGrowingImpl*>(segment_growing.get());
+
+    int64_t per_batch = 1000;
+    int64_t n_batch = 3;
+    int64_t dim = 128;
+    for (int64_t i = 0; i < n_batch; i++) {
+        auto dataset = DataGen(schema, per_batch);
+
+        auto offset = segment->PreInsert(per_batch);
+        segment->Insert(offset,
+                        per_batch,
+                        dataset.row_ids_.data(),
+                        dataset.timestamps_.data(),
+                        dataset.raw_);
+        auto num_inserted = (i + 1) * per_batch;
+        auto ids_ds = GenRandomIds(num_inserted);
+        auto bool_result =
+            segment->bulk_subscript(bool_field, ids_ds->GetIds(), num_inserted);
+        auto int8_result =
+            segment->bulk_subscript(int8_field, ids_ds->GetIds(), num_inserted);
+        auto int16_result = segment->bulk_subscript(
+            int16_field, ids_ds->GetIds(), num_inserted);
+        auto int32_result = segment->bulk_subscript(
+            int32_field, ids_ds->GetIds(), num_inserted);
+        auto int64_result = segment->bulk_subscript(
+            int64_field, ids_ds->GetIds(), num_inserted);
+        auto float_result = segment->bulk_subscript(
+            float_field, ids_ds->GetIds(), num_inserted);
+        auto double_result = segment->bulk_subscript(
+            double_field, ids_ds->GetIds(), num_inserted);
+        auto varchar_result = segment->bulk_subscript(
+            varchar_field, ids_ds->GetIds(), num_inserted);
+        auto json_result =
+            segment->bulk_subscript(json_field, ids_ds->GetIds(), num_inserted);
+        auto int_array_result = segment->bulk_subscript(
+            int_array_field, ids_ds->GetIds(), num_inserted);
+        auto long_array_result = segment->bulk_subscript(
+            long_array_field, ids_ds->GetIds(), num_inserted);
+        auto bool_array_result = segment->bulk_subscript(
+            bool_array_field, ids_ds->GetIds(), num_inserted);
+        auto string_array_result = segment->bulk_subscript(
+            string_array_field, ids_ds->GetIds(), num_inserted);
+        auto double_array_result = segment->bulk_subscript(
+            double_array_field, ids_ds->GetIds(), num_inserted);
+        auto float_array_result = segment->bulk_subscript(
+            float_array_field, ids_ds->GetIds(), num_inserted);
+        auto vec_result =
+            segment->bulk_subscript(vec, ids_ds->GetIds(), num_inserted);
+
+        EXPECT_EQ(bool_result->scalars().bool_data().data_size(), num_inserted);
+        EXPECT_EQ(int8_result->scalars().int_data().data_size(), num_inserted);
+        EXPECT_EQ(int16_result->scalars().int_data().data_size(), num_inserted);
+        EXPECT_EQ(int32_result->scalars().int_data().data_size(), num_inserted);
+        EXPECT_EQ(int64_result->scalars().long_data().data_size(),
+                  num_inserted);
+        EXPECT_EQ(float_result->scalars().float_data().data_size(),
+                  num_inserted);
+        EXPECT_EQ(double_result->scalars().double_data().data_size(),
+                  num_inserted);
+        EXPECT_EQ(varchar_result->scalars().string_data().data_size(),
+                  num_inserted);
+        EXPECT_EQ(json_result->scalars().json_data().data_size(), num_inserted);
+        EXPECT_EQ(vec_result->vectors().float_vector().data_size(),
+                  num_inserted * dim);
+        EXPECT_EQ(int_array_result->scalars().array_data().data_size(),
+                  num_inserted);
+        EXPECT_EQ(long_array_result->scalars().array_data().data_size(),
+                  num_inserted);
+        EXPECT_EQ(bool_array_result->scalars().array_data().data_size(),
+                  num_inserted);
+        EXPECT_EQ(string_array_result->scalars().array_data().data_size(),
+                  num_inserted);
+        EXPECT_EQ(double_array_result->scalars().array_data().data_size(),
+                  num_inserted);
+        EXPECT_EQ(float_array_result->scalars().array_data().data_size(),
+                  num_inserted);
+        EXPECT_EQ(bool_result->valid_data_size(), num_inserted);
+        EXPECT_EQ(int8_result->valid_data_size(), num_inserted);
+        EXPECT_EQ(int16_result->valid_data_size(), num_inserted);
+        EXPECT_EQ(int32_result->valid_data_size(), num_inserted);
+        EXPECT_EQ(float_result->valid_data_size(), num_inserted);
+        EXPECT_EQ(double_result->valid_data_size(), num_inserted);
+        EXPECT_EQ(varchar_result->valid_data_size(), num_inserted);
+        EXPECT_EQ(json_result->valid_data_size(), num_inserted);
+        EXPECT_EQ(int_array_result->valid_data_size(), num_inserted);
+        EXPECT_EQ(long_array_result->valid_data_size(), num_inserted);
+        EXPECT_EQ(bool_array_result->valid_data_size(), num_inserted);
+        EXPECT_EQ(string_array_result->valid_data_size(), num_inserted);
+        EXPECT_EQ(double_array_result->valid_data_size(), num_inserted);
+        EXPECT_EQ(float_array_result->valid_data_size(), num_inserted);
     }
 }

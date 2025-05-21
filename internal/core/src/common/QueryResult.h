@@ -66,8 +66,9 @@ struct OffsetDisPairComparator {
 };
 struct VectorIterator {
  public:
-    VectorIterator(int chunk_count, int64_t chunk_rows = -1)
-        : chunk_rows_(chunk_rows) {
+    VectorIterator(int chunk_count,
+                   const std::vector<int64_t>& total_rows_until_chunk = {})
+        : total_rows_until_chunk_(total_rows_until_chunk) {
         iterators_.reserve(chunk_count);
     }
 
@@ -78,8 +79,6 @@ struct VectorIterator {
             heap_.pop();
             if (iterators_[top->GetIteratorIdx()]->HasNext()) {
                 auto origin_pair = iterators_[top->GetIteratorIdx()]->Next();
-                origin_pair.first = convert_to_segment_offset(
-                    origin_pair.first, top->GetIteratorIdx());
                 auto off_dis_pair = std::make_shared<OffsetDisPair>(
                     origin_pair, top->GetIteratorIdx());
                 heap_.push(off_dis_pair);
@@ -93,7 +92,7 @@ struct VectorIterator {
         return !heap_.empty();
     }
     bool
-    AddIterator(std::shared_ptr<knowhere::IndexNode::iterator> iter) {
+    AddIterator(knowhere::IndexNode::IteratorPtr iter) {
         if (!sealed && iter != nullptr) {
             iterators_.emplace_back(iter);
             return true;
@@ -106,8 +105,9 @@ struct VectorIterator {
         int idx = 0;
         for (auto& iter : iterators_) {
             if (iter->HasNext()) {
+                auto origin_pair = iter->Next();
                 auto off_dis_pair =
-                    std::make_shared<OffsetDisPair>(iter->Next(), idx++);
+                    std::make_shared<OffsetDisPair>(origin_pair, idx++);
                 heap_.push(off_dis_pair);
             }
         }
@@ -116,7 +116,7 @@ struct VectorIterator {
  private:
     int64_t
     convert_to_segment_offset(int64_t chunk_offset, int chunk_idx) {
-        if (chunk_rows_ == -1) {
+        if (total_rows_until_chunk_.size() == 0) {
             AssertInfo(
                 iterators_.size() == 1,
                 "Wrong state for vectorIterators, which having incorrect "
@@ -126,17 +126,17 @@ struct VectorIterator {
                 iterators_.size());
             return chunk_offset;
         }
-        return chunk_idx * chunk_rows_ + chunk_offset;
+        return total_rows_until_chunk_[chunk_idx] + chunk_offset;
     }
 
  private:
-    std::vector<std::shared_ptr<knowhere::IndexNode::iterator>> iterators_;
+    std::vector<knowhere::IndexNode::IteratorPtr> iterators_;
     std::priority_queue<std::shared_ptr<OffsetDisPair>,
                         std::vector<std::shared_ptr<OffsetDisPair>>,
                         OffsetDisPairComparator>
         heap_;
     bool sealed = false;
-    int64_t chunk_rows_ = -1;
+    std::vector<int64_t> total_rows_until_chunk_;
     //currently, VectorIterator is guaranteed to be used serially without concurrent problem, in the future
     //we may need to add mutex to protect the variable sealed
 };
@@ -160,9 +160,8 @@ struct SearchResult {
     AssembleChunkVectorIterators(
         int64_t nq,
         int chunk_count,
-        int64_t rows_per_chunk,
-        const std::vector<std::shared_ptr<knowhere::IndexNode::iterator>>&
-            kw_iterators) {
+        const std::vector<int64_t>& total_rows_until_chunk,
+        const std::vector<knowhere::IndexNode::IteratorPtr>& kw_iterators) {
         AssertInfo(kw_iterators.size() == nq * chunk_count,
                    "kw_iterators count:{} is not equal to nq*chunk_count:{}, "
                    "wrong state",
@@ -174,13 +173,13 @@ struct SearchResult {
             vec_iter_idx = vec_iter_idx % nq;
             if (vector_iterators.size() < nq) {
                 auto vector_iterator = std::make_shared<VectorIterator>(
-                    chunk_count, rows_per_chunk);
+                    chunk_count, total_rows_until_chunk);
                 vector_iterators.emplace_back(vector_iterator);
             }
-            auto kw_iterator = kw_iterators[i];
+            const auto& kw_iterator = kw_iterators[i];
             vector_iterators[vec_iter_idx++]->AddIterator(kw_iterator);
         }
-        for (auto vector_iter : vector_iterators) {
+        for (const auto& vector_iter : vector_iterators) {
             vector_iter->seal();
         }
         this->vector_iterators_ = vector_iterators;
@@ -196,6 +195,7 @@ struct SearchResult {
     std::vector<float> distances_;
     std::vector<int64_t> seg_offsets_;
     std::optional<std::vector<GroupByValueType>> group_by_values_;
+    std::optional<int64_t> group_size_;
 
     // first fill data during fillPrimaryKey, and then update data after reducing search results
     std::vector<PkType> primary_keys_;
@@ -210,7 +210,7 @@ struct SearchResult {
     std::map<FieldId, std::unique_ptr<milvus::DataArray>> output_fields_data_;
 
     // used for reduce, filter invalid pk, get real topks count
-    std::vector<size_t> topk_per_nq_prefix_sum_;
+    std::vector<size_t> topk_per_nq_prefix_sum_{};
 
     //Vector iterators, used for group by
     std::optional<std::vector<std::shared_ptr<VectorIterator>>>

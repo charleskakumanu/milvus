@@ -13,13 +13,14 @@
 
 #include <memory>
 #include <utility>
-#include <tuple>
 
 #include "common/LoadInfo.h"
+#include "common/Types.h"
+#include "index/Index.h"
 #include "pb/segcore.pb.h"
+#include "segcore/InsertRecord.h"
 #include "segcore/SegmentInterface.h"
 #include "segcore/Types.h"
-#include "mmap/Column.h"
 
 namespace milvus::segcore {
 
@@ -35,18 +36,100 @@ class SegmentSealed : public SegmentInternalInterface {
     DropFieldData(const FieldId field_id) = 0;
 
     virtual void
-    LoadFieldData(FieldId field_id, FieldDataInfo& data) = 0;
-    virtual void
-    MapFieldData(const FieldId field_id, FieldDataInfo& data) = 0;
-    virtual void
     AddFieldDataInfoForSealed(const LoadFieldDataInfo& field_data_info) = 0;
     virtual void
-    WarmupChunkCache(const FieldId field_id) = 0;
+    RemoveFieldFile(const FieldId field_id) = 0;
+    virtual void
+    ClearData() = 0;
+    virtual std::unique_ptr<DataArray>
+    get_vector(FieldId field_id, const int64_t* ids, int64_t count) const = 0;
+
+    virtual void
+    LoadTextIndex(FieldId field_id,
+                  std::unique_ptr<index::TextMatchIndex> index) = 0;
+
+    virtual InsertRecord<true>&
+    get_insert_record() = 0;
+
+    virtual index::IndexBase*
+    GetJsonIndex(FieldId field_id, std::string path) const override {
+        JSONIndexKey key;
+        key.field_id = field_id;
+        key.nested_path = path;
+        auto index = json_indexings_.find(key);
+        if (index == json_indexings_.end()) {
+            return nullptr;
+        }
+        return index->second.get();
+    }
+
+    virtual void
+    LoadJsonKeyIndex(
+        FieldId field_id,
+        std::unique_ptr<index::JsonKeyStatsInvertedIndex> index) = 0;
 
     SegmentType
     type() const override {
         return SegmentType::Sealed;
     }
+
+    PinWrapper<const index::IndexBase*>
+    chunk_index_impl(FieldId field_id,
+                     std::string path,
+                     int64_t chunk_id) const override {
+        JSONIndexKey key;
+        key.field_id = field_id;
+        key.nested_path = path;
+        AssertInfo(json_indexings_.find(key) != json_indexings_.end(),
+                   "Cannot find json index with path: " + path);
+        return PinWrapper<const index::IndexBase*>(
+            json_indexings_.at(key).get());
+    }
+
+    virtual bool
+    HasIndex(FieldId field_id) const override = 0;
+    bool
+    HasIndex(FieldId field_id,
+             const std::string& path,
+             DataType data_type,
+             bool any_type = false) const override {
+        JSONIndexKey key;
+        key.field_id = field_id;
+        key.nested_path = path;
+        auto index = json_indexings_.find(key);
+        if (index == json_indexings_.end()) {
+            return false;
+        }
+        if (any_type) {
+            return true;
+        }
+        return index->second->IsDataTypeSupported(data_type);
+    }
+
+ protected:
+    struct JSONIndexKey {
+        FieldId field_id;
+        std::string nested_path;
+        bool
+        operator==(const JSONIndexKey& other) const {
+            return field_id == other.field_id &&
+                   nested_path == other.nested_path;
+        }
+    };
+
+    struct hash_helper {
+        size_t
+        operator()(const JSONIndexKey& k) const {
+            std::hash<int64_t> h1;
+            std::hash<std::string> h2;
+            size_t hash_result = 0;
+            boost::hash_combine(hash_result, h1(k.field_id.get()));
+            boost::hash_combine(hash_result, h2(k.nested_path));
+            return hash_result;
+        }
+    };
+    std::unordered_map<JSONIndexKey, index::IndexBasePtr, hash_helper>
+        json_indexings_;
 };
 
 using SegmentSealedSPtr = std::shared_ptr<SegmentSealed>;

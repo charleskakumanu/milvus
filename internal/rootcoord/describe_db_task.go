@@ -19,9 +19,9 @@ package rootcoord
 import (
 	"context"
 
-	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/proto/rootcoordpb"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 // describeDBTask describe database request task
@@ -38,6 +38,21 @@ func (t *describeDBTask) Prepare(ctx context.Context) error {
 
 // Execute task execution
 func (t *describeDBTask) Execute(ctx context.Context) (err error) {
+	visibleDatabases, err := t.core.getCurrentUserVisibleDatabases(ctx)
+	if err != nil {
+		t.Rsp = &rootcoordpb.DescribeDatabaseResponse{
+			Status: merr.Status(err),
+		}
+		return err
+	}
+	if !isVisibleDatabaseForCurUser(t.Req.GetDbName(), visibleDatabases) {
+		err = merr.WrapErrPrivilegeNotPermitted("not allowed to access database, db name: %s", t.Req.GetDbName())
+		t.Rsp = &rootcoordpb.DescribeDatabaseResponse{
+			Status: merr.Status(err),
+		}
+		return err
+	}
+
 	db, err := t.core.meta.GetDatabaseByName(ctx, t.Req.GetDbName(), typeutil.MaxTimestamp)
 	if err != nil {
 		t.Rsp = &rootcoordpb.DescribeDatabaseResponse{
@@ -54,4 +69,11 @@ func (t *describeDBTask) Execute(ctx context.Context) (err error) {
 		Properties:       db.Properties,
 	}
 	return nil
+}
+
+func (t *describeDBTask) GetLockerKey() LockerKey {
+	return NewLockerKeyChain(
+		NewClusterLockerKey(false),
+		NewDatabaseLockerKey(t.Req.GetDbName(), false),
+	)
 }

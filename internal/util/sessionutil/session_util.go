@@ -18,7 +18,6 @@ package sessionutil
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path"
@@ -36,19 +35,24 @@ import (
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 
+	"github.com/milvus-io/milvus/internal/json"
 	"github.com/milvus-io/milvus/internal/storage"
 	kvfactory "github.com/milvus-io/milvus/internal/util/dependency/kv"
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/retry"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/retry"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 const (
 	// DefaultServiceRoot default root path used in kv by Session
 	DefaultServiceRoot = "session/"
 	// DefaultIDKey default id key for Session
-	DefaultIDKey = "id"
+	DefaultIDKey                        = "id"
+	SupportedLabelPrefix                = "MILVUS_SERVER_LABEL_"
+	LabelStreamingNodeEmbeddedQueryNode = "QUERYNODE_STREAMING-EMBEDDED"
 )
 
 // SessionEventType session event type
@@ -90,18 +94,20 @@ type IndexEngineVersion struct {
 
 // SessionRaw the persistent part of Session.
 type SessionRaw struct {
-	ServerID           int64  `json:"ServerID,omitempty"`
-	ServerName         string `json:"ServerName,omitempty"`
-	Address            string `json:"Address,omitempty"`
-	Exclusive          bool   `json:"Exclusive,omitempty"`
-	Stopping           bool   `json:"Stopping,omitempty"`
-	TriggerKill        bool
-	Version            string             `json:"Version"`
-	IndexEngineVersion IndexEngineVersion `json:"IndexEngineVersion,omitempty"`
-	LeaseID            *clientv3.LeaseID  `json:"LeaseID,omitempty"`
+	ServerID                 int64  `json:"ServerID,omitempty"`
+	ServerName               string `json:"ServerName,omitempty"`
+	Address                  string `json:"Address,omitempty"`
+	Exclusive                bool   `json:"Exclusive,omitempty"`
+	Stopping                 bool   `json:"Stopping,omitempty"`
+	TriggerKill              bool
+	Version                  string             `json:"Version"`
+	IndexEngineVersion       IndexEngineVersion `json:"IndexEngineVersion,omitempty"`
+	ScalarIndexEngineVersion IndexEngineVersion `json:"ScalarIndexEngineVersion,omitempty"`
+	IndexNonEncoding         bool               `json:"IndexNonEncoding,omitempty"`
+	LeaseID                  *clientv3.LeaseID  `json:"LeaseID,omitempty"`
 
-	HostName   string `json:"HostName,omitempty"`
-	EnableDisk bool   `json:"EnableDisk,omitempty"`
+	HostName     string            `json:"HostName,omitempty"`
+	ServerLabels map[string]string `json:"ServerLabels,omitempty"`
 }
 
 func (s *SessionRaw) GetAddress() string {
@@ -110,6 +116,10 @@ func (s *SessionRaw) GetAddress() string {
 
 func (s *SessionRaw) GetServerID() int64 {
 	return s.ServerID
+}
+
+func (s *SessionRaw) GetServerLabel() map[string]string {
+	return s.ServerLabels
 }
 
 func (s *SessionRaw) IsTriggerKill() bool {
@@ -177,9 +187,17 @@ func WithIndexEngineVersion(minimal, current int32) SessionOption {
 	}
 }
 
-func WithEnableDisk(enableDisk bool) SessionOption {
-	return func(s *Session) {
-		s.EnableDisk = enableDisk
+// WithScalarIndexEngineVersion should be only used by querynode.
+func WithScalarIndexEngineVersion(minimal, current int32) SessionOption {
+	return func(session *Session) {
+		session.ScalarIndexEngineVersion.MinimalIndexVersion = minimal
+		session.ScalarIndexEngineVersion.CurrentIndexVersion = current
+	}
+}
+
+func WithIndexNonEncoding() SessionOption {
+	return func(session *Session) {
+		session.IndexNonEncoding = true
 	}
 }
 
@@ -225,7 +243,7 @@ func NewSession(ctx context.Context, opts ...SessionOption) *Session {
 func NewSessionWithEtcd(ctx context.Context, metaRoot string, client *clientv3.Client, opts ...SessionOption) *Session {
 	hostName, hostNameErr := os.Hostname()
 	if hostNameErr != nil {
-		log.Error("get host name fail", zap.Error(hostNameErr))
+		log.Ctx(ctx).Error("get host name fail", zap.Error(hostNameErr))
 	}
 
 	session := &Session{
@@ -254,7 +272,7 @@ func NewSessionWithEtcd(ctx context.Context, metaRoot string, client *clientv3.C
 	session.UpdateRegistered(false)
 
 	connectEtcdFn := func() error {
-		log.Debug("Session try to connect to etcd")
+		log.Ctx(ctx).Debug("Session try to connect to etcd")
 		ctx2, cancel2 := context.WithTimeout(session.ctx, 5*time.Second)
 		defer cancel2()
 		if _, err := client.Get(ctx2, "health"); err != nil {
@@ -265,11 +283,11 @@ func NewSessionWithEtcd(ctx context.Context, metaRoot string, client *clientv3.C
 	}
 	err := retry.Do(ctx, connectEtcdFn, retry.Attempts(100))
 	if err != nil {
-		log.Warn("failed to initialize session",
+		log.Ctx(ctx).Warn("failed to initialize session",
 			zap.Error(err))
 		return nil
 	}
-	log.Debug("Session connect to etcd success")
+	log.Ctx(ctx).Debug("Session connect to etcd success")
 	return session
 }
 
@@ -286,7 +304,8 @@ func (s *Session) Init(serverName, address string, exclusive bool, triggerKill b
 		panic(err)
 	}
 	s.ServerID = serverID
-	log.Info("start server", zap.String("name", serverName), zap.String("address", address), zap.Int64("id", s.ServerID))
+	s.ServerLabels = GetServerLabelsFromEnv(serverName)
+	log.Info("start server", zap.String("name", serverName), zap.String("address", address), zap.Int64("id", s.ServerID), zap.Any("server_labels", s.ServerLabels))
 }
 
 // String makes Session struct able to be logged by zap
@@ -312,7 +331,7 @@ func (s *Session) getServerID() (int64, error) {
 	serverIDMu.Lock()
 	defer serverIDMu.Unlock()
 
-	log.Debug("getServerID", zap.Bool("reuse", s.reuseNodeID))
+	log.Ctx(s.ctx).Debug("getServerID", zap.Bool("reuse", s.reuseNodeID))
 	if s.reuseNodeID {
 		// Notice, For standalone, all process share the same nodeID.
 		if nodeID := paramtable.GetNodeID(); nodeID != 0 {
@@ -329,6 +348,25 @@ func (s *Session) getServerID() (int64, error) {
 	return nodeID, nil
 }
 
+func GetServerLabelsFromEnv(role string) map[string]string {
+	ret := make(map[string]string)
+	switch role {
+	case "querynode":
+		for _, value := range os.Environ() {
+			rs := []rune(value)
+			in := strings.Index(value, "=")
+			key := string(rs[0:in])
+			value := string(rs[in+1:])
+
+			if strings.HasPrefix(key, SupportedLabelPrefix) {
+				label := strings.TrimPrefix(key, SupportedLabelPrefix)
+				ret[label] = value
+			}
+		}
+	}
+	return ret
+}
+
 func (s *Session) checkIDExist() {
 	s.etcdCli.Txn(s.ctx).If(
 		clientv3.Compare(
@@ -339,6 +377,7 @@ func (s *Session) checkIDExist() {
 }
 
 func (s *Session) getServerIDWithKey(key string) (int64, error) {
+	log := log.Ctx(s.ctx)
 	for {
 		getResp, err := s.etcdCli.Get(s.ctx, path.Join(s.metaRoot, DefaultServiceRoot, key))
 		if err != nil {
@@ -433,6 +472,7 @@ func (s *Session) registerService() (<-chan *clientv3.LeaseKeepAliveResponse, er
 	}
 	completeKey := s.getCompleteKey()
 	var ch <-chan *clientv3.LeaseKeepAliveResponse
+	log := log.Ctx(s.ctx)
 	log.Debug("service begin to register to etcd", zap.String("serverName", s.ServerName), zap.Int64("ServerID", s.ServerID))
 
 	registerFn := func() error {
@@ -591,9 +631,9 @@ func fnWithTimeout(fn func() error, d time.Duration) error {
 
 		select {
 		case <-resultChan:
-			log.Debug("retry func success")
+			log.Ctx(context.TODO()).Debug("retry func success")
 		case <-time.After(d):
-			return fmt.Errorf("func timed out")
+			return errors.New("func timed out")
 		}
 		return err1
 	}
@@ -617,7 +657,7 @@ func (s *Session) GetSessions(prefix string) (map[string]*Session, int64, error)
 			return nil, 0, err
 		}
 		_, mapKey := path.Split(string(kv.Key))
-		log.Debug("SessionUtil GetSessions",
+		log.Ctx(s.ctx).Debug("SessionUtil GetSessions",
 			zap.String("prefix", prefix),
 			zap.String("key", mapKey),
 			zap.String("address", session.Address))
@@ -629,6 +669,7 @@ func (s *Session) GetSessions(prefix string) (map[string]*Session, int64, error)
 // GetSessionsWithVersionRange will get all sessions with provided prefix and version range in etcd.
 // Revision is returned for WatchServices to prevent missing events.
 func (s *Session) GetSessionsWithVersionRange(prefix string, r semver.Range) (map[string]*Session, int64, error) {
+	log := log.Ctx(s.ctx)
 	res := make(map[string]*Session)
 	key := path.Join(s.metaRoot, DefaultServiceRoot, prefix)
 	resp, err := s.etcdCli.Get(s.ctx, key, clientv3.WithPrefix(),
@@ -763,6 +804,7 @@ func (s *Session) WatchServicesWithVersionRange(prefix string, r semver.Range, r
 }
 
 func (w *sessionWatcher) handleWatchResponse(wresp clientv3.WatchResponse) {
+	log := log.Ctx(context.TODO())
 	if wresp.Err() != nil {
 		err := w.handleWatchErr(wresp.Err())
 		if err != nil {
@@ -1022,13 +1064,32 @@ func (s *Session) safeCloseLiveCh() {
 // activateFunc is the function to re-active the service.
 func (s *Session) ProcessActiveStandBy(activateFunc func() error) error {
 	s.activeKey = path.Join(s.metaRoot, DefaultServiceRoot, s.ServerName)
-
+	log := log.Ctx(s.ctx)
 	// try to register to the active_key.
 	// return
 	//   1. doRegistered: if registered the active_key by this session or by other session
 	//   2. revision: revision of the active_key
 	//   3. err: etcd error, should retry
+
+	oldRoles := []string{
+		typeutil.RootCoordRole,
+		typeutil.DataCoordRole,
+		typeutil.QueryCoordRole,
+	}
+
 	registerActiveFn := func() (bool, int64, error) {
+		for _, role := range oldRoles {
+			sessions, _, err := s.GetSessions(role)
+			if err != nil {
+				log.Debug("failed to get old sessions", zap.String("role", role), zap.Error(err))
+				continue
+			}
+			if len(sessions) > 0 {
+				log.Info("old session exists", zap.String("role", role))
+				return false, -1, merr.ErrOldSessionExists
+			}
+		}
+
 		log.Info(fmt.Sprintf("try to register as ACTIVE %v service...", s.ServerName))
 		sessionJSON, err := json.Marshal(s)
 		if err != nil {
@@ -1236,4 +1297,9 @@ func saveServerInfoInternal(role string, serverID int64, pid int) {
 
 func SaveServerInfo(role string, serverID int64) {
 	saveServerInfoInternal(role, serverID, os.Getpid())
+}
+
+// GetSessionPrefixByRole get session prefix by role
+func GetSessionPrefixByRole(role string) string {
+	return path.Join(paramtable.Get().EtcdCfg.MetaRootPath.GetValue(), DefaultServiceRoot, role)
 }

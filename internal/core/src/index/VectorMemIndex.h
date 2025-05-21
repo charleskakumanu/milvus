@@ -25,11 +25,12 @@
 #include "knowhere/index/index_factory.h"
 #include "index/VectorIndex.h"
 #include "storage/MemFileManagerImpl.h"
-#include "storage/space.h"
 #include "index/IndexInfo.h"
 
 namespace milvus::index {
-
+// TODO : growing index should be isolated from VectorMemIndex
+// For general index, it should not suppport AddWithDataset etc.
+// For growing index, it should suppport AddWithDataset etc.
 template <typename T>
 class VectorMemIndex : public VectorIndex {
  public:
@@ -37,12 +38,10 @@ class VectorMemIndex : public VectorIndex {
         const IndexType& index_type,
         const MetricType& metric_type,
         const IndexVersion& version,
+        bool use_knowhere_build_pool = true,
         const storage::FileManagerContext& file_manager_context =
             storage::FileManagerContext());
 
-    explicit VectorMemIndex(const CreateIndexInfo& create_index_info,
-                            const storage::FileManagerContext& file_manager,
-                            std::shared_ptr<milvus_storage::Space> space);
     BinarySet
     Serialize(const Config& config) override;
 
@@ -53,17 +52,11 @@ class VectorMemIndex : public VectorIndex {
     Load(milvus::tracer::TraceContext ctx, const Config& config = {}) override;
 
     void
-    LoadV2(const Config& config = {}) override;
-
-    void
     BuildWithDataset(const DatasetPtr& dataset,
                      const Config& config = {}) override;
 
     void
     Build(const Config& config = {}) override;
-
-    void
-    BuildV2(const Config& config = {}) override;
 
     void
     AddWithDataset(const DatasetPtr& dataset, const Config& config) override;
@@ -88,14 +81,10 @@ class VectorMemIndex : public VectorIndex {
     std::unique_ptr<const knowhere::sparse::SparseRow<float>[]>
     GetSparseVector(const DatasetPtr dataset) const override;
 
-    BinarySet
+    IndexStatsPtr
     Upload(const Config& config = {}) override;
 
-    BinarySet
-    UploadV2(const Config& config = {}) override;
-
-    knowhere::expected<
-        std::vector<std::shared_ptr<knowhere::IndexNode::iterator>>>
+    knowhere::expected<std::vector<knowhere::IndexNode::IteratorPtr>>
     VectorIterators(const DatasetPtr dataset,
                     const knowhere::Json& json,
                     const BitsetView& bitset) const override;
@@ -108,16 +97,13 @@ class VectorMemIndex : public VectorIndex {
     void
     LoadFromFile(const Config& config);
 
-    void
-    LoadFromFileV2(const Config& config);
-
  protected:
     Config config_;
     knowhere::Index<knowhere::IndexNode> index_;
     std::shared_ptr<storage::MemFileManagerImpl> file_manager_;
-    std::shared_ptr<milvus_storage::Space> space_;
 
     CreateIndexInfo create_index_info_;
+    bool use_knowhere_build_pool_;
 };
 
 template <typename T>

@@ -23,11 +23,11 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/internal/proto/proxypb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/util/proxyutil"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/proto/proxypb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 type CollectionShardLeaderCache = map[string]*querypb.ShardLeadersList
@@ -36,6 +36,7 @@ type CollectionShardLeaderCache = map[string]*querypb.ShardLeadersList
 type LeaderCacheObserver struct {
 	wg           sync.WaitGroup
 	proxyManager proxyutil.ProxyClientManagerInterface
+	startOnce    sync.Once
 	stopOnce     sync.Once
 	closeCh      chan struct{}
 
@@ -44,8 +45,10 @@ type LeaderCacheObserver struct {
 }
 
 func (o *LeaderCacheObserver) Start(ctx context.Context) {
-	o.wg.Add(1)
-	go o.schedule(ctx)
+	o.startOnce.Do(func() {
+		o.wg.Add(1)
+		go o.schedule(ctx)
+	})
 }
 
 func (o *LeaderCacheObserver) Stop() {

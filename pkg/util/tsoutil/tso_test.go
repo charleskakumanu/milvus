@@ -23,7 +23,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/v2/log"
 )
 
 func TestParseHybridTs(t *testing.T) {
@@ -69,4 +69,14 @@ func TestAddPhysicalDurationOnTs(t *testing.T) {
 	ts3 = ComposeTSByTime(now.Add(-duration), 0)
 	// diff := CalculateDuration(ts2, ts1)
 	assert.Equal(t, ts3, ts2)
+}
+
+func TestIsValidUnixMilli(t *testing.T) {
+	physicalTs := uint64(time.Now().UnixMilli())
+	assert.True(t, IsValidPhysicalTs(physicalTs))
+	assert.False(t, IsValidHybridTs(physicalTs))
+
+	hybridTs := GetCurrentTime()
+	assert.False(t, IsValidPhysicalTs(hybridTs))
+	assert.True(t, IsValidHybridTs(hybridTs))
 }

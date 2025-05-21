@@ -6,10 +6,11 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
 	"github.com/milvus-io/milvus/internal/metastore/model"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/indexpb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/streamingpb"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 //go:generate mockery --name=RootCoordCatalog
@@ -76,10 +77,19 @@ type RootCoordCatalog interface {
 	// ListGrant lists all grant infos accoording to entity for the tenant
 	// Please make sure entity valid before calling this API
 	ListGrant(ctx context.Context, tenant string, entity *milvuspb.GrantEntity) ([]*milvuspb.GrantEntity, error)
-	ListPolicy(ctx context.Context, tenant string) ([]string, error)
+	ListPolicy(ctx context.Context, tenant string) ([]*milvuspb.GrantEntity, error)
 	// List all user role pair in string for the tenant
 	// For example []string{"user1/role1"}
 	ListUserRole(ctx context.Context, tenant string) ([]string, error)
+
+	ListCredentialsWithPasswd(ctx context.Context) (map[string]string, error)
+	BackupRBAC(ctx context.Context, tenant string) (*milvuspb.RBACMeta, error)
+	RestoreRBAC(ctx context.Context, tenant string, meta *milvuspb.RBACMeta) error
+
+	GetPrivilegeGroup(ctx context.Context, groupName string) (*milvuspb.PrivilegeGroupInfo, error)
+	DropPrivilegeGroup(ctx context.Context, groupName string) error
+	SavePrivilegeGroup(ctx context.Context, data *milvuspb.PrivilegeGroupInfo) error
+	ListPrivilegeGroups(ctx context.Context) ([]*milvuspb.PrivilegeGroupInfo, error)
 
 	Close()
 }
@@ -110,7 +120,7 @@ type BinlogsIncrement struct {
 
 //go:generate mockery --name=DataCoordCatalog --with-expecter
 type DataCoordCatalog interface {
-	ListSegments(ctx context.Context) ([]*datapb.SegmentInfo, error)
+	ListSegments(ctx context.Context, collectionID int64) ([]*datapb.SegmentInfo, error)
 	AddSegment(ctx context.Context, segment *datapb.SegmentInfo) error
 	// TODO Remove this later, we should update flush segments info for each segment separately, so far we still need transaction
 	AlterSegments(ctx context.Context, newSegments []*datapb.SegmentInfo, binlogs ...BinlogsIncrement) error
@@ -138,15 +148,15 @@ type DataCoordCatalog interface {
 	AlterSegmentIndexes(ctx context.Context, newSegIdxes []*model.SegmentIndex) error
 	DropSegmentIndex(ctx context.Context, collID, partID, segID, buildID typeutil.UniqueID) error
 
-	SaveImportJob(job *datapb.ImportJob) error
-	ListImportJobs() ([]*datapb.ImportJob, error)
-	DropImportJob(jobID int64) error
-	SavePreImportTask(task *datapb.PreImportTask) error
-	ListPreImportTasks() ([]*datapb.PreImportTask, error)
-	DropPreImportTask(taskID int64) error
-	SaveImportTask(task *datapb.ImportTaskV2) error
-	ListImportTasks() ([]*datapb.ImportTaskV2, error)
-	DropImportTask(taskID int64) error
+	SaveImportJob(ctx context.Context, job *datapb.ImportJob) error
+	ListImportJobs(ctx context.Context) ([]*datapb.ImportJob, error)
+	DropImportJob(ctx context.Context, jobID int64) error
+	SavePreImportTask(ctx context.Context, task *datapb.PreImportTask) error
+	ListPreImportTasks(ctx context.Context) ([]*datapb.PreImportTask, error)
+	DropPreImportTask(ctx context.Context, taskID int64) error
+	SaveImportTask(ctx context.Context, task *datapb.ImportTaskV2) error
+	ListImportTasks(ctx context.Context) ([]*datapb.ImportTaskV2, error)
+	DropImportTask(ctx context.Context, taskID int64) error
 
 	GcConfirm(ctx context.Context, collectionID, partitionID typeutil.UniqueID) bool
 
@@ -165,24 +175,73 @@ type DataCoordCatalog interface {
 	SaveCurrentPartitionStatsVersion(ctx context.Context, collID, partID int64, vChannel string, currentVersion int64) error
 	GetCurrentPartitionStatsVersion(ctx context.Context, collID, partID int64, vChannel string) (int64, error)
 	DropCurrentPartitionStatsVersion(ctx context.Context, collID, partID int64, vChannel string) error
+
+	ListStatsTasks(ctx context.Context) ([]*indexpb.StatsTask, error)
+	SaveStatsTask(ctx context.Context, task *indexpb.StatsTask) error
+	DropStatsTask(ctx context.Context, taskID typeutil.UniqueID) error
 }
 
 type QueryCoordCatalog interface {
-	SaveCollection(collection *querypb.CollectionLoadInfo, partitions ...*querypb.PartitionLoadInfo) error
-	SavePartition(info ...*querypb.PartitionLoadInfo) error
-	SaveReplica(replicas ...*querypb.Replica) error
-	GetCollections() ([]*querypb.CollectionLoadInfo, error)
-	GetPartitions() (map[int64][]*querypb.PartitionLoadInfo, error)
-	GetReplicas() ([]*querypb.Replica, error)
-	ReleaseCollection(collection int64) error
-	ReleasePartition(collection int64, partitions ...int64) error
-	ReleaseReplicas(collectionID int64) error
-	ReleaseReplica(collection, replica int64) error
-	SaveResourceGroup(rgs ...*querypb.ResourceGroup) error
-	RemoveResourceGroup(rgName string) error
-	GetResourceGroups() ([]*querypb.ResourceGroup, error)
+	SaveCollection(ctx context.Context, collection *querypb.CollectionLoadInfo, partitions ...*querypb.PartitionLoadInfo) error
+	SavePartition(ctx context.Context, info ...*querypb.PartitionLoadInfo) error
+	SaveReplica(ctx context.Context, replicas ...*querypb.Replica) error
+	GetCollections(ctx context.Context) ([]*querypb.CollectionLoadInfo, error)
+	GetPartitions(ctx context.Context, collectionIDs []int64) (map[int64][]*querypb.PartitionLoadInfo, error)
+	GetReplicas(ctx context.Context) ([]*querypb.Replica, error)
+	ReleaseCollection(ctx context.Context, collection int64) error
+	ReleasePartition(ctx context.Context, collection int64, partitions ...int64) error
+	ReleaseReplicas(ctx context.Context, collectionID int64) error
+	ReleaseReplica(ctx context.Context, collection int64, replicas ...int64) error
+	SaveResourceGroup(ctx context.Context, rgs ...*querypb.ResourceGroup) error
+	RemoveResourceGroup(ctx context.Context, rgName string) error
+	GetResourceGroups(ctx context.Context) ([]*querypb.ResourceGroup, error)
 
-	SaveCollectionTargets(target ...*querypb.CollectionTarget) error
-	RemoveCollectionTarget(collectionID int64) error
-	GetCollectionTargets() (map[int64]*querypb.CollectionTarget, error)
+	SaveCollectionTargets(ctx context.Context, target ...*querypb.CollectionTarget) error
+	RemoveCollectionTarget(ctx context.Context, collectionID int64) error
+	GetCollectionTargets(ctx context.Context) (map[int64]*querypb.CollectionTarget, error)
+}
+
+// StreamingCoordCataLog is the interface for streamingcoord catalog
+type StreamingCoordCataLog interface {
+	// physical channel watch related
+
+	// ListPChannel list all pchannels on milvus.
+	ListPChannel(ctx context.Context) ([]*streamingpb.PChannelMeta, error)
+
+	// SavePChannel save a pchannel info to metastore.
+	SavePChannels(ctx context.Context, info []*streamingpb.PChannelMeta) error
+
+	// ListBroadcastTask list all broadcast tasks.
+	// Used to recovery the broadcast tasks.
+	ListBroadcastTask(ctx context.Context) ([]*streamingpb.BroadcastTask, error)
+
+	// SaveBroadcastTask save the broadcast task to metastore.
+	// Make the task recoverable after restart.
+	// When broadcast task is done, it will be removed from metastore.
+	SaveBroadcastTask(ctx context.Context, broadcastID uint64, task *streamingpb.BroadcastTask) error
+}
+
+// StreamingNodeCataLog is the interface for streamingnode catalog
+type StreamingNodeCataLog interface {
+	// WAL select the wal related recovery infos.
+	// Which must give the pchannel name.
+
+	// ListVChannel list all vchannels on current pchannel.
+	ListVChannel(ctx context.Context, pchannelName string) ([]*streamingpb.VChannelMeta, error)
+
+	// SaveVChannels save vchannel on current pchannel.
+	SaveVChannels(ctx context.Context, pchannelName string, vchannels map[string]*streamingpb.VChannelMeta) error
+
+	// ListSegmentAssignment list all segment assignments for the wal.
+	ListSegmentAssignment(ctx context.Context, pChannelName string) ([]*streamingpb.SegmentAssignmentMeta, error)
+
+	// SaveSegmentAssignments save the segment assignments for the wal.
+	SaveSegmentAssignments(ctx context.Context, pChannelName string, infos map[int64]*streamingpb.SegmentAssignmentMeta) error
+
+	// GetConsumeCheckpoint gets the consuming checkpoint of the wal.
+	// Return nil, nil if the checkpoint is not exist.
+	GetConsumeCheckpoint(ctx context.Context, pChannelName string) (*streamingpb.WALCheckpoint, error)
+
+	// SaveConsumeCheckpoint saves the consuming checkpoint of the wal.
+	SaveConsumeCheckpoint(ctx context.Context, pChannelName string, checkpoint *streamingpb.WALCheckpoint) error
 }

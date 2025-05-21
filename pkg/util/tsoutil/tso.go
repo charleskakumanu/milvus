@@ -19,7 +19,7 @@ package tsoutil
 import (
 	"time"
 
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 const (
@@ -55,17 +55,16 @@ func PhysicalTime(ts uint64) time.Time {
 	return physicalTime
 }
 
+// PhysicalTimeSeconds returns the physical time in seconds
+func PhysicalTimeSeconds(ts uint64) float64 {
+	return float64(ts>>logicalBits) / 1000
+}
+
 // ParseHybridTs parses the ts to (physical, logical), physical part is of utc-timestamp format.
 func ParseHybridTs(ts uint64) (int64, int64) {
 	logical := ts & logicalBitsMask
 	physical := ts >> logicalBits
 	return int64(physical), int64(logical)
-}
-
-// ParseAndFormatHybridTs parses the ts and returns its human-readable format.
-func ParseAndFormatHybridTs(ts uint64) string {
-	physicalTs, _ := ParseHybridTs(ts)
-	return time.Unix(physicalTs, 0).Format(time.RFC3339) // Convert to RFC3339 format
 }
 
 // CalculateDuration returns the number of milliseconds obtained by subtracting ts2 from ts1.
@@ -95,4 +94,21 @@ func SubByNow(ts uint64) int64 {
 	utcT, _ := ParseHybridTs(ts)
 	now := time.Now().UnixMilli()
 	return now - utcT
+}
+
+func PhysicalTimeFormat(ts uint64) string {
+	return PhysicalTime(ts).Format(time.DateTime)
+}
+
+const (
+	minUnixMillis = 1546300800000   // 2019-01-01 00:00:00 UTC
+	maxUnixMillis = 253402300799000 // 9999-12-31 23:59:59 UTC
+)
+
+func IsValidPhysicalTs(t uint64) bool {
+	return t >= minUnixMillis && t <= maxUnixMillis
+}
+
+func IsValidHybridTs(t uint64) bool {
+	return IsValidPhysicalTs(t >> logicalBits)
 }

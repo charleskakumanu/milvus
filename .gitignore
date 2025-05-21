@@ -9,7 +9,9 @@
 **/cmake-build-release/*
 **/cmake_build_release/*
 **/cmake_build/*
-**/CmakeFiles/*
+**/CMakeFiles/*
+**/.cmake/*
+CMakeCache.txt
 .cache
 coverage_report/
 
@@ -29,6 +31,7 @@ docker-compose-devcontainer.yml.tmp
 
 # Docker generated cache file
 .docker/
+.docker-gpu/
 
 **/_artifacts/**
 
@@ -99,8 +102,11 @@ cwrapper_rocksdb_build/
 
 # local file data
 **/data/*
+!**/tantivy-binding/src/analyzer/data/*
 
 internal/proto/**/*.pb.go
+pkg/streaming/**/*.pb.go
 internal/core/src/pb/*.pb.h
 internal/core/src/pb/*.pb.cc
 **/legacypb/*.pb.go
+pkg/streaming/proto/**/*.pb.go

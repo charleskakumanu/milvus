@@ -21,10 +21,20 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/samber/lo"
+	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/distributed/streaming"
 	"github.com/milvus-io/milvus/internal/metastore/model"
-	pb "github.com/milvus-io/milvus/internal/proto/etcdpb"
 	"github.com/milvus-io/milvus/internal/util/proxyutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	pb "github.com/milvus-io/milvus/pkg/v2/proto/etcdpb"
+	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message"
+	"github.com/milvus-io/milvus/pkg/v2/util/commonpbutil"
 )
 
 type stepPriority int
@@ -263,6 +273,7 @@ func (s *waitForTsSyncedStep) Weight() stepPriority {
 type deletePartitionDataStep struct {
 	baseStep
 	pchans    []string
+	vchans    []string
 	partition *model.Partition
 
 	isSkip bool
@@ -272,7 +283,7 @@ func (s *deletePartitionDataStep) Execute(ctx context.Context) ([]nestedStep, er
 	if s.isSkip {
 		return nil, nil
 	}
-	_, err := s.core.garbageCollector.GcPartitionData(ctx, s.pchans, s.partition)
+	_, err := s.core.garbageCollector.GcPartitionData(ctx, s.pchans, s.vchans, s.partition)
 	return nil, err
 }
 
@@ -291,6 +302,7 @@ type releaseCollectionStep struct {
 
 func (s *releaseCollectionStep) Execute(ctx context.Context) ([]nestedStep, error) {
 	err := s.core.broker.ReleaseCollection(ctx, s.collectionID)
+	log.Ctx(ctx).Info("release collection done", zap.Int64("collectionID", s.collectionID))
 	return nil, err
 }
 
@@ -318,25 +330,6 @@ func (s *releasePartitionsStep) Desc() string {
 }
 
 func (s *releasePartitionsStep) Weight() stepPriority {
-	return stepPriorityUrgent
-}
-
-type syncNewCreatedPartitionStep struct {
-	baseStep
-	collectionID UniqueID
-	partitionID  UniqueID
-}
-
-func (s *syncNewCreatedPartitionStep) Execute(ctx context.Context) ([]nestedStep, error) {
-	err := s.core.broker.SyncNewCreatedPartition(ctx, s.collectionID, s.partitionID)
-	return nil, err
-}
-
-func (s *syncNewCreatedPartitionStep) Desc() string {
-	return fmt.Sprintf("sync new partition, collectionID=%d, partitionID=%d", s.partitionID, s.partitionID)
-}
-
-func (s *syncNewCreatedPartitionStep) Weight() stepPriority {
 	return stepPriorityUrgent
 }
 
@@ -371,6 +364,51 @@ func (s *addPartitionMetaStep) Execute(ctx context.Context) ([]nestedStep, error
 
 func (s *addPartitionMetaStep) Desc() string {
 	return fmt.Sprintf("add partition to meta table, collection: %d, partition: %d", s.partition.CollectionID, s.partition.PartitionID)
+}
+
+type broadcastCreatePartitionMsgStep struct {
+	baseStep
+	vchannels []string
+	partition *model.Partition
+	ts        Timestamp
+}
+
+func (s *broadcastCreatePartitionMsgStep) Execute(ctx context.Context) ([]nestedStep, error) {
+	req := &msgpb.CreatePartitionRequest{
+		Base: commonpbutil.NewMsgBase(
+			commonpbutil.WithMsgType(commonpb.MsgType_CreatePartition),
+			commonpbutil.WithTimeStamp(0), // ts is given by streamingnode.
+		),
+		PartitionName: s.partition.PartitionName,
+		CollectionID:  s.partition.CollectionID,
+		PartitionID:   s.partition.PartitionID,
+	}
+
+	msgs := make([]message.MutableMessage, 0, len(s.vchannels))
+	for _, vchannel := range s.vchannels {
+		msg, err := message.NewCreatePartitionMessageBuilderV1().
+			WithVChannel(vchannel).
+			WithHeader(&message.CreatePartitionMessageHeader{
+				CollectionId: s.partition.CollectionID,
+				PartitionId:  s.partition.PartitionID,
+			}).
+			WithBody(req).
+			BuildMutable()
+		if err != nil {
+			return nil, err
+		}
+		msgs = append(msgs, msg)
+	}
+	if err := streaming.WAL().AppendMessagesWithOption(ctx, streaming.AppendOption{
+		BarrierTimeTick: s.ts,
+	}, msgs...).UnwrapFirstError(); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
+func (s *broadcastCreatePartitionMsgStep) Desc() string {
+	return fmt.Sprintf("broadcast create partition message to mq, collection: %d, partition: %d", s.partition.CollectionID, s.partition.PartitionID)
 }
 
 type changePartitionStateStep struct {
@@ -457,6 +495,79 @@ func (b *BroadcastAlteredCollectionStep) Execute(ctx context.Context) ([]nestedS
 
 func (b *BroadcastAlteredCollectionStep) Desc() string {
 	return fmt.Sprintf("broadcast altered collection, collectionID: %d", b.req.CollectionID)
+}
+
+type AddCollectionFieldStep struct {
+	baseStep
+	oldColl           *model.Collection
+	updatedCollection *model.Collection
+	newField          *model.Field
+	ts                Timestamp
+}
+
+func (a *AddCollectionFieldStep) Execute(ctx context.Context) ([]nestedStep, error) {
+	// newColl := a.oldColl.Clone()
+	// newColl.Fields = append(newColl.Fields, a.newField)
+	err := a.core.meta.AlterCollection(ctx, a.oldColl, a.updatedCollection, a.updatedCollection.UpdateTimestamp)
+	log.Ctx(ctx).Info("add field done", zap.Int64("collectionID", a.oldColl.CollectionID), zap.Any("new field", a.newField))
+	return nil, err
+}
+
+func (a *AddCollectionFieldStep) Desc() string {
+	return fmt.Sprintf("add field, collectionID: %d, fieldID: %d, ts: %d", a.oldColl.CollectionID, a.newField.FieldID, a.ts)
+}
+
+type WriteSchemaChangeWALStep struct {
+	baseStep
+	collection *model.Collection
+	ts         Timestamp
+}
+
+func (s *WriteSchemaChangeWALStep) Execute(ctx context.Context) ([]nestedStep, error) {
+	vchannels := s.collection.VirtualChannelNames
+	schema := &schemapb.CollectionSchema{
+		Name:               s.collection.Name,
+		Description:        s.collection.Description,
+		AutoID:             s.collection.AutoID,
+		Fields:             model.MarshalFieldModels(s.collection.Fields),
+		Functions:          model.MarshalFunctionModels(s.collection.Functions),
+		EnableDynamicField: s.collection.EnableDynamicField,
+		Properties:         s.collection.Properties,
+	}
+
+	schemaMsg, err := message.NewSchemaChangeMessageBuilderV2().
+		WithBroadcast(vchannels).
+		WithHeader(&message.SchemaChangeMessageHeader{
+			CollectionId: s.collection.CollectionID,
+		}).
+		WithBody(&message.SchemaChangeMessageBody{
+			Schema:   schema,
+			ModifyTs: s.ts,
+		}).BuildBroadcast()
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := streaming.WAL().Broadcast().Append(ctx, schemaMsg)
+	if err != nil {
+		return nil, err
+	}
+
+	// use broadcast max msg timestamp as update timestamp here
+	s.collection.UpdateTimestamp = lo.Max(lo.Map(vchannels, func(channelName string, _ int) uint64 {
+		return resp.GetAppendResult(channelName).TimeTick
+	}))
+	log.Ctx(ctx).Info(
+		"broadcast schema change success",
+		zap.Uint64("broadcastID", resp.BroadcastID),
+		zap.Uint64("WALUpdateTimestamp", s.collection.UpdateTimestamp),
+		zap.Any("appendResults", resp.AppendResults),
+	)
+	return nil, nil
+}
+
+func (s *WriteSchemaChangeWALStep) Desc() string {
+	return fmt.Sprintf("write schema change WALcollectionID: %d, ts: %d", s.collection.CollectionID, s.ts)
 }
 
 type AlterDatabaseStep struct {

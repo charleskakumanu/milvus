@@ -1,18 +1,40 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package httpserver
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"net/http"
 	"strconv"
 	"sync"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/gin-gonic/gin"
+
+	mhttp "github.com/milvus-io/milvus/internal/http"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 func defaultResponse(c *gin.Context) {
-	c.String(http.StatusRequestTimeout, "timeout")
+	c.JSON(http.StatusRequestTimeout, gin.H{HTTPReturnCode: merr.TimeoutCode, HTTPReturnMessage: "request timeout"})
 }
 
 // BufferPool represents a pool of buffers.
@@ -37,7 +59,6 @@ func (p *BufferPool) Put(buf *bytes.Buffer) {
 
 // Timeout struct
 type Timeout struct {
-	timeout  time.Duration
 	handler  gin.HandlerFunc
 	response gin.HandlerFunc
 }
@@ -61,7 +82,7 @@ func NewWriter(w gin.ResponseWriter, buf *bytes.Buffer) *Writer {
 // Write will write data to response body
 func (w *Writer) Write(data []byte) (int, error) {
 	if w.timeout || w.body == nil {
-		return 0, nil
+		return 0, errors.New("Response writer closed")
 	}
 
 	w.mu.Lock()
@@ -133,23 +154,27 @@ func checkWriteHeaderCode(code int) {
 
 func timeoutMiddleware(handler gin.HandlerFunc) gin.HandlerFunc {
 	t := &Timeout{
-		timeout:  HTTPDefaultTimeout,
 		handler:  handler,
 		response: defaultResponse,
 	}
 	bufPool := &BufferPool{}
-	return func(c *gin.Context) {
-		timeoutSecond, err := strconv.ParseInt(c.Request.Header.Get(HTTPHeaderRequestTimeout), 10, 64)
+	return func(gCtx *gin.Context) {
+		topCtx, cancel := context.WithCancel(gCtx.Request.Context())
+		defer cancel()
+		gCtx.Request = gCtx.Request.WithContext(topCtx)
+
+		timeout := paramtable.Get().HTTPCfg.RequestTimeoutMs.GetAsDuration(time.Millisecond)
+		timeoutSecond, err := strconv.ParseInt(gCtx.Request.Header.Get(mhttp.HTTPHeaderRequestTimeout), 10, 64)
 		if err == nil {
-			t.timeout = time.Duration(timeoutSecond) * time.Second
+			timeout = time.Duration(timeoutSecond) * time.Second
 		}
 		finish := make(chan struct{}, 1)
 		panicChan := make(chan interface{}, 1)
 
-		w := c.Writer
+		w := gCtx.Writer
 		buffer := bufPool.Get()
 		tw := NewWriter(w, buffer)
-		c.Writer = tw
+		gCtx.Writer = tw
 		buffer.Reset()
 
 		go func() {
@@ -158,19 +183,19 @@ func timeoutMiddleware(handler gin.HandlerFunc) gin.HandlerFunc {
 					panicChan <- p
 				}
 			}()
-			t.handler(c)
+			t.handler(gCtx)
 			finish <- struct{}{}
 		}()
 
 		select {
 		case p := <-panicChan:
 			tw.FreeBuffer()
-			c.Writer = w
-			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{HTTPReturnCode: http.StatusInternalServerError})
+			gCtx.Writer = w
+			gCtx.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{mhttp.HTTPReturnCode: http.StatusInternalServerError})
 			panic(p)
 
 		case <-finish:
-			c.Next()
+			gCtx.Next()
 			tw.mu.Lock()
 			defer tw.mu.Unlock()
 			dst := tw.ResponseWriter.Header()
@@ -184,17 +209,17 @@ func timeoutMiddleware(handler gin.HandlerFunc) gin.HandlerFunc {
 			tw.FreeBuffer()
 			bufPool.Put(buffer)
 
-		case <-time.After(t.timeout):
-			c.Abort()
+		case <-time.After(timeout):
+			gCtx.Abort()
 			tw.mu.Lock()
 			defer tw.mu.Unlock()
 			tw.timeout = true
 			tw.FreeBuffer()
 			bufPool.Put(buffer)
 
-			c.Writer = w
-			t.response(c)
-			c.Writer = tw
+			gCtx.Writer = w
+			t.response(gCtx)
+			gCtx.Writer = tw
 		}
 	}
 }

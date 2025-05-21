@@ -20,13 +20,16 @@
 #include <index/Index.h>
 #include <index/ScalarIndex.h>
 
-#include "AckResponder.h"
 #include "InsertRecord.h"
+#include "cachinglayer/CacheSlot.h"
+#include "common/FieldMeta.h"
 #include "common/Schema.h"
 #include "common/IndexMeta.h"
 #include "IndexConfigGenerator.h"
+#include "knowhere/config.h"
 #include "log/Log.h"
 #include "segcore/SegcoreConfig.h"
+#include "segcore/InsertRecord.h"
 #include "index/VectorIndex.h"
 
 namespace milvus::segcore {
@@ -91,10 +94,10 @@ class FieldIndexing {
         return segcore_config_.get_chunk_rows();
     }
 
-    virtual index::IndexBase*
+    virtual PinWrapper<index::IndexBase*>
     get_chunk_indexing(int64_t chunk_id) const = 0;
 
-    virtual index::IndexBase*
+    virtual PinWrapper<index::IndexBase*>
     get_segment_indexing() const = 0;
 
  protected:
@@ -152,13 +155,13 @@ class ScalarFieldIndexing : public FieldIndexing {
     }
 
     // concurrent
-    index::ScalarIndex<T>*
+    PinWrapper<index::IndexBase*>
     get_chunk_indexing(int64_t chunk_id) const override {
         Assert(!field_meta_.is_vector());
         return data_.at(chunk_id).get();
     }
 
-    index::IndexBase*
+    PinWrapper<index::IndexBase*>
     get_segment_indexing() const override {
         return nullptr;
     }
@@ -209,14 +212,15 @@ class VectorFieldIndexing : public FieldIndexing {
     }
 
     // concurrent
-    index::IndexBase*
+    PinWrapper<index::IndexBase*>
     get_chunk_indexing(int64_t chunk_id) const override {
         Assert(field_meta_.is_vector());
-        return data_.at(chunk_id).get();
+        return PinWrapper<index::IndexBase*>(data_.at(chunk_id).get());
     }
-    index::IndexBase*
+
+    PinWrapper<index::IndexBase*>
     get_segment_indexing() const override {
-        return index_.get();
+        return PinWrapper<index::IndexBase*>(index_.get());
     }
 
     bool
@@ -266,10 +270,14 @@ class IndexingRecord {
     void
     Initialize() {
         int offset_id = 0;
+        auto enable_growing_mmap = storage::MmapManager::GetInstance()
+                                       .GetMmapConfig()
+                                       .GetEnableGrowingMmap();
         for (auto& [field_id, field_meta] : schema_.get_fields()) {
             ++offset_id;
             if (field_meta.is_vector() &&
-                segcore_config_.get_enable_interim_segment_index()) {
+                segcore_config_.get_enable_interim_segment_index() &&
+                !enable_growing_mmap) {
                 // TODO: skip binary small index now, reenable after config.yaml is ready
                 if (field_meta.get_data_type() == DataType::VECTOR_BINARY) {
                     continue;
@@ -282,14 +290,14 @@ class IndexingRecord {
                 //Small-Index enabled, create index for vector field only
                 if (index_meta_->GetIndexMaxRowCount() > 0 &&
                     index_meta_->HasFiled(field_id)) {
-                    auto vec_filed_meta =
+                    auto vec_field_meta =
                         index_meta_->GetFieldIndexMeta(field_id);
                     //Disable growing index for flat
-                    if (!vec_filed_meta.IsFlatIndex()) {
+                    if (!vec_field_meta.IsFlatIndex()) {
                         field_indexings_.try_emplace(
                             field_id,
                             CreateIndex(field_meta,
-                                        vec_filed_meta,
+                                        vec_field_meta,
                                         index_meta_->GetIndexMaxRowCount(),
                                         segcore_config_));
                     }
@@ -300,19 +308,18 @@ class IndexingRecord {
     }
 
     // concurrent, reentrant
-    template <bool is_sealed>
     void
     AppendingIndex(int64_t reserved_offset,
                    int64_t size,
                    FieldId fieldId,
                    const DataArray* stream_data,
-                   const InsertRecord<is_sealed>& record) {
+                   const InsertRecord<false>& record) {
         if (!is_in(fieldId)) {
             return;
         }
         auto& indexing = field_indexings_.at(fieldId);
         auto type = indexing->get_field_meta().get_data_type();
-        auto field_raw_data = record.get_field_data_base(fieldId);
+        auto field_raw_data = record.get_data_base(fieldId);
         if (type == DataType::VECTOR_FLOAT &&
             reserved_offset + size >= indexing->get_build_threshold()) {
             indexing->AppendSegmentIndexDense(
@@ -333,13 +340,12 @@ class IndexingRecord {
     }
 
     // concurrent, reentrant
-    template <bool is_sealed>
     void
     AppendingIndex(int64_t reserved_offset,
                    int64_t size,
                    FieldId fieldId,
                    const FieldDataPtr data,
-                   const InsertRecord<is_sealed>& record) {
+                   const InsertRecord<false>& record) {
         if (!is_in(fieldId)) {
             return;
         }
@@ -349,11 +355,11 @@ class IndexingRecord {
 
         if (type == DataType::VECTOR_FLOAT &&
             reserved_offset + size >= indexing->get_build_threshold()) {
-            auto vec_base = record.get_field_data_base(fieldId);
+            auto vec_base = record.get_data_base(fieldId);
             indexing->AppendSegmentIndexDense(
                 reserved_offset, size, vec_base, data->Data());
         } else if (type == DataType::VECTOR_SPARSE_FLOAT) {
-            auto vec_base = record.get_field_data_base(fieldId);
+            auto vec_base = record.get_data_base(fieldId);
             indexing->AppendSegmentIndexSparse(
                 reserved_offset,
                 size,
@@ -423,6 +429,11 @@ class IndexingRecord {
         auto ptr = dynamic_cast<const VectorFieldIndexing*>(&field_indexing);
         AssertInfo(ptr, "invalid indexing");
         return *ptr;
+    }
+
+    const FieldIndexMeta&
+    get_field_index_meta(FieldId fieldId) const {
+        return index_meta_->GetFieldIndexMeta(fieldId);
     }
 
     bool

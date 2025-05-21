@@ -3,7 +3,7 @@ package metrics
 import (
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 var (
@@ -146,6 +146,15 @@ var (
 			Help:      "The number of roles",
 		})
 
+	// RootCoordNumOfPrivilegeGroups counts the number of credentials.
+	RootCoordNumOfPrivilegeGroups = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.RootCoordRole,
+			Name:      "num_of_privilege_groups",
+			Help:      "The number of privilege groups",
+		})
+
 	// RootCoordTtDelay records the max time tick delay of flow graphs in DataNodes and QueryNodes.
 	RootCoordTtDelay = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -168,6 +177,15 @@ var (
 		}, []string{
 			"quota_states",
 			"name",
+		})
+
+	// RootCoordForceDenyWritingCounter records the number of times that milvus turns into force-deny-writing states.
+	RootCoordForceDenyWritingCounter = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.RootCoordRole,
+			Name:      "force_deny_writing_counter",
+			Help:      "The number of times milvus turns into force-deny-writing states",
 		})
 
 	// RootCoordRateLimitRatio reflects the ratio of rate limit.
@@ -209,10 +227,26 @@ var (
 			indexName,
 			isVectorIndex,
 		})
+
+	QueryNodeMemoryHighWaterLevel = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.RootCoordRole,
+			Name:      "qn_mem_high_water_level",
+			Help:      "querynode memory high water level",
+		})
+
+	DiskQuota = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.RootCoordRole,
+			Name:      "disk_quota",
+			Help:      "disk quota",
+		}, []string{"node_id", "scope"})
 )
 
 // RegisterRootCoord registers RootCoord metrics
-func RegisterRootCoord(registry *prometheus.Registry) {
+func RegisterMixCoord(registry *prometheus.Registry) {
 	registry.Register(RootCoordProxyCounter)
 
 	// for time tick
@@ -241,11 +275,19 @@ func RegisterRootCoord(registry *prometheus.Registry) {
 	registry.MustRegister(RootCoordNumOfRoles)
 	registry.MustRegister(RootCoordTtDelay)
 	registry.MustRegister(RootCoordQuotaStates)
+	registry.MustRegister(RootCoordForceDenyWritingCounter)
 	registry.MustRegister(RootCoordRateLimitRatio)
 	registry.MustRegister(RootCoordDDLReqLatencyInQueue)
 
 	registry.MustRegister(RootCoordNumEntities)
 	registry.MustRegister(RootCoordIndexedNumEntities)
+
+	registry.MustRegister(QueryNodeMemoryHighWaterLevel)
+	registry.MustRegister(DiskQuota)
+
+	RegisterStreamingServiceClient(registry)
+	RegisterQueryCoord(registry)
+	RegisterDataCoord(registry)
 }
 
 func CleanupRootCoordDBMetrics(dbName string) {

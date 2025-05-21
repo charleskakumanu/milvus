@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/csv"
 	"fmt"
 	"io"
@@ -12,9 +13,9 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/exp/slices"
 
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 type DocContent struct {
@@ -59,7 +60,7 @@ func collectRecursive(params *paramtable.ComponentParam, data *[]DocContent, val
 	if val.Kind() != reflect.Struct {
 		return
 	}
-	log.Debug("enter", zap.Any("variable", val.String()))
+	log.Ctx(context.TODO()).Debug("enter", zap.Any("variable", val.String()))
 	for j := 0; j < val.NumField(); j++ {
 		subVal := val.Field(j)
 		tag := val.Type().Field(j).Tag
@@ -68,11 +69,14 @@ func collectRecursive(params *paramtable.ComponentParam, data *[]DocContent, val
 			item := subVal.Interface().(paramtable.ParamItem) //nolint:govet
 			refreshable := tag.Get("refreshable")
 			defaultValue := params.GetWithDefault(item.Key, item.DefaultValue)
-			log.Debug("got key", zap.String("key", item.Key), zap.Any("value", defaultValue), zap.String("variable", val.Type().Field(j).Name))
+			if strings.HasPrefix(item.DefaultValue, "\"") && strings.HasSuffix(item.DefaultValue, "\"") {
+				defaultValue = fmt.Sprintf("\"%s\"", defaultValue)
+			}
+			log.Ctx(context.TODO()).Debug("got key", zap.String("key", item.Key), zap.Any("value", defaultValue), zap.String("variable", val.Type().Field(j).Name))
 			*data = append(*data, DocContent{item.Key, defaultValue, item.Version, refreshable, item.Export, item.Doc})
 		} else if t == "paramtable.ParamGroup" {
 			item := subVal.Interface().(paramtable.ParamGroup)
-			log.Debug("got key", zap.String("key", item.KeyPrefix), zap.String("variable", val.Type().Field(j).Name))
+			log.Ctx(context.TODO()).Debug("got key", zap.String("key", item.KeyPrefix), zap.String("variable", val.Type().Field(j).Name))
 			refreshable := tag.Get("refreshable")
 
 			// Sort group items to stablize the output order
@@ -84,8 +88,8 @@ func collectRecursive(params *paramtable.ComponentParam, data *[]DocContent, val
 			sort.Strings(keys)
 			for _, key := range keys {
 				value := m[key]
-				log.Debug("got group entry", zap.String("key", key), zap.String("value", value))
-				*data = append(*data, DocContent{fmt.Sprintf("%s%s", item.KeyPrefix, key), quoteIfNeeded(value), item.Version, refreshable, item.Export, ""})
+				log.Ctx(context.TODO()).Debug("got group entry", zap.String("key", key), zap.String("value", value))
+				*data = append(*data, DocContent{fmt.Sprintf("%s%s", item.KeyPrefix, key), quoteIfNeeded(value), item.Version, refreshable, item.Export, item.GetDoc(key)})
 			}
 		} else {
 			collectRecursive(params, data, &subVal)
@@ -145,7 +149,7 @@ func (m *YamlMarshaller) writeYamlRecursive(data []DocContent, level int) {
 	for _, key := range keys {
 		contents, ok := topLevels.Get(key)
 		if !ok {
-			log.Debug("didnot found config for " + key)
+			log.Ctx(context.TODO()).Debug("didnot found config for " + key)
 			continue
 		}
 		content := contents[0]
@@ -229,11 +233,16 @@ func WriteYaml(w io.Writer) {
 		{
 			name: "mq",
 			header: `
-# Milvus supports four MQ: rocksmq(based on RockDB), natsmq(embedded nats-server), Pulsar and Kafka.
+# Milvus supports four MQ: rocksmq(based on RockDB), Pulsar and Kafka.
 # You can change your mq by setting mq.type field.
 # If you don't set mq.type field as default, there is a note about enabling priority if we config multiple mq in this file.
-# 1. standalone(local) mode: rocksmq(default) > natsmq > Pulsar > Kafka
-# 2. cluster mode:  Pulsar(default) > Kafka (rocksmq and natsmq is unsupported in cluster mode)`,
+# 1. standalone(local) mode: rocksmq(default) > Pulsar > Kafka
+# 2. cluster mode:  Pulsar(default) > Kafka (rocksmq is unsupported in cluster mode)`,
+		},
+		{
+			name: "woodpecker",
+			header: `
+# Related configuration of woodpecker, used to manage Milvus logs of recent mutation operations, output streaming log, and provide embedded log sequential read and write.`,
 		},
 		{
 			name: "pulsar",
@@ -249,10 +258,8 @@ func WriteYaml(w io.Writer) {
 			name: "rocksmq",
 		},
 		{
-			name: "natsmq",
-			header: `
-# natsmq configuration.
-# more detail: https://docs.nats.io/running-a-nats-service/configuration`,
+			name:   "mixCoord",
+			header: "\n# Related configuration of mixCoord",
 		},
 		{
 			name:   "rootCoord",
@@ -283,6 +290,10 @@ func WriteYaml(w io.Writer) {
 			name: "dataNode",
 		},
 		{
+			name:   "msgChannel",
+			header: "\n# This topic introduces the message channel-related configurations of Milvus.",
+		},
+		{
 			name:   "log",
 			header: "\n# Configures the system log output.",
 		},
@@ -291,7 +302,11 @@ func WriteYaml(w io.Writer) {
 		},
 		{
 			name:   "tls",
-			header: "\n# Configure the proxy tls enable.",
+			header: "\n# Configure external tls.",
+		},
+		{
+			name:   "internaltls",
+			header: "\n# Configure internal tls.",
 		},
 		{
 			name: "common",
@@ -323,6 +338,40 @@ func WriteYaml(w io.Writer) {
 #if initMemSize and MaxMemSize both set zero,
 #milvus will automatically initialize half of the available GPU memory,
 #maxMemSize will the whole available GPU memory.`,
+		},
+		{
+			name: "streamingNode",
+			header: `
+# Any configuration related to the streaming node server.`,
+		},
+		{
+			name: "streaming",
+			header: `
+# Any configuration related to the streaming service.`,
+		},
+		{
+			name: "knowhere",
+			header: `
+# Any configuration related to the knowhere vector search engine`,
+		},
+		{
+			name: "credential",
+			header: `
+# credential configs, support apikey, AKSK, gcp credential
+# examples:
+# credential:
+#  your_apikey_crendential_name:
+#    apikey:  # Your apikey credential
+#  your_aksk_crendential_name:
+#    access_key_id:
+#    secret_access_key:
+#  your_gcp_credential_name:
+#    credential_json:`,
+		},
+		{
+			name: "function",
+			header: `
+# Any configuration related to functions`,
 		},
 	}
 	marshller := YamlMarshaller{w, groups, result}

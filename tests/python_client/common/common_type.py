@@ -1,3 +1,6 @@
+import numpy as np
+from pymilvus import DataType
+
 """ Initialized parameters """
 port = 19530
 epsilon = 0.000001
@@ -13,8 +16,10 @@ default_top_k = 10
 default_nq = 2
 default_limit = 10
 default_batch_size = 1000
+min_limit = 1
 max_limit = 16384
 max_top_k = 16384
+max_nq = 16384
 max_partition_num = 1024
 max_role_num = 10
 default_partition_num = 16   # default num_partitions for partition key feature
@@ -23,6 +28,7 @@ default_server_segment_row_limit = 1024 * 512
 default_alias = "default"
 default_user = "root"
 default_password = "Milvus"
+default_primary_field_name = 'pk'
 default_bool_field_name = "bool"
 default_int8_field_name = "int8"
 default_int16_field_name = "int16"
@@ -41,12 +47,30 @@ default_float16_vec_field_name = "float16_vector"
 default_bfloat16_vec_field_name = "bfloat16_vector"
 another_float_vec_field_name = "float_vector1"
 default_binary_vec_field_name = "binary_vector"
-float_type = "FLOAT_VECTOR"
-float16_type = "FLOAT16_VECTOR"
-bfloat16_type = "BFLOAT16_VECTOR"
-sparse_vector = "SPARSE_FLOAT_VECTOR"
-append_vector_type = [float16_type, bfloat16_type, sparse_vector]
-all_dense_vector_types = [float_type, float16_type, bfloat16_type]
+text_sparse_vector = "TEXT_SPARSE_VECTOR"
+
+all_vector_types = [
+        DataType.FLOAT_VECTOR,
+        DataType.FLOAT16_VECTOR,
+        DataType.BFLOAT16_VECTOR,
+        DataType.SPARSE_FLOAT_VECTOR,
+        DataType.INT8_VECTOR,
+        DataType.BINARY_VECTOR,
+    ]
+
+default_metric_for_vector_type = {
+    DataType.FLOAT_VECTOR: "COSINE",
+    DataType.FLOAT16_VECTOR: "L2",
+    DataType.BFLOAT16_VECTOR: "IP",
+    DataType.SPARSE_FLOAT_VECTOR: "IP",
+    DataType.INT8_VECTOR: "COSINE",
+    DataType.BINARY_VECTOR: "HAMMING",
+}
+
+all_dense_vector_types = [DataType.FLOAT_VECTOR, DataType.FLOAT16_VECTOR, DataType.BFLOAT16_VECTOR]
+all_float_vector_dtypes = [DataType.FLOAT_VECTOR, DataType.FLOAT16_VECTOR, DataType.BFLOAT16_VECTOR, DataType.SPARSE_FLOAT_VECTOR]
+
+append_vector_type = [DataType.FLOAT16_VECTOR, DataType.BFLOAT16_VECTOR, DataType.SPARSE_FLOAT_VECTOR]
 default_sparse_vec_field_name = "sparse_vector"
 default_partition_name = "_default"
 default_resource_group_name = '__default_resource_group'
@@ -205,47 +229,53 @@ get_dict_without_host_port = [
     {"": ""}
 ]
 
-get_dict_invalid_host_port = [
-    {"port": "port"},
-    # ["host", "port"],
-    # ("host", "port"),
-    {"host": -1},
-    {"port": ["192.168.1.1"]},
-    {"port": "-1", "host": "hostlocal"},
-]
-
 get_wrong_format_dict = [
     {"host": "string_host", "port": {}},
     {"host": 0, "port": 19520}
 ]
 
+get_all_kind_data_distribution = [
+    1, np.float64(1.0), np.double(1.0), 9707199254740993.0, 9707199254740992,
+    '1', '123', '321', '213', True, False, [1, 2], [1.0, 2], None, {}, {"a": 1},
+    {'a': 1.0}, {'a': 9707199254740993.0}, {'a': 9707199254740992}, {'a': '1'}, {'a': '123'},
+    {'a': '321'}, {'a': '213'}, {'a': True}, {'a': [1, 2, 3]}, {'a': [1.0, 2, '1']}, {'a': [1.0, 2]},
+    {'a': None}, {'a': {'b': 1}}, {'a': {'b': 1.0}}, {'a': [{'b': 1}, 2.0, np.double(3.0), '4', True, [1, 3.0], None]}
+]
+
 """ Specially defined list """
 L0_index_types = ["IVF_SQ8", "HNSW", "DISKANN"]
 all_index_types = ["FLAT", "IVF_FLAT", "IVF_SQ8", "IVF_PQ",
+                   "IVF_RABITQ",
                    "HNSW", "SCANN", "DISKANN",
                    "BIN_FLAT", "BIN_IVF_FLAT",
                    "SPARSE_INVERTED_INDEX", "SPARSE_WAND",
                    "GPU_IVF_FLAT", "GPU_IVF_PQ"]
 
+inverted_index_algo = ['TAAT_NAIVE', 'DAAT_WAND', 'DAAT_MAXSCORE']
+
 default_all_indexes_params = [{}, {"nlist": 128}, {"nlist": 128}, {"nlist": 128, "m": 16, "nbits": 8},
+                              {"nlist": 128, "refine": 'true', "refine_type": "SQ8"},
                               {"M": 32, "efConstruction": 360}, {"nlist": 128}, {},
                               {}, {"nlist": 64},
-                              {"drop_ratio_build": 0.2}, {"drop_ratio_build": 0.2},
+                              {}, {"drop_ratio_build": 0.2},
                               {"nlist": 64}, {"nlist": 64, "m": 16, "nbits": 8}]
 
 default_all_search_params_params = [{}, {"nprobe": 32}, {"nprobe": 32}, {"nprobe": 32},
+                                    {"nprobe": 8, "rbq_bits_query": 6, "refine_k": 1.0},
                                     {"ef": 100}, {"nprobe": 32, "reorder_k": 100}, {"search_list": 30},
                                     {}, {"nprobe": 32},
                                     {"drop_ratio_search": "0.2"}, {"drop_ratio_search": "0.2"},
                                     {}, {}]
 
 Handler_type = ["GRPC", "HTTP"]
-binary_support = ["BIN_FLAT", "BIN_IVF_FLAT"]
-sparse_support = ["SPARSE_INVERTED_INDEX", "SPARSE_WAND"]
+binary_supported_index_types = ["BIN_FLAT", "BIN_IVF_FLAT"]
+sparse_supported_index_types = ["SPARSE_INVERTED_INDEX", "SPARSE_WAND"]
+gpu_supported_index_types = ["GPU_IVF_FLAT", "GPU_IVF_PQ"]
 default_L0_metric = "COSINE"
-float_metrics = ["L2", "IP", "COSINE"]
+dense_metrics = ["L2", "IP", "COSINE"]
 binary_metrics = ["JACCARD", "HAMMING", "SUBSTRUCTURE", "SUPERSTRUCTURE"]
 structure_metrics = ["SUBSTRUCTURE", "SUPERSTRUCTURE"]
+sparse_metrics = ["IP", "BM25"]
 all_scalar_data_types = ['int8', 'int16', 'int32', 'int64', 'float', 'double', 'bool', 'varchar']
 
 
@@ -253,15 +283,39 @@ default_flat_index = {"index_type": "FLAT", "params": {}, "metric_type": default
 default_bin_flat_index = {"index_type": "BIN_FLAT", "params": {}, "metric_type": "JACCARD"}
 default_sparse_inverted_index = {"index_type": "SPARSE_INVERTED_INDEX", "metric_type": "IP",
                                  "params": {"drop_ratio_build": 0.2}}
-
-default_search_params = {"params": default_all_search_params_params[2].copy()}
-default_search_ip_params = {"metric_type": "IP", "params": default_all_search_params_params[2].copy()}
+default_text_sparse_inverted_index = {"index_type": "SPARSE_INVERTED_INDEX", "metric_type": "BM25",
+                                      "params": {"drop_ratio_build": 0.2, "bm25_k1": 1.5, "bm25_b": 0.75,}}
+default_search_params = {"params": {"nlist": 128}}
+default_search_ip_params = {"metric_type": "IP", "params": {"nlist": 128}}
 default_search_binary_params = {"metric_type": "JACCARD", "params": {"nprobe": 32}}
-default_index = {"index_type": "IVF_SQ8", "metric_type": default_L0_metric, "params": default_all_indexes_params[2].copy()}
-default_binary_index = {"index_type": "BIN_IVF_FLAT", "metric_type": "JACCARD", "params": default_all_indexes_params[8].copy()}
+default_index = {"index_type": "IVF_SQ8", "metric_type": default_L0_metric, "params": {"nlist": 128}}
+default_binary_index = {"index_type": "BIN_IVF_FLAT", "metric_type": "JACCARD", "params": {"nlist": 64}}
 default_diskann_index = {"index_type": "DISKANN", "metric_type": default_L0_metric, "params": {}}
 default_diskann_search_params = {"params": {"search_list": 30}}
 default_sparse_search_params = {"metric_type": "IP", "params": {"drop_ratio_search": "0.2"}}
+default_text_sparse_search_params = {"metric_type": "BM25", "params": {}}
+built_in_privilege_groups = ["CollectionReadWrite", "CollectionReadOnly", "CollectionAdmin",
+                             "DatabaseReadWrite", "DatabaseReadOnly", "DatabaseAdmin",
+                             "ClusterReadWrite", "ClusterReadOnly", "ClusterAdmin"]
+privilege_group_privilege_dict = {"Query": False, "Search": False, "GetLoadState": False,
+                                  "GetLoadingProgress": False, "HasPartition": False, "ShowPartitions": False,
+                                  "ShowCollections": False, "ListAliases": False, "ListDatabases": False,
+                                  "DescribeDatabase": False, "DescribeAlias": False, "GetStatistics": False,
+                                  "CreateIndex": False, "DropIndex": False, "CreatePartition": False,
+                                  "DropPartition": False, "Load": False, "Release": False,
+                                  "Insert": False, "Delete": False, "Upsert": False,
+                                  "Import": False, "Flush": False, "Compaction": False,
+                                  "LoadBalance": False, "RenameCollection": False, "CreateAlias": False,
+                                  "DropAlias": False, "CreateCollection": False, "DropCollection": False,
+                                  "CreateOwnership": False, "DropOwnership": False, "SelectOwnership": False,
+                                  "ManageOwnership": False, "UpdateUser": False, "SelectUser": False,
+                                  "CreateResourceGroup": False, "DropResourceGroup": False,
+                                  "UpdateResourceGroups": False,
+                                  "DescribeResourceGroup": False, "ListResourceGroups": False, "TransferNode": False,
+                                  "TransferReplica": False, "CreateDatabase": False, "DropDatabase": False,
+                                  "AlterDatabase": False, "FlushAll": False, "ListPrivilegeGroups": False,
+                                  "CreatePrivilegeGroup": False, "DropPrivilegeGroup": False,
+                                  "OperatePrivilegeGroup": False}
 
 
 class CheckTasks:
@@ -286,6 +340,10 @@ class CheckTasks:
     check_value_equal = "check_value_equal"
     check_rg_property = "check_resource_group_property"
     check_describe_collection_property = "check_describe_collection_property"
+    check_describe_database_property = "check_describe_database_property"
+    check_insert_result = "check_insert_result"
+    check_collection_fields_properties = "check_collection_fields_properties"
+    check_describe_index_property = "check_describe_index_property"
 
 
 class BulkLoadStates:

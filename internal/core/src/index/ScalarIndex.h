@@ -25,6 +25,7 @@
 #include "common/EasyAssert.h"
 #include "index/Index.h"
 #include "fmt/format.h"
+#include "index/Meta.h"
 
 namespace milvus::index {
 
@@ -37,13 +38,36 @@ enum class ScalarIndexType {
     HYBRID,
 };
 
+inline std::string
+ToString(ScalarIndexType type) {
+    switch (type) {
+        case ScalarIndexType::NONE:
+            return "NONE";
+        case ScalarIndexType::BITMAP:
+            return "BITMAP";
+        case ScalarIndexType::STLSORT:
+            return "STLSORT";
+        case ScalarIndexType::MARISA:
+            return "MARISA";
+        case ScalarIndexType::INVERTED:
+            return "INVERTED";
+        case ScalarIndexType::HYBRID:
+            return "HYBRID";
+        default:
+            return "UNKNOWN";
+    }
+}
+
 template <typename T>
 class ScalarIndex : public IndexBase {
  public:
+    ScalarIndex(const std::string& index_type) : IndexBase(index_type) {
+    }
+
     void
-    BuildWithRawData(size_t n,
-                     const void* values,
-                     const Config& config = {}) override;
+    BuildWithRawDataForUT(size_t n,
+                          const void* values,
+                          const Config& config = {}) override;
 
     void
     BuildWithDataset(const DatasetPtr& dataset,
@@ -57,10 +81,16 @@ class ScalarIndex : public IndexBase {
     GetIndexType() const = 0;
 
     virtual void
-    Build(size_t n, const T* values) = 0;
+    Build(size_t n, const T* values, const bool* valid_data = nullptr) = 0;
 
     virtual const TargetBitmap
     In(size_t n, const T* values) = 0;
+
+    virtual const TargetBitmap
+    IsNull() = 0;
+
+    virtual const TargetBitmap
+    IsNotNull() = 0;
 
     virtual const TargetBitmap
     InApplyFilter(size_t n,
@@ -88,11 +118,30 @@ class ScalarIndex : public IndexBase {
           T upper_bound_value,
           bool ub_inclusive) = 0;
 
-    virtual T
+    virtual std::optional<T>
     Reverse_Lookup(size_t offset) const = 0;
 
     virtual const TargetBitmap
     Query(const DatasetPtr& dataset);
+
+    virtual bool
+    SupportPatternMatch() const {
+        return false;
+    }
+
+    virtual const TargetBitmap
+    PatternMatch(const std::string& pattern, proto::plan::OpType op) {
+        PanicInfo(Unsupported, "pattern match is not supported");
+    }
+
+    virtual bool
+    IsMmapSupported() const override {
+        return index_type_ == milvus::index::BITMAP_INDEX_TYPE ||
+               index_type_ == milvus::index::HYBRID_INDEX_TYPE ||
+               index_type_ == milvus::index::INVERTED_INDEX_TYPE ||
+               index_type_ == milvus::index::MARISA_TRIE ||
+               index_type_ == milvus::index::MARISA_TRIE_UPPER;
+    }
 
     virtual int64_t
     Size() = 0;
@@ -100,6 +149,11 @@ class ScalarIndex : public IndexBase {
     virtual bool
     SupportRegexQuery() const {
         return false;
+    }
+
+    virtual bool
+    TryUseRegexQuery() const {
+        return true;
     }
 
     virtual const TargetBitmap

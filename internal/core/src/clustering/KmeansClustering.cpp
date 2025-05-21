@@ -66,7 +66,9 @@ KmeansClustering::FetchDataFiles(uint8_t* buf,
         size_t end = std::min(files.size(), i + batch);
         std::vector<std::string> group_files(files.begin() + start,
                                              files.begin() + end);
-        auto field_datas = file_manager_->CacheRawDataToMemory(group_files);
+        Config config;
+        config[INSERT_FILES_KEY] = group_files;
+        auto field_datas = file_manager_->CacheRawDataToMemory(config);
 
         for (auto& data : field_datas) {
             size_t size = std::min(expected_train_size - offset, data->Size());
@@ -105,7 +107,8 @@ KmeansClustering::SampleTrainData(
             }
         }
         // shuffle files
-        std::shuffle(files.begin(), files.end(), std::mt19937());
+        std::mt19937 rng(static_cast<unsigned int>(std::time(nullptr)));
+        std::shuffle(files.begin(), files.end(), rng);
         FetchDataFiles<T>(
             buf, expected_train_size, expected_train_size, files, dim, offset);
         return;
@@ -325,11 +328,6 @@ KmeansClustering::StreamingAssignandUpload(
     }
     if (IsDataSkew<T>(config, dim, num_vectors_each_centroid)) {
         LOG_INFO(msg_header_ + "data skew! skip clustering");
-        // remove uploaded files
-        remote_paths_to_size[cluster_result_.centroid_path] =
-            cluster_result_.centroid_file_size;
-        RemoveClusteringResultFiles(file_manager_->GetChunkManager().get(),
-                                    remote_paths_to_size);
         // skip clustering, nothing takes affect
         throw SegcoreError(ErrorCode::ClusterSkip,
                            "data skew! skip clustering");

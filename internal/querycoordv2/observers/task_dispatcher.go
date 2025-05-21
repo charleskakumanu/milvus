@@ -20,9 +20,9 @@ import (
 	"context"
 	"sync"
 
-	"github.com/milvus-io/milvus/pkg/util/conc"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/conc"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 // taskDispatcher is the utility to provide task dedup and dispatch feature
@@ -67,6 +67,9 @@ func (d *taskDispatcher[K]) Stop() {
 			d.cancel()
 		}
 		d.wg.Wait()
+		if d.pool != nil {
+			d.pool.Release()
+		}
 	})
 }
 

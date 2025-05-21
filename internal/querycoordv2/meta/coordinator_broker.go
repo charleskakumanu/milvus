@@ -18,7 +18,7 @@ package meta
 
 import (
 	"context"
-	"fmt"
+	"math"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -27,18 +27,18 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus/internal/metastore/kv/binlog"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/indexpb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
-	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
 	"github.com/milvus-io/milvus/internal/types"
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/commonpbutil"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/retry"
-	. "github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/rootcoordpb"
+	"github.com/milvus-io/milvus/pkg/v2/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/retry"
+	. "github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 type Broker interface {
@@ -46,25 +46,22 @@ type Broker interface {
 	GetPartitions(ctx context.Context, collectionID UniqueID) ([]UniqueID, error)
 	GetRecoveryInfo(ctx context.Context, collectionID UniqueID, partitionID UniqueID) ([]*datapb.VchannelInfo, []*datapb.SegmentBinlogs, error)
 	ListIndexes(ctx context.Context, collectionID UniqueID) ([]*indexpb.IndexInfo, error)
-	GetSegmentInfo(ctx context.Context, segmentID ...UniqueID) (*datapb.GetSegmentInfoResponse, error)
-	GetIndexInfo(ctx context.Context, collectionID UniqueID, segmentID UniqueID) ([]*querypb.FieldIndexInfo, error)
+	GetSegmentInfo(ctx context.Context, segmentID ...UniqueID) ([]*datapb.SegmentInfo, error)
+	GetIndexInfo(ctx context.Context, collectionID UniqueID, segmentIDs ...UniqueID) (map[int64][]*querypb.FieldIndexInfo, error)
 	GetRecoveryInfoV2(ctx context.Context, collectionID UniqueID, partitionIDs ...UniqueID) ([]*datapb.VchannelInfo, []*datapb.SegmentInfo, error)
 	DescribeDatabase(ctx context.Context, dbName string) (*rootcoordpb.DescribeDatabaseResponse, error)
 	GetCollectionLoadInfo(ctx context.Context, collectionID UniqueID) ([]string, int64, error)
 }
 
 type CoordinatorBroker struct {
-	dataCoord types.DataCoordClient
-	rootCoord types.RootCoordClient
+	mixCoord types.MixCoord
 }
 
 func NewCoordinatorBroker(
-	dataCoord types.DataCoordClient,
-	rootCoord types.RootCoordClient,
+	mixCoord types.MixCoord,
 ) *CoordinatorBroker {
 	return &CoordinatorBroker{
-		dataCoord,
-		rootCoord,
+		mixCoord,
 	}
 }
 
@@ -79,7 +76,7 @@ func (broker *CoordinatorBroker) DescribeCollection(ctx context.Context, collect
 		// please do not specify the collection name alone after database feature.
 		CollectionID: collectionID,
 	}
-	resp, err := broker.rootCoord.DescribeCollection(ctx, req)
+	resp, err := broker.mixCoord.DescribeCollection(ctx, req)
 	if err := merr.CheckRPCCall(resp, err); err != nil {
 		log.Ctx(ctx).Warn("failed to get collection schema", zap.Error(err))
 		return nil, err
@@ -97,7 +94,7 @@ func (broker *CoordinatorBroker) DescribeDatabase(ctx context.Context, dbName st
 		),
 		DbName: dbName,
 	}
-	resp, err := broker.rootCoord.DescribeDatabase(ctx, req)
+	resp, err := broker.mixCoord.DescribeDatabase(ctx, req)
 	if err := merr.CheckRPCCall(resp, err); err != nil {
 		log.Ctx(ctx).Warn("failed to describe database", zap.Error(err))
 		return nil, err
@@ -107,23 +104,65 @@ func (broker *CoordinatorBroker) DescribeDatabase(ctx context.Context, dbName st
 
 // try to get database level replica_num and resource groups, return (resource_groups, replica_num, error)
 func (broker *CoordinatorBroker) GetCollectionLoadInfo(ctx context.Context, collectionID UniqueID) ([]string, int64, error) {
-	// to do by weiliu1031: querycoord should cache mappings: collectionID->dbName
 	collectionInfo, err := broker.DescribeCollection(ctx, collectionID)
 	if err != nil {
 		return nil, 0, err
 	}
 
-	dbInfo, err := broker.DescribeDatabase(ctx, collectionInfo.GetDbName())
+	log := log.Ctx(ctx)
+	replicaNum, err := common.CollectionLevelReplicaNumber(collectionInfo.GetProperties())
 	if err != nil {
-		return nil, 0, err
+		log.Debug("failed to get collection level load info", zap.Int64("collectionID", collectionID), zap.Error(err))
+	} else if replicaNum > 0 {
+		log.Info("get collection level load info", zap.Int64("collectionID", collectionID), zap.Int64("replica_num", replicaNum))
 	}
-	replicaNum, err := common.DatabaseLevelReplicaNumber(dbInfo.GetProperties())
+
+	rgs, err := common.CollectionLevelResourceGroups(collectionInfo.GetProperties())
 	if err != nil {
-		return nil, 0, err
+		log.Debug("failed to get collection level load info", zap.Int64("collectionID", collectionID), zap.Error(err))
+	} else if len(rgs) > 0 {
+		log.Info("get collection level load info", zap.Int64("collectionID", collectionID), zap.Strings("resource_groups", rgs))
 	}
-	rgs, err := common.DatabaseLevelResourceGroups(dbInfo.GetProperties())
-	if err != nil {
-		return nil, 0, err
+
+	if replicaNum <= 0 || len(rgs) == 0 {
+		dbInfo, err := broker.DescribeDatabase(ctx, collectionInfo.GetDbName())
+		if err != nil {
+			return nil, 0, err
+		}
+
+		if replicaNum <= 0 {
+			replicaNum, err = common.DatabaseLevelReplicaNumber(dbInfo.GetProperties())
+			if err != nil {
+				log.Debug("failed to get database level load info", zap.Int64("collectionID", collectionID), zap.Error(err))
+			} else if replicaNum > 0 {
+				log.Info("get database level load info", zap.Int64("collectionID", collectionID), zap.Int64("replica_num", replicaNum))
+			}
+		}
+
+		if len(rgs) == 0 {
+			rgs, err = common.DatabaseLevelResourceGroups(dbInfo.GetProperties())
+			if err != nil {
+				log.Debug("failed to get database level load info", zap.Int64("collectionID", collectionID), zap.Error(err))
+			} else if len(rgs) > 0 {
+				log.Info("get database level load info", zap.Int64("collectionID", collectionID), zap.Strings("resource_groups", rgs))
+			}
+		}
+	}
+
+	if replicaNum <= 0 || len(rgs) == 0 {
+		if replicaNum <= 0 {
+			replicaNum = paramtable.Get().QueryCoordCfg.ClusterLevelLoadReplicaNumber.GetAsInt64()
+			if replicaNum > 0 {
+				log.Info("get cluster level load info", zap.Int64("collectionID", collectionID), zap.Int64("replica_num", replicaNum))
+			}
+		}
+
+		if len(rgs) == 0 {
+			rgs = paramtable.Get().QueryCoordCfg.ClusterLevelLoadResourceGroups.GetAsStrings()
+			if len(rgs) > 0 {
+				log.Info("get cluster level load info", zap.Int64("collectionID", collectionID), zap.Strings("resource_groups", rgs))
+			}
+		}
 	}
 
 	return rgs, replicaNum, nil
@@ -140,7 +179,7 @@ func (broker *CoordinatorBroker) GetPartitions(ctx context.Context, collectionID
 		// please do not specify the collection name alone after database feature.
 		CollectionID: collectionID,
 	}
-	resp, err := broker.rootCoord.ShowPartitions(ctx, req)
+	resp, err := broker.mixCoord.ShowPartitions(ctx, req)
 	if err := merr.CheckRPCCall(resp, err); err != nil {
 		log.Warn("failed to get partitions", zap.Error(err))
 		return nil, err
@@ -164,7 +203,7 @@ func (broker *CoordinatorBroker) GetRecoveryInfo(ctx context.Context, collection
 		CollectionID: collectionID,
 		PartitionID:  partitionID,
 	}
-	recoveryInfo, err := broker.dataCoord.GetRecoveryInfo(ctx, getRecoveryInfoRequest)
+	recoveryInfo, err := broker.mixCoord.GetRecoveryInfo(ctx, getRecoveryInfoRequest)
 	if err := merr.CheckRPCCall(recoveryInfo, err); err != nil {
 		log.Warn("get recovery info failed", zap.Error(err))
 		return nil, nil, err
@@ -204,7 +243,7 @@ func (broker *CoordinatorBroker) GetRecoveryInfoV2(ctx context.Context, collecti
 		CollectionID: collectionID,
 		PartitionIDs: partitionIDs,
 	}
-	recoveryInfo, err := broker.dataCoord.GetRecoveryInfoV2(ctx, getRecoveryInfoRequest)
+	recoveryInfo, err := broker.mixCoord.GetRecoveryInfoV2(ctx, getRecoveryInfoRequest)
 
 	if err := merr.CheckRPCCall(recoveryInfo, err); err != nil {
 		log.Warn("get recovery info failed", zap.Error(err))
@@ -214,44 +253,63 @@ func (broker *CoordinatorBroker) GetRecoveryInfoV2(ctx context.Context, collecti
 	return recoveryInfo.Channels, recoveryInfo.Segments, nil
 }
 
-func (broker *CoordinatorBroker) GetSegmentInfo(ctx context.Context, ids ...UniqueID) (*datapb.GetSegmentInfoResponse, error) {
+func (broker *CoordinatorBroker) GetSegmentInfo(ctx context.Context, ids ...UniqueID) ([]*datapb.SegmentInfo, error) {
 	ctx, cancel := context.WithTimeout(ctx, paramtable.Get().QueryCoordCfg.BrokerTimeout.GetAsDuration(time.Millisecond))
 	defer cancel()
+
 	log := log.Ctx(ctx).With(
 		zap.Int64s("segments", ids),
 	)
 
-	req := &datapb.GetSegmentInfoRequest{
-		SegmentIDs:       ids,
-		IncludeUnHealthy: true,
-	}
-	resp, err := broker.dataCoord.GetSegmentInfo(ctx, req)
-	if err := merr.CheckRPCCall(resp, err); err != nil {
-		log.Warn("failed to get segment info from DataCoord", zap.Error(err))
-		return nil, err
+	getSegmentInfo := func(ids []UniqueID) (*datapb.GetSegmentInfoResponse, error) {
+		req := &datapb.GetSegmentInfoRequest{
+			SegmentIDs:       ids,
+			IncludeUnHealthy: true,
+		}
+		resp, err := broker.mixCoord.GetSegmentInfo(ctx, req)
+		if err := merr.CheckRPCCall(resp, err); err != nil {
+			log.Warn("failed to get segment info from DataCoord", zap.Error(err))
+			return nil, err
+		}
+
+		if len(resp.Infos) == 0 {
+			log.Warn("No such segment in DataCoord")
+			return nil, errors.New("no such segment in DataCoord")
+		}
+
+		err = binlog.DecompressMultiBinLogs(resp.GetInfos())
+		if err != nil {
+			log.Warn("failed to DecompressMultiBinLogs", zap.Error(err))
+			return nil, err
+		}
+
+		return resp, nil
 	}
 
-	if len(resp.Infos) == 0 {
-		log.Warn("No such segment in DataCoord")
-		return nil, fmt.Errorf("no such segment in DataCoord")
+	ret := make([]*datapb.SegmentInfo, 0, len(ids))
+	batchSize := 1000
+	startIdx := 0
+	for startIdx < len(ids) {
+		endIdx := int(math.Min(float64(startIdx+batchSize), float64(len(ids))))
+
+		resp, err := getSegmentInfo(ids[startIdx:endIdx])
+		if err != nil {
+			return nil, err
+		}
+		ret = append(ret, resp.GetInfos()...)
+		startIdx += batchSize
 	}
 
-	err = binlog.DecompressMultiBinLogs(resp.GetInfos())
-	if err != nil {
-		log.Warn("failed to DecompressMultiBinLogs", zap.Error(err))
-		return nil, err
-	}
-
-	return resp, nil
+	return ret, nil
 }
 
-func (broker *CoordinatorBroker) GetIndexInfo(ctx context.Context, collectionID UniqueID, segmentID UniqueID) ([]*querypb.FieldIndexInfo, error) {
+func (broker *CoordinatorBroker) GetIndexInfo(ctx context.Context, collectionID UniqueID, segmentIDs ...UniqueID) (map[int64][]*querypb.FieldIndexInfo, error) {
 	ctx, cancel := context.WithTimeout(ctx, paramtable.Get().QueryCoordCfg.BrokerTimeout.GetAsDuration(time.Millisecond))
 	defer cancel()
 
 	log := log.Ctx(ctx).With(
 		zap.Int64("collectionID", collectionID),
-		zap.Int64("segmentID", segmentID),
+		zap.Int64s("segmentIDs", segmentIDs),
 	)
 
 	// during rolling upgrade, query coord may connect to datacoord with version 2.2, which will return merr.ErrServiceUnimplemented
@@ -259,9 +317,9 @@ func (broker *CoordinatorBroker) GetIndexInfo(ctx context.Context, collectionID 
 	var resp *indexpb.GetIndexInfoResponse
 	var err error
 	retry.Do(ctx, func() error {
-		resp, err = broker.dataCoord.GetIndexInfos(ctx, &indexpb.GetIndexInfoRequest{
+		resp, err = broker.mixCoord.GetIndexInfos(ctx, &indexpb.GetIndexInfoRequest{
 			CollectionID: collectionID,
-			SegmentIDs:   []int64{segmentID},
+			SegmentIDs:   segmentIDs,
 		})
 
 		if errors.Is(err, merr.ErrServiceUnimplemented) {
@@ -276,32 +334,30 @@ func (broker *CoordinatorBroker) GetIndexInfo(ctx context.Context, collectionID 
 	}
 
 	if resp.GetSegmentInfo() == nil {
-		err = merr.WrapErrIndexNotFoundForSegment(segmentID)
-		log.Warn("failed to get segment index info",
+		err = merr.WrapErrIndexNotFoundForSegments(segmentIDs)
+		log.Warn("failed to get segments index info",
 			zap.Error(err))
 		return nil, err
 	}
 
-	segmentInfo, ok := resp.GetSegmentInfo()[segmentID]
-	if !ok || len(segmentInfo.GetIndexInfos()) == 0 {
-		return nil, merr.WrapErrIndexNotFoundForSegment(segmentID)
-	}
-
-	indexes := make([]*querypb.FieldIndexInfo, 0)
-	for _, info := range segmentInfo.GetIndexInfos() {
-		indexes = append(indexes, &querypb.FieldIndexInfo{
-			FieldID:             info.GetFieldID(),
-			EnableIndex:         true, // deprecated, but keep it for compatibility
-			IndexName:           info.GetIndexName(),
-			IndexID:             info.GetIndexID(),
-			BuildID:             info.GetBuildID(),
-			IndexParams:         info.GetIndexParams(),
-			IndexFilePaths:      info.GetIndexFilePaths(),
-			IndexSize:           int64(info.GetSerializedSize()),
-			IndexVersion:        info.GetIndexVersion(),
-			NumRows:             info.GetNumRows(),
-			CurrentIndexVersion: info.GetCurrentIndexVersion(),
-		})
+	indexes := make(map[int64][]*querypb.FieldIndexInfo, 0)
+	for segmentID, segmentInfo := range resp.GetSegmentInfo() {
+		indexes[segmentID] = make([]*querypb.FieldIndexInfo, 0)
+		for _, info := range segmentInfo.GetIndexInfos() {
+			indexes[segmentID] = append(indexes[segmentID], &querypb.FieldIndexInfo{
+				FieldID:             info.GetFieldID(),
+				EnableIndex:         true, // deprecated, but keep it for compatibility
+				IndexName:           info.GetIndexName(),
+				IndexID:             info.GetIndexID(),
+				BuildID:             info.GetBuildID(),
+				IndexParams:         info.GetIndexParams(),
+				IndexFilePaths:      info.GetIndexFilePaths(),
+				IndexSize:           int64(info.GetMemSize()),
+				IndexVersion:        info.GetIndexVersion(),
+				NumRows:             info.GetNumRows(),
+				CurrentIndexVersion: info.GetCurrentIndexVersion(),
+			})
+		}
 	}
 
 	return indexes, nil
@@ -316,7 +372,7 @@ func (broker *CoordinatorBroker) describeIndex(ctx context.Context, collectionID
 	var resp *indexpb.DescribeIndexResponse
 	var err error
 	retry.Do(ctx, func() error {
-		resp, err = broker.dataCoord.DescribeIndex(ctx, &indexpb.DescribeIndexRequest{
+		resp, err = broker.mixCoord.DescribeIndex(ctx, &indexpb.DescribeIndexRequest{
 			CollectionID: collectionID,
 		})
 		if errors.Is(err, merr.ErrServiceUnimplemented) {
@@ -339,7 +395,7 @@ func (broker *CoordinatorBroker) ListIndexes(ctx context.Context, collectionID U
 	ctx, cancel := context.WithTimeout(ctx, paramtable.Get().QueryCoordCfg.BrokerTimeout.GetAsDuration(time.Millisecond))
 	defer cancel()
 
-	resp, err := broker.dataCoord.ListIndexes(ctx, &indexpb.ListIndexesRequest{
+	resp, err := broker.mixCoord.ListIndexes(ctx, &indexpb.ListIndexesRequest{
 		CollectionID: collectionID,
 	})
 

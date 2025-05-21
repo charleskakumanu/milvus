@@ -25,7 +25,7 @@ import (
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	"github.com/milvus-io/milvus/internal/querycoordv2/session"
 	"github.com/milvus-io/milvus/internal/querycoordv2/task"
-	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/v2/log"
 )
 
 type Controller interface {
@@ -36,13 +36,14 @@ type Controller interface {
 }
 
 type ControllerImpl struct {
-	mu          sync.RWMutex
-	handlers    map[int64]*distHandler
-	client      session.Cluster
-	nodeManager *session.NodeManager
-	dist        *meta.DistributionManager
-	targetMgr   *meta.TargetManager
-	scheduler   task.Scheduler
+	mu                  sync.RWMutex
+	handlers            map[int64]*distHandler
+	client              session.Cluster
+	nodeManager         *session.NodeManager
+	dist                *meta.DistributionManager
+	targetMgr           meta.TargetManagerInterface
+	scheduler           task.Scheduler
+	syncTargetVersionFn TriggerUpdateTargetVersion
 }
 
 func (dc *ControllerImpl) StartDistInstance(ctx context.Context, nodeID int64) {
@@ -52,7 +53,7 @@ func (dc *ControllerImpl) StartDistInstance(ctx context.Context, nodeID int64) {
 		log.Info("node has started", zap.Int64("nodeID", nodeID))
 		return
 	}
-	h := newDistHandler(ctx, nodeID, dc.client, dc.nodeManager, dc.scheduler, dc.dist, dc.targetMgr)
+	h := newDistHandler(ctx, nodeID, dc.client, dc.nodeManager, dc.scheduler, dc.dist, dc.targetMgr, dc.syncTargetVersionFn)
 	dc.handlers[nodeID] = h
 }
 
@@ -78,7 +79,7 @@ func (dc *ControllerImpl) SyncAll(ctx context.Context) {
 			if err != nil {
 				log.Warn("SyncAll come across err when getting data distribution", zap.Error(err))
 			} else {
-				handler.handleDistResp(resp, true)
+				handler.handleDistResp(ctx, resp, true)
 			}
 		}(h)
 	}
@@ -98,15 +99,17 @@ func NewDistController(
 	client session.Cluster,
 	nodeManager *session.NodeManager,
 	dist *meta.DistributionManager,
-	targetMgr *meta.TargetManager,
+	targetMgr meta.TargetManagerInterface,
 	scheduler task.Scheduler,
+	syncTargetVersionFn TriggerUpdateTargetVersion,
 ) *ControllerImpl {
 	return &ControllerImpl{
-		handlers:    make(map[int64]*distHandler),
-		client:      client,
-		nodeManager: nodeManager,
-		dist:        dist,
-		targetMgr:   targetMgr,
-		scheduler:   scheduler,
+		handlers:            make(map[int64]*distHandler),
+		client:              client,
+		nodeManager:         nodeManager,
+		dist:                dist,
+		targetMgr:           targetMgr,
+		scheduler:           scheduler,
+		syncTargetVersionFn: syncTargetVersionFn,
 	}
 }

@@ -41,9 +41,8 @@ if (USE_OPENDAL)
 endif()
 add_subdirectory(tantivy)
 
-add_subdirectory(milvus-storage)
-
 if (LINUX)
     add_subdirectory(jemalloc)
 endif()
 
+add_subdirectory(milvus-storage)

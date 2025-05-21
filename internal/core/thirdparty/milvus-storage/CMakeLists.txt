@@ -11,38 +11,41 @@
 # or implied. See the License for the specific language governing permissions and limitations under the License.
 #-------------------------------------------------------------------------------
 
-set( MILVUS_STORAGE_VERSION 9d1ad9c)
+# Update milvus-storage_VERSION for the first occurrence
+milvus_add_pkg_config("milvus-storage")
+set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY INCLUDE_DIRECTORIES "")
+set( milvus-storage_VERSION 1238e21 )
+set( GIT_REPOSITORY  "https://github.com/milvus-io/milvus-storage.git")
+message(STATUS "milvus-storage repo: ${GIT_REPOSITORY}")
+message(STATUS "milvus-storage version: ${milvus-storage_VERSION}")
 
-message(STATUS "Building milvus-storage-${MILVUS_STORAGE_VERSION} from source")
+message(STATUS "Building milvus-storage-${milvus-storage_SOURCE_VER} from source")
 message(STATUS ${CMAKE_BUILD_TYPE})
 
-# message(FATAL_ERROR ${CMAKE_CURRENT_SOURCE_DIR}/milvus-storage.patch)
-# set(milvus-storage-patch git apply --ignore-whitespace ${CMAKE_CURRENT_SOURCE_DIR}/milvus-storage.patch)
+if ( ENABLE_AZURE_FS STREQUAL "ON" )
+    set(WITH_AZURE_FS ON CACHE BOOL "" FORCE )
+else ()
+    set(WITH_AZURE_FS OFF CACHE BOOL "" FORCE )
+endif ()
+
 set( CMAKE_PREFIX_PATH ${CONAN_BOOST_ROOT} )
 FetchContent_Declare(
         milvus-storage
-        GIT_REPOSITORY  "https://github.com/milvus-io/milvus-storage.git"
-        GIT_TAG         ${MILVUS_STORAGE_VERSION}
+        GIT_REPOSITORY  ${GIT_REPOSITORY}
+        GIT_TAG         ${milvus-storage_VERSION}
         SOURCE_DIR      ${CMAKE_CURRENT_BINARY_DIR}/milvus-storage-src
         BINARY_DIR      ${CMAKE_CURRENT_BINARY_DIR}/milvus-storage-build
         SOURCE_SUBDIR   cpp
-        PATCH_COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_CURRENT_SOURCE_DIR}/milvus-storage_CMakeLists.txt <SOURCE_DIR>/cpp/CMakeLists.txt
         DOWNLOAD_DIR    ${THIRDPARTY_DOWNLOAD_PATH} )
 
-FetchContent_MakeAvailable(milvus-storage)
-# target_compile_features(milvus-storage PUBLIC cxx_std_20)
+FetchContent_GetProperties( milvus-storage )
+if ( NOT milvus-storage_POPULATED )
+    FetchContent_Populate( milvus-storage )
 
-# FetchContent_GetProperties( milvus-storage )
-# if ( NOT milvus-storage_POPULATED )
-#     FetchContent_Populate( milvus-storage)
+    # Adding the following target:
+    # milvus-storage
+    add_subdirectory( ${milvus-storage_SOURCE_DIR}/cpp
+                      ${milvus-storage_BINARY_DIR} )
+endif()
 
-#     # Adding the following target:
-#     add_subdirectory( ${milvus-storage_SOURCE_DIR}/cpp
-#                       ${milvus-storage_BINARY_DIR} )
-# endif()
-
-# message(FATAL_ERROR ${milvus-storage_SOURCE_DIR}  ${milvus-storage_BINARY_DIR})
-# get prometheus COMPILE_OPTIONS
-# get_property( var DIRECTORY "${milvus-storage_SOURCE_DIR}" PROPERTY COMPILE_OPTIONS )
-message( STATUS "milvus-storage src compile options: ${var}" )
-# unset(CMAKE_CXX_STANDARD)
+set( MILVUS_STORAGE_INCLUDE_DIR ${milvus-storage_SOURCE_DIR}/cpp/include CACHE INTERNAL "Path to milvus-storage include directory" )

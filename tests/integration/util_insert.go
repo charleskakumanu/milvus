@@ -22,7 +22,7 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/pkg/util/testutils"
+	"github.com/milvus-io/milvus/pkg/v2/util/testutils"
 )
 
 func (s *MiniClusterSuite) WaitForFlush(ctx context.Context, segIDs []int64, flushTs uint64, dbName, collectionName string) {
@@ -81,6 +81,24 @@ func NewInt64FieldDataWithStart(fieldName string, numRows int, start int64) *sch
 	}
 }
 
+func NewInt64FieldDataNullableWithStart(fieldName string, numRows, start int) *schemapb.FieldData {
+	validData, num := GenerateBoolArray(numRows)
+	return &schemapb.FieldData{
+		Type:      schemapb.DataType_Int64,
+		FieldName: fieldName,
+		Field: &schemapb.FieldData_Scalars{
+			Scalars: &schemapb.ScalarField{
+				Data: &schemapb.ScalarField_LongData{
+					LongData: &schemapb.LongArray{
+						Data: GenerateInt64Array(num, int64(start)),
+					},
+				},
+			},
+		},
+		ValidData: validData,
+	}
+}
+
 func NewInt64SameFieldData(fieldName string, numRows int, value int64) *schemapb.FieldData {
 	return &schemapb.FieldData{
 		Type:      schemapb.DataType_Int64,
@@ -113,6 +131,28 @@ func NewVarCharSameFieldData(fieldName string, numRows int, value string) *schem
 	}
 }
 
+func NewVarCharFieldData(fieldName string, numRows int, nullable bool) *schemapb.FieldData {
+	numValid := numRows
+	if nullable {
+		numValid = numRows / 2
+	}
+	return &schemapb.FieldData{
+		Type:      schemapb.DataType_String,
+		FieldName: fieldName,
+		Field: &schemapb.FieldData_Scalars{
+			Scalars: &schemapb.ScalarField{
+				Data: &schemapb.ScalarField_StringData{
+					StringData: &schemapb.StringArray{
+						Data: testutils.GenerateStringArray(numValid),
+						// Data: testutils.GenerateStringArray(numRows),
+					},
+				},
+			},
+		},
+		ValidData: testutils.GenerateBoolArray(numRows),
+	}
+}
+
 func NewStringFieldData(fieldName string, numRows int) *schemapb.FieldData {
 	return testutils.NewStringFieldData(fieldName, numRows)
 }
@@ -137,6 +177,10 @@ func NewSparseFloatVectorFieldData(fieldName string, numRows int) *schemapb.Fiel
 	return testutils.NewSparseFloatVectorFieldData(fieldName, numRows)
 }
 
+func NewInt8VectorFieldData(fieldName string, numRows, dim int) *schemapb.FieldData {
+	return testutils.NewInt8VectorFieldData(fieldName, numRows, dim)
+}
+
 func GenerateInt64Array(numRows int, start int64) []int64 {
 	ret := make([]int64, numRows)
 	for i := 0; i < numRows; i++ {
@@ -151,6 +195,18 @@ func GenerateSameInt64Array(numRows int, value int64) []int64 {
 		ret[i] = value
 	}
 	return ret
+}
+
+func GenerateBoolArray(numRows int) ([]bool, int) {
+	var num int
+	ret := make([]bool, numRows)
+	for i := 0; i < numRows; i++ {
+		ret[i] = i%2 == 0
+		if ret[i] {
+			num++
+		}
+	}
+	return ret, num
 }
 
 func GenerateSameStringArray(numRows int, value string) []string {

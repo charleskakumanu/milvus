@@ -20,20 +20,23 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"strings"
 	"time"
 
+	"github.com/samber/lo"
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus/internal/proxy/connection"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/requestutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/requestutil"
 )
 
 type GrpcAccessInfo struct {
@@ -161,12 +164,17 @@ type SizeResponse interface {
 }
 
 func (i *GrpcAccessInfo) ResponseSize() string {
-	message, ok := i.resp.(SizeResponse)
-	if !ok {
+	var size int
+	switch r := i.resp.(type) {
+	case SizeResponse:
+		size = r.XXX_Size()
+	case proto.Message:
+		size = proto.Size(r)
+	default:
 		return Unknown
 	}
 
-	return fmt.Sprint(message.XXX_Size())
+	return fmt.Sprint(size)
 }
 
 type BaseResponse interface {
@@ -181,22 +189,44 @@ func (i *GrpcAccessInfo) ErrorCode() string {
 	return fmt.Sprint(merr.Code(i.err))
 }
 
-func (i *GrpcAccessInfo) ErrorMsg() string {
-	if i.err != nil {
-		return i.err.Error()
-	}
-
+func (i *GrpcAccessInfo) respStatus() *commonpb.Status {
 	baseResp, ok := i.resp.(BaseResponse)
 	if ok {
-		status := baseResp.GetStatus()
-		return status.GetReason()
+		return baseResp.GetStatus()
 	}
 
 	status, ok := i.resp.(*commonpb.Status)
 	if ok {
-		return status.GetReason()
+		return status
 	}
+	return nil
+}
+
+func (i *GrpcAccessInfo) ErrorMsg() string {
+	if i.err != nil {
+		return strings.ReplaceAll(i.err.Error(), "\n", "\\n")
+	}
+
+	if status := i.respStatus(); status != nil {
+		return strings.ReplaceAll(status.GetReason(), "\n", "\\n")
+	}
+
 	return Unknown
+}
+
+func (i *GrpcAccessInfo) ErrorType() string {
+	if i.err != nil {
+		return merr.GetErrorType(i.err).String()
+	}
+
+	if status := i.respStatus(); status.GetCode() > 0 {
+		if _, ok := status.ExtraInfo[merr.InputErrorFlagKey]; ok {
+			return merr.InputError.String()
+		}
+		return merr.SystemError.String()
+	}
+
+	return ""
 }
 
 func (i *GrpcAccessInfo) DbName() string {
@@ -235,6 +265,10 @@ func (i *GrpcAccessInfo) Expression() string {
 		return expr.(string)
 	}
 
+	if req, ok := i.req.(*milvuspb.HybridSearchRequest); ok {
+		return listToString(lo.Map(req.GetRequests(), func(req *milvuspb.SearchRequest, _ int) string { return req.GetDsl() }))
+	}
+
 	dsl, ok := requestutil.GetDSLFromRequest(i.req)
 	if ok {
 		return dsl.(string)
@@ -267,6 +301,47 @@ func (i *GrpcAccessInfo) ConsistencyLevel() string {
 	level, ok := requestutil.GetConsistencyLevelFromRequst(i.req)
 	if ok {
 		return level.String()
+	}
+	return Unknown
+}
+
+func (i *GrpcAccessInfo) AnnsField() string {
+	if req, ok := i.req.(*milvuspb.SearchRequest); ok {
+		return getAnnsFieldFromKvs(req.GetSearchParams())
+	}
+
+	if req, ok := i.req.(*milvuspb.HybridSearchRequest); ok {
+		fields := lo.Map(req.GetRequests(), func(req *milvuspb.SearchRequest, _ int) string { return getAnnsFieldFromKvs(req.GetSearchParams()) })
+		return listToString(fields)
+	}
+	return Unknown
+}
+
+func (i *GrpcAccessInfo) NQ() string {
+	if req, ok := i.req.(*milvuspb.SearchRequest); ok {
+		return fmt.Sprint(req.GetNq())
+	}
+
+	if req, ok := i.req.(*milvuspb.HybridSearchRequest); ok {
+		return listToString(lo.Map(req.GetRequests(), func(req *milvuspb.SearchRequest, _ int) string { return fmt.Sprint(req.GetNq()) }))
+	}
+	return Unknown
+}
+
+func (i *GrpcAccessInfo) SearchParams() string {
+	if req, ok := i.req.(*milvuspb.SearchRequest); ok {
+		return kvsToString(req.GetSearchParams())
+	}
+
+	if req, ok := i.req.(*milvuspb.HybridSearchRequest); ok {
+		return listToString(lo.Map(req.GetRequests(), func(req *milvuspb.SearchRequest, _ int) string { return kvsToString(req.GetSearchParams()) }))
+	}
+	return Unknown
+}
+
+func (i *GrpcAccessInfo) QueryParams() string {
+	if req, ok := i.req.(*milvuspb.QueryRequest); ok {
+		return kvsToString(req.GetQueryParams())
 	}
 	return Unknown
 }

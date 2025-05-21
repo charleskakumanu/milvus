@@ -20,19 +20,21 @@ import (
 	"context"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
-	"github.com/milvus-io/milvus/internal/proto/segcorepb"
 	"github.com/milvus-io/milvus/internal/storage"
-	"github.com/milvus-io/milvus/pkg/util/metautil"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/internal/util/segcore"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/segcorepb"
+	"github.com/milvus-io/milvus/pkg/v2/util/metautil"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 // ResourceUsage is used to estimate the resource usage of a sealed segment.
 type ResourceUsage struct {
-	MemorySize     uint64
-	DiskSize       uint64
-	MmapFieldCount int
+	MemorySize         uint64
+	DiskSize           uint64
+	MmapFieldCount     int
+	FieldGpuMemorySize []uint64
 }
 
 // Segment is the interface of a segment implementation.
@@ -53,6 +55,7 @@ type Segment interface {
 	StartPosition() *msgpb.MsgPosition
 	Type() SegmentType
 	Level() datapb.SegmentLevel
+	IsSorted() bool
 	LoadInfo() *querypb.SegmentLoadInfo
 	// PinIfNotReleased the segment to prevent it from being released
 	PinIfNotReleased() error
@@ -69,16 +72,18 @@ type Segment interface {
 	ResourceUsageEstimate() ResourceUsage
 
 	// Index related
-	GetIndex(fieldID int64) *IndexedFieldInfo
+	GetIndexByID(indexID int64) *IndexedFieldInfo
+	GetIndex(fieldID int64) []*IndexedFieldInfo
 	ExistIndex(fieldID int64) bool
 	Indexes() []*IndexedFieldInfo
 	HasRawData(fieldID int64) bool
 
 	// Modification related
 	Insert(ctx context.Context, rowIDs []int64, timestamps []typeutil.Timestamp, record *segcorepb.InsertRecord) error
-	Delete(ctx context.Context, primaryKeys []storage.PrimaryKey, timestamps []typeutil.Timestamp) error
-	LoadDeltaData(ctx context.Context, deltaData *storage.DeleteData) error
+	Delete(ctx context.Context, primaryKeys storage.PrimaryKeys, timestamps []typeutil.Timestamp) error
+	LoadDeltaData(ctx context.Context, deltaData *storage.DeltaData) error
 	LastDeltaTimestamp() uint64
+	FinishLoad() error
 	Release(ctx context.Context, opts ...releaseOption)
 
 	// Bloom filter related
@@ -86,14 +91,20 @@ type Segment interface {
 	MayPkExist(lc *storage.LocationsCache) bool
 	BatchPkExist(lc *storage.BatchLocationsCache) []bool
 
+	// BM25 stats
+	UpdateBM25Stats(stats map[int64]*storage.BM25Stats)
+	GetBM25Stats() map[int64]*storage.BM25Stats
+
 	// Read operations
-	Search(ctx context.Context, searchReq *SearchRequest) (*SearchResult, error)
-	Retrieve(ctx context.Context, plan *RetrievePlan) (*segcorepb.RetrieveResults, error)
-	RetrieveByOffsets(ctx context.Context, plan *RetrievePlan, offsets []int64) (*segcorepb.RetrieveResults, error)
+	Search(ctx context.Context, searchReq *segcore.SearchRequest) (*segcore.SearchResult, error)
+	Retrieve(ctx context.Context, plan *segcore.RetrievePlan) (*segcorepb.RetrieveResults, error)
+	RetrieveByOffsets(ctx context.Context, plan *segcore.RetrievePlanWithOffsets) (*segcorepb.RetrieveResults, error)
 	IsLazyLoad() bool
 	ResetIndexesLazyLoad(lazyState bool)
 
 	// lazy load related
 	NeedUpdatedVersion() int64
 	RemoveUnusedFieldFiles() error
+
+	GetFieldJSONIndexStats() []int64
 }

@@ -17,16 +17,16 @@
 package importv2
 
 import (
+	"sort"
 	"sync"
 	"time"
 
 	"github.com/samber/lo"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/conc"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/util/conc"
 )
 
 type Scheduler interface {
@@ -64,6 +64,9 @@ func (s *scheduler) Start() {
 			return
 		case <-exeTicker.C:
 			tasks := s.manager.GetBy(WithStates(datapb.ImportTaskStateV2_Pending))
+			sort.Slice(tasks, func(i, j int) bool {
+				return tasks[i].GetTaskID() < tasks[j].GetTaskID()
+			})
 			futures := make(map[int64][]*conc.Future[any])
 			for _, task := range tasks {
 				fs := task.Execute()
@@ -84,9 +87,13 @@ func (s *scheduler) Start() {
 	}
 }
 
+// Slots returns the available slots for import
 func (s *scheduler) Slots() int64 {
 	tasks := s.manager.GetBy(WithStates(datapb.ImportTaskStateV2_Pending, datapb.ImportTaskStateV2_InProgress))
-	return paramtable.Get().DataNodeCfg.MaxConcurrentImportTaskNum.GetAsInt64() - int64(len(tasks))
+	used := lo.SumBy(tasks, func(t Task) int64 {
+		return t.GetSlots()
+	})
+	return used
 }
 
 func (s *scheduler) Close() {

@@ -17,20 +17,25 @@
 package storage
 
 import (
-	"encoding/json"
-	"fmt"
+	"bytes"
+	"encoding/binary"
+	"maps"
+	"math"
 
+	"github.com/cockroachdb/errors"
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/json"
 	"github.com/milvus-io/milvus/internal/util/bloomfilter"
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
-// PrimaryKeyStats contains statistics data for pk column
+// PrimaryKeyStats contains rowsWithToken data for pk column
 type PrimaryKeyStats struct {
 	FieldID int64                            `json:"fieldID"`
 	Max     int64                            `json:"max"` // useless, will delete
@@ -95,7 +100,7 @@ func (stats *PrimaryKeyStats) UnmarshalJSON(data []byte) error {
 		stats.MaxPk = &VarCharPrimaryKey{}
 		stats.MinPk = &VarCharPrimaryKey{}
 	default:
-		return fmt.Errorf("Invalid PK Data Type")
+		return errors.New("Invalid PK Data Type")
 	}
 
 	if maxPkMessage, ok := messageMap["maxPk"]; ok && maxPkMessage != nil {
@@ -199,7 +204,7 @@ func (stats *PrimaryKeyStats) UpdateMinMax(pk PrimaryKey) {
 
 func NewPrimaryKeyStats(fieldID, pkType, rowNum int64) (*PrimaryKeyStats, error) {
 	if rowNum <= 0 {
-		return nil, merr.WrapErrParameterInvalidMsg("zero or negative row num", rowNum)
+		return nil, merr.WrapErrParameterInvalidMsg("zero or negative row num %d", rowNum)
 	}
 
 	bfType := paramtable.Get().CommonCfg.BloomFilterType.GetValue()
@@ -297,6 +302,178 @@ func (sr *StatsReader) GetPrimaryKeyStatsList() ([]*PrimaryKeyStats, error) {
 	}
 
 	return stats, nil
+}
+
+type BM25Stats struct {
+	rowsWithToken map[uint32]int32 // mapping token => row num include token
+	numRow        int64            // total row num
+	numToken      int64            // total token num
+}
+
+const BM25VERSION int32 = 0
+
+func NewBM25Stats() *BM25Stats {
+	return &BM25Stats{
+		rowsWithToken: map[uint32]int32{},
+	}
+}
+
+func NewBM25StatsWithBytes(bytes []byte) (*BM25Stats, error) {
+	stats := NewBM25Stats()
+	err := stats.Deserialize(bytes)
+	if err != nil {
+		return nil, err
+	}
+	return stats, nil
+}
+
+func (m *BM25Stats) Append(rows ...map[uint32]float32) {
+	for _, row := range rows {
+		for key, value := range row {
+			m.rowsWithToken[key] += 1
+			m.numToken += int64(value)
+		}
+
+		m.numRow += 1
+	}
+}
+
+func (m *BM25Stats) AppendFieldData(datas ...*SparseFloatVectorFieldData) {
+	for _, data := range datas {
+		m.AppendBytes(data.GetContents()...)
+	}
+}
+
+// Update BM25Stats by sparse vector bytes
+func (m *BM25Stats) AppendBytes(datas ...[]byte) {
+	for _, data := range datas {
+		dim := typeutil.SparseFloatRowElementCount(data)
+		for i := 0; i < dim; i++ {
+			index := typeutil.SparseFloatRowIndexAt(data, i)
+			value := typeutil.SparseFloatRowValueAt(data, i)
+			m.rowsWithToken[index] += 1
+			m.numToken += int64(value)
+		}
+		m.numRow += 1
+	}
+}
+
+func (m *BM25Stats) NumRow() int64 {
+	return m.numRow
+}
+
+func (m *BM25Stats) NumToken() int64 {
+	return m.numToken
+}
+
+func (m *BM25Stats) Merge(meta *BM25Stats) {
+	for key, value := range meta.rowsWithToken {
+		m.rowsWithToken[key] += value
+	}
+	m.numRow += meta.NumRow()
+	m.numToken += meta.numToken
+}
+
+func (m *BM25Stats) Minus(meta *BM25Stats) {
+	for key, value := range meta.rowsWithToken {
+		m.rowsWithToken[key] -= value
+	}
+	m.numRow -= meta.numRow
+	m.numToken -= meta.numToken
+}
+
+func (m *BM25Stats) Clone() *BM25Stats {
+	return &BM25Stats{
+		rowsWithToken: maps.Clone(m.rowsWithToken),
+		numRow:        m.numRow,
+		numToken:      m.numToken,
+	}
+}
+
+func (m *BM25Stats) Serialize() ([]byte, error) {
+	buffer := bytes.NewBuffer(make([]byte, 0, len(m.rowsWithToken)*8+20))
+
+	if err := binary.Write(buffer, common.Endian, BM25VERSION); err != nil {
+		return nil, err
+	}
+
+	if err := binary.Write(buffer, common.Endian, m.numRow); err != nil {
+		return nil, err
+	}
+
+	if err := binary.Write(buffer, common.Endian, m.numToken); err != nil {
+		return nil, err
+	}
+
+	for key, value := range m.rowsWithToken {
+		if err := binary.Write(buffer, common.Endian, key); err != nil {
+			return nil, err
+		}
+
+		if err := binary.Write(buffer, common.Endian, value); err != nil {
+			return nil, err
+		}
+	}
+
+	// TODO ADD Serialize Time Metric
+	return buffer.Bytes(), nil
+}
+
+func (m *BM25Stats) Deserialize(bs []byte) error {
+	buffer := bytes.NewBuffer(bs)
+	dim := (len(bs) - 20) / 8
+	var numRow, tokenNum int64
+	var version int32
+	if err := binary.Read(buffer, common.Endian, &version); err != nil {
+		return err
+	}
+
+	if err := binary.Read(buffer, common.Endian, &numRow); err != nil {
+		return err
+	}
+
+	if err := binary.Read(buffer, common.Endian, &tokenNum); err != nil {
+		return err
+	}
+
+	var keys []uint32 = make([]uint32, dim)
+	var values []int32 = make([]int32, dim)
+	for i := 0; i < dim; i++ {
+		if err := binary.Read(buffer, common.Endian, &keys[i]); err != nil {
+			return err
+		}
+
+		if err := binary.Read(buffer, common.Endian, &values[i]); err != nil {
+			return err
+		}
+	}
+
+	m.numRow += numRow
+	m.numToken += tokenNum
+	for i := 0; i < dim; i++ {
+		m.rowsWithToken[keys[i]] += values[i]
+	}
+
+	return nil
+}
+
+func (m *BM25Stats) BuildIDF(tf []byte) (idf []byte) {
+	numElements := typeutil.SparseFloatRowElementCount(tf)
+	idf = make([]byte, len(tf))
+	for idx := 0; idx < numElements; idx++ {
+		key := typeutil.SparseFloatRowIndexAt(tf, idx)
+		value := typeutil.SparseFloatRowValueAt(tf, idx)
+		nq := m.rowsWithToken[key]
+		typeutil.SparseFloatRowSetAt(idf, idx, key, value*float32(math.Log(1+(float64(m.numRow)-float64(nq)+0.5)/(float64(nq)+0.5))))
+	}
+	return
+}
+
+func (m *BM25Stats) GetAvgdl() float64 {
+	if m.numRow == 0 || m.numToken == 0 {
+		return 0
+	}
+	return float64(m.numToken) / float64(m.numRow)
 }
 
 // DeserializeStats deserialize @blobs as []*PrimaryKeyStats

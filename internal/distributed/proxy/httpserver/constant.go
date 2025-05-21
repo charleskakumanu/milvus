@@ -1,22 +1,41 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package httpserver
 
 import (
-	"time"
-
-	"github.com/milvus-io/milvus/pkg/util/metric"
+	"github.com/milvus-io/milvus/pkg/v2/util/metric"
 )
 
 // v2
 const (
 	// --- category ---
-	CollectionCategory = "/collections/"
-	EntityCategory     = "/entities/"
-	PartitionCategory  = "/partitions/"
-	UserCategory       = "/users/"
-	RoleCategory       = "/roles/"
-	IndexCategory      = "/indexes/"
-	AliasCategory      = "/aliases/"
-	ImportJobCategory  = "/jobs/import/"
+	DataBaseCategory        = "/databases/"
+	CollectionCategory      = "/collections/"
+	EntityCategory          = "/entities/"
+	PartitionCategory       = "/partitions/"
+	UserCategory            = "/users/"
+	RoleCategory            = "/roles/"
+	IndexCategory           = "/indexes/"
+	AliasCategory           = "/aliases/"
+	ImportJobCategory       = "/jobs/import/"
+	PrivilegeGroupCategory  = "/privilege_groups/"
+	CollectionFieldCategory = "/collections/fields/"
+	ResourceGroupCategory   = "/resource_groups/"
+	SegmentCategory         = "/segments/"
 
 	ListAction           = "list"
 	HasAction            = "has"
@@ -27,6 +46,7 @@ const (
 	LoadStateAction      = "get_load_state"
 	RenameAction         = "rename"
 	LoadAction           = "load"
+	RefreshLoadAction    = "refresh_load"
 	ReleaseAction        = "release"
 	QueryAction          = "query"
 	GetAction            = "get"
@@ -37,18 +57,29 @@ const (
 	AdvancedSearchAction = "advanced_search"
 	HybridSearchAction   = "hybrid_search"
 
-	UpdatePasswordAction  = "update_password"
-	GrantRoleAction       = "grant_role"
-	RevokeRoleAction      = "revoke_role"
-	GrantPrivilegeAction  = "grant_privilege"
-	RevokePrivilegeAction = "revoke_privilege"
-	AlterAction           = "alter"
-	GetProgressAction     = "get_progress"
+	UpdatePasswordAction            = "update_password"
+	GrantRoleAction                 = "grant_role"
+	RevokeRoleAction                = "revoke_role"
+	GrantPrivilegeAction            = "grant_privilege"
+	RevokePrivilegeAction           = "revoke_privilege"
+	GrantPrivilegeActionV2          = "grant_privilege_v2"
+	RevokePrivilegeActionV2         = "revoke_privilege_v2"
+	AlterAction                     = "alter"
+	AlterPropertiesAction           = "alter_properties"
+	DropPropertiesAction            = "drop_properties"
+	CompactAction                   = "compact"
+	CompactionStateAction           = "get_compaction_state"
+	FlushAction                     = "flush"
+	GetProgressAction               = "get_progress" // deprecated, keep it for compatibility, use `/v2/vectordb/jobs/import/describe` instead
+	AddPrivilegesToGroupAction      = "add_privileges_to_group"
+	RemovePrivilegesFromGroupAction = "remove_privileges_from_group"
+	TransferReplicaAction           = "transfer_replica"
 )
 
 const (
 	ContextRequest                = "request"
 	ContextUsername               = "username"
+	ContextToken                  = "token"
 	VectorCollectionsPath         = "/vector/collections"
 	VectorCollectionsCreatePath   = "/vector/collections/create"
 	VectorCollectionsDescribePath = "/vector/collections/describe"
@@ -69,6 +100,8 @@ const (
 	HTTPCollectionName       = "collectionName"
 	HTTPCollectionID         = "collectionID"
 	HTTPDbName               = "dbName"
+	HTTPDbID                 = "dbID"
+	HTTPProperties           = "properties"
 	HTTPPartitionName        = "partitionName"
 	HTTPPartitionNames       = "partitionNames"
 	HTTPUserName             = "userName"
@@ -77,6 +110,7 @@ const (
 	HTTPIndexField           = "fieldName"
 	HTTPAliasName            = "aliasName"
 	HTTPRequestData          = "data"
+	HTTPRequestDefaultValue  = "defaultValue"
 	DefaultDbName            = "default"
 	DefaultIndexName         = "vector_idx"
 	DefaultAliasName         = "the_alias"
@@ -84,42 +118,62 @@ const (
 	HTTPHeaderAllowInt64     = "Accept-Type-Allow-Int64"
 	HTTPHeaderDBName         = "DB-Name"
 	HTTPHeaderRequestTimeout = "Request-Timeout"
-	HTTPDefaultTimeout       = 30 * time.Second
 	HTTPReturnCode           = "code"
 	HTTPReturnMessage        = "message"
 	HTTPReturnData           = "data"
 	HTTPReturnCost           = "cost"
+	HTTPReturnRecalls        = "recalls"
 	HTTPReturnLoadState      = "loadState"
 	HTTPReturnLoadProgress   = "loadProgress"
+	HTTPReturnTopks          = "topks"
 
 	HTTPReturnHas = "has"
 
-	HTTPReturnFieldName         = "name"
-	HTTPReturnFieldID           = "id"
-	HTTPReturnFieldType         = "type"
-	HTTPReturnFieldPrimaryKey   = "primaryKey"
-	HTTPReturnFieldPartitionKey = "partitionKey"
-	HTTPReturnFieldAutoID       = "autoId"
-	HTTPReturnFieldElementType  = "elementType"
-	HTTPReturnDescription       = "description"
+	HTTPReturnFieldName             = "name"
+	HTTPReturnFieldID               = "id"
+	HTTPReturnFieldType             = "type"
+	HTTPReturnFieldPrimaryKey       = "primaryKey"
+	HTTPReturnFieldPartitionKey     = "partitionKey"
+	HTTPReturnFieldClusteringKey    = "clusteringKey"
+	HTTPReturnFieldNullable         = "nullable"
+	HTTPReturnFieldDefaultValue     = "defaultValue"
+	HTTPReturnFieldAutoID           = "autoId"
+	HTTPReturnFieldElementType      = "elementType"
+	HTTPReturnDescription           = "description"
+	HTTPReturnFieldIsFunctionOutput = "isFunctionOutput"
 
-	HTTPReturnIndexMetricType  = "metricType"
-	HTTPReturnIndexType        = "indexType"
-	HTTPReturnIndexTotalRows   = "totalRows"
-	HTTPReturnIndexPendingRows = "pendingRows"
-	HTTPReturnIndexIndexedRows = "indexedRows"
-	HTTPReturnIndexState       = "indexState"
-	HTTPReturnIndexFailReason  = "failReason"
+	HTTPReturnFunctionName             = "name"
+	HTTPReturnFunctionID               = "id"
+	HTTPReturnFunctionType             = "type"
+	HTTPReturnFunctionInputFieldNames  = "inputFieldNames"
+	HTTPReturnFunctionOutputFieldNames = "outputFieldNames"
+	HTTPReturnFunctionParams           = "params"
+
+	HTTPReturnIndexMetricType      = "metricType"
+	HTTPReturnIndexType            = "indexType"
+	HTTPIndexOffsetCacheEnabledKey = "indexoffsetcache.enabled"
+	HTTPMmapEnabledKey             = "mmap.enabled"
+	HTTPReturnIndexTotalRows       = "totalRows"
+	HTTPReturnIndexPendingRows     = "pendingRows"
+	HTTPReturnIndexIndexedRows     = "indexedRows"
+	HTTPReturnIndexState           = "indexState"
+	HTTPReturnIndexFailReason      = "failReason"
+
+	HTTPReturnMinIndexVersion = "minIndexVersion"
+	HTTPReturnMaxIndexVersion = "maxIndexVersion"
 
 	HTTPReturnDistance = "distance"
 
 	HTTPReturnRowCount = "rowCount"
 
-	HTTPReturnObjectType = "objectType"
-	HTTPReturnObjectName = "objectName"
-	HTTPReturnPrivilege  = "privilege"
-	HTTPReturnGrantor    = "grantor"
-	HTTPReturnDbName     = "dbName"
+	HTTPReturnObjectType         = "objectType"
+	HTTPReturnObjectName         = "objectName"
+	HTTPReturnPrivilege          = "privilege"
+	HTTPReturnGrantor            = "grantor"
+	HTTPReturnDbName             = "dbName"
+	HTTPReturnPrivilegeGroupName = "privilegeGroupName"
+	HTTPReturnPrivileges         = "privileges"
+	HTTPReturnPrivilegeGroups    = "privilegeGroups"
 
 	DefaultMetricType       = metric.COSINE
 	DefaultPrimaryFieldName = "id"
@@ -129,13 +183,15 @@ const (
 )
 
 const (
-	ParamAnnsField    = "anns_field"
-	Params            = "params"
-	ParamRoundDecimal = "round_decimal"
-	ParamOffset       = "offset"
-	ParamLimit        = "limit"
-	ParamRadius       = "radius"
-	ParamRangeFilter  = "range_filter"
-	ParamGroupByField = "group_by_field"
-	BoundedTimestamp  = 2
+	ParamAnnsField       = "anns_field"
+	Params               = "params"
+	ParamRoundDecimal    = "round_decimal"
+	ParamOffset          = "offset"
+	ParamLimit           = "limit"
+	ParamRadius          = "radius"
+	ParamRangeFilter     = "range_filter"
+	ParamGroupByField    = "group_by_field"
+	ParamGroupSize       = "group_size"
+	ParamStrictGroupSize = "strict_group_size"
+	BoundedTimestamp     = 2
 )

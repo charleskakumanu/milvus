@@ -64,12 +64,17 @@ enum ErrorCode {
     MemAllocateFailed = 2034,
     MemAllocateSizeNotMatch = 2035,
     MmapError = 2036,
-    KnowhereError = 2100,
+    // timeout or cancel related
+    FollyOtherException = 2037,
+    FollyCancel = 2038,
+    OutOfRange = 2039,
+    GcpNativeError = 2040,
+    TextIndexNotFound = 2041,
+    InvalidParameter = 2042,
 
-    // timeout or cancel related.
-    FollyOtherException = 2200,
-    FollyCancel = 2201
+    KnowhereError = 2099
 };
+
 namespace impl {
 void
 EasyAssertInfo(bool value,
@@ -78,6 +83,9 @@ EasyAssertInfo(bool value,
                int lineno,
                std::string_view extra_info,
                ErrorCode error_code = ErrorCode::UnexpectedError);
+
+std::string
+EasyStackTrace();
 
 }  // namespace impl
 
@@ -129,7 +137,7 @@ FailureCStatus(const std::exception* ex) {
 
 #define AssertInfo(expr, info, args...)                              \
     do {                                                             \
-        auto _expr_res = bool(expr);                                 \
+        auto _expr_res = static_cast<bool>(expr);                    \
         /* call func only when needed */                             \
         if (!_expr_res) {                                            \
             milvus::impl::EasyAssertInfo(_expr_res,                  \

@@ -19,11 +19,11 @@
 package metrics
 
 /*
-#cgo pkg-config: milvus_segcore milvus_storage milvus_common
+#cgo pkg-config: milvus_core
 
 #include <stdlib.h>
 #include "segcore/metrics_c.h"
-#include "storage/storage_c.h"
+#include "monitor/monitor_c.h"
 
 */
 import "C"
@@ -40,7 +40,7 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/exp/maps"
 
-	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/v2/log"
 )
 
 // metricSorter is a sortable slice of *dto.Metric.
@@ -135,7 +135,7 @@ func (r *CRegistry) Gather() (res []*dto.MetricFamily, err error) {
 		return
 	}
 
-	cMetricsStr = C.GetStorageMetrics()
+	cMetricsStr = C.GetCoreMetrics()
 	metricsStr = C.GoString(cMetricsStr)
 	C.free(unsafe.Pointer(cMetricsStr))
 

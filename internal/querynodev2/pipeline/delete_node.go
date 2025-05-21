@@ -17,6 +17,7 @@
 package pipeline
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/samber/lo"
@@ -25,9 +26,9 @@ import (
 	"github.com/milvus-io/milvus/internal/querynodev2/delegator"
 	"github.com/milvus-io/milvus/internal/storage"
 	base "github.com/milvus-io/milvus/internal/util/pipeline"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/metrics"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/metrics"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 type deleteNode struct {
@@ -35,9 +36,8 @@ type deleteNode struct {
 	collectionID UniqueID
 	channel      string
 
-	manager      *DataManager
-	tSafeManager TSafeManager
-	delegator    delegator.ShardDelegator
+	manager   *DataManager
+	delegator delegator.ShardDelegator
 }
 
 // addDeleteData find the segment of delete column in DeleteMsg and save in deleteData
@@ -57,7 +57,7 @@ func (dNode *deleteNode) addDeleteData(deleteDatas map[UniqueID]*delegator.Delet
 	log.Info("pipeline fetch delete msg",
 		zap.Int64("collectionID", dNode.collectionID),
 		zap.Int64("partitionID", msg.PartitionID),
-		zap.Int("insertRowNum", len(pks)),
+		zap.Int("deleteRowNum", len(pks)),
 		zap.Uint64("timestampMin", msg.BeginTimestamp),
 		zap.Uint64("timestampMax", msg.EndTimestamp))
 }
@@ -66,30 +66,29 @@ func (dNode *deleteNode) Operate(in Msg) Msg {
 	metrics.QueryNodeWaitProcessingMsgCount.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.DeleteLabel).Dec()
 	nodeMsg := in.(*deleteNodeMsg)
 
-	// partition id = > DeleteData
-	deleteDatas := make(map[UniqueID]*delegator.DeleteData)
+	if len(nodeMsg.deleteMsgs) > 0 {
+		// partition id = > DeleteData
+		deleteDatas := make(map[UniqueID]*delegator.DeleteData)
 
-	for _, msg := range nodeMsg.deleteMsgs {
-		dNode.addDeleteData(deleteDatas, msg)
-	}
-
-	if len(deleteDatas) > 0 {
+		for _, msg := range nodeMsg.deleteMsgs {
+			dNode.addDeleteData(deleteDatas, msg)
+		}
 		// do Delete, use ts range max as ts
 		dNode.delegator.ProcessDelete(lo.Values(deleteDatas), nodeMsg.timeRange.timestampMax)
 	}
 
-	// update tSafe
-	err := dNode.tSafeManager.Set(dNode.channel, nodeMsg.timeRange.timestampMax)
-	if err != nil {
-		// should not happen, QueryNode should addTSafe before start pipeline
-		panic(fmt.Errorf("serviceTimeNode setTSafe timeout, collectionID = %d, err = %s", dNode.collectionID, err))
+	if nodeMsg.schema != nil {
+		dNode.delegator.UpdateSchema(context.Background(), nodeMsg.schema, nodeMsg.schemaVersion)
 	}
+
+	// update tSafe
+	dNode.delegator.UpdateTSafe(nodeMsg.timeRange.timestampMax)
 	return nil
 }
 
 func newDeleteNode(
 	collectionID UniqueID, channel string,
-	manager *DataManager, tSafeManager TSafeManager, delegator delegator.ShardDelegator,
+	manager *DataManager, delegator delegator.ShardDelegator,
 	maxQueueLength int32,
 ) *deleteNode {
 	return &deleteNode{
@@ -97,7 +96,6 @@ func newDeleteNode(
 		collectionID: collectionID,
 		channel:      channel,
 		manager:      manager,
-		tSafeManager: tSafeManager,
 		delegator:    delegator,
 	}
 }

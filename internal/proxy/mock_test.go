@@ -26,14 +26,14 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/allocator"
-	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
-	"github.com/milvus-io/milvus/pkg/mq/common"
-	"github.com/milvus-io/milvus/pkg/mq/msgstream"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/testutils"
-	"github.com/milvus-io/milvus/pkg/util/uniquegenerator"
+	"github.com/milvus-io/milvus/pkg/v2/mq/common"
+	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/v2/proto/rootcoordpb"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/testutils"
+	"github.com/milvus-io/milvus/pkg/v2/util/uniquegenerator"
 )
 
 type mockTimestampAllocatorInterface struct {
@@ -96,6 +96,7 @@ func newMockIDAllocatorInterface() allocator.Interface {
 }
 
 type mockTask struct {
+	baseTask
 	*TaskCondition
 	id    UniqueID
 	name  string
@@ -234,7 +235,7 @@ func newDefaultMockDqlTask() *mockDqlTask {
 }
 
 type simpleMockMsgStream struct {
-	msgChan chan *msgstream.MsgPack
+	msgChan chan *msgstream.ConsumeMsgPack
 
 	msgCount    int
 	msgCountMtx sync.RWMutex
@@ -243,7 +244,7 @@ type simpleMockMsgStream struct {
 func (ms *simpleMockMsgStream) Close() {
 }
 
-func (ms *simpleMockMsgStream) Chan() <-chan *msgstream.MsgPack {
+func (ms *simpleMockMsgStream) Chan() <-chan *msgstream.ConsumeMsgPack {
 	if ms.getMsgCount() <= 0 {
 		ms.msgChan <- nil
 		return ms.msgChan
@@ -254,7 +255,11 @@ func (ms *simpleMockMsgStream) Chan() <-chan *msgstream.MsgPack {
 	return ms.msgChan
 }
 
-func (ms *simpleMockMsgStream) AsProducer(channels []string) {
+func (ms *simpleMockMsgStream) GetUnmarshalDispatcher() msgstream.UnmarshalDispatcher {
+	return nil
+}
+
+func (ms *simpleMockMsgStream) AsProducer(ctx context.Context, channels []string) {
 }
 
 func (ms *simpleMockMsgStream) AsConsumer(ctx context.Context, channels []string, subName string, position common.SubscriptionInitialPosition) error {
@@ -282,15 +287,14 @@ func (ms *simpleMockMsgStream) decreaseMsgCount(delta int) {
 	ms.increaseMsgCount(-delta)
 }
 
-func (ms *simpleMockMsgStream) Produce(pack *msgstream.MsgPack) error {
+func (ms *simpleMockMsgStream) Produce(ctx context.Context, pack *msgstream.MsgPack) error {
 	defer ms.increaseMsgCount(1)
 
-	ms.msgChan <- pack
-
+	ms.msgChan <- msgstream.BuildConsumeMsgPack(pack)
 	return nil
 }
 
-func (ms *simpleMockMsgStream) Broadcast(pack *msgstream.MsgPack) (map[string][]msgstream.MessageID, error) {
+func (ms *simpleMockMsgStream) Broadcast(ctx context.Context, pack *msgstream.MsgPack) (map[string][]msgstream.MessageID, error) {
 	return map[string][]msgstream.MessageID{}, nil
 }
 
@@ -310,12 +314,15 @@ func (ms *simpleMockMsgStream) CheckTopicValid(topic string) error {
 	return nil
 }
 
-func (ms *simpleMockMsgStream) EnableProduce(enabled bool) {
+func (ms *simpleMockMsgStream) ForceEnableProduce(enabled bool) {
+}
+
+func (ms *simpleMockMsgStream) SetReplicate(config *msgstream.ReplicateConfig) {
 }
 
 func newSimpleMockMsgStream() *simpleMockMsgStream {
 	return &simpleMockMsgStream{
-		msgChan:  make(chan *msgstream.MsgPack, 1024),
+		msgChan:  make(chan *msgstream.ConsumeMsgPack, 1024),
 		msgCount: 0,
 	}
 }

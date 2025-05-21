@@ -17,6 +17,7 @@ extern "C" {
 
 #include <stdint.h>
 #include "common/type_c.h"
+#include "common/protobuf_utils_c.h"
 #include "common/binary_set_c.h"
 #include "indexbuilder/type_c.h"
 
@@ -36,6 +37,16 @@ CStatus
 DeleteIndex(CIndex index);
 
 CStatus
+BuildJsonKeyIndex(ProtoLayoutInterface c_binary_set,
+                  const uint8_t* serialized_build_index_info,
+                  const uint64_t len);
+
+CStatus
+BuildTextIndex(ProtoLayoutInterface c_binary_set,
+               const uint8_t* serialized_build_index_info,
+               const uint64_t len);
+
+CStatus
 BuildFloatVecIndex(CIndex index, int64_t float_value_num, const float* vectors);
 
 CStatus
@@ -52,6 +63,9 @@ BuildSparseFloatVecIndex(CIndex index,
                          int64_t row_num,
                          int64_t dim,
                          const uint8_t* vectors);
+
+CStatus
+BuildInt8VecIndex(CIndex index, int64_t data_size, const int8_t* vectors);
 
 // field_data:
 //  1, serialized proto::schema::BoolArray, if type is bool;
@@ -126,15 +140,7 @@ AppendOptionalFieldDataPath(CBuildIndexInfo c_build_index_info,
                             const char* c_file_path);
 
 CStatus
-SerializeIndexAndUpLoad(CIndex index, CBinarySet* c_binary_set);
-
-CStatus
-SerializeIndexAndUpLoadV2(CIndex index, CBinarySet* c_binary_set);
-
-CStatus
-CreateIndexV2(CIndex* res_index,
-              const uint8_t* serialized_build_index_info,
-              const uint64_t len);
+SerializeIndexAndUpLoad(CIndex index, ProtoLayoutInterface result);
 
 CStatus
 AppendIndexStorageInfo(CBuildIndexInfo c_build_index_info,

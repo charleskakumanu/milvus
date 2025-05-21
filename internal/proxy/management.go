@@ -17,18 +17,20 @@
 package proxy
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
 	"sync"
 
+	"github.com/samber/lo"
+
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	management "github.com/milvus-io/milvus/internal/http"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
-	"github.com/milvus-io/milvus/pkg/util/commonpbutil"
-	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/internal/json"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 )
 
 // this file contains proxy management restful API handler
@@ -80,13 +82,17 @@ func RegisterMgrRoute(proxy *Proxy) {
 			Path:        management.RouteCheckQueryNodeDistribution,
 			HandlerFunc: proxy.CheckQueryNodeDistribution,
 		})
+		management.Register(&management.Handler{
+			Path:        management.RouteQueryCoordBalanceStatus,
+			HandlerFunc: proxy.CheckQueryCoordBalanceStatus,
+		})
 	})
 }
 
 func (node *Proxy) PauseDatacoordGC(w http.ResponseWriter, req *http.Request) {
 	pauseSeconds := req.URL.Query().Get("pause_seconds")
 
-	resp, err := node.dataCoord.GcControl(req.Context(), &datapb.GcControlRequest{
+	resp, err := node.mixCoord.GcControl(req.Context(), &datapb.GcControlRequest{
 		Base:    commonpbutil.NewMsgBase(),
 		Command: datapb.GcCommand_Pause,
 		Params: []*commonpb.KeyValuePair{
@@ -108,7 +114,7 @@ func (node *Proxy) PauseDatacoordGC(w http.ResponseWriter, req *http.Request) {
 }
 
 func (node *Proxy) ResumeDatacoordGC(w http.ResponseWriter, req *http.Request) {
-	resp, err := node.dataCoord.GcControl(req.Context(), &datapb.GcControlRequest{
+	resp, err := node.mixCoord.GcControl(req.Context(), &datapb.GcControlRequest{
 		Base:    commonpbutil.NewMsgBase(),
 		Command: datapb.GcCommand_Resume,
 	})
@@ -127,7 +133,7 @@ func (node *Proxy) ResumeDatacoordGC(w http.ResponseWriter, req *http.Request) {
 }
 
 func (node *Proxy) ListQueryNode(w http.ResponseWriter, req *http.Request) {
-	resp, err := node.queryCoord.ListQueryNode(req.Context(), &querypb.ListQueryNodeRequest{
+	resp, err := node.mixCoord.ListQueryNode(req.Context(), &querypb.ListQueryNodeRequest{
 		Base: commonpbutil.NewMsgBase(),
 	})
 	if err != nil {
@@ -169,7 +175,7 @@ func (node *Proxy) GetQueryNodeDistribution(w http.ResponseWriter, req *http.Req
 		return
 	}
 
-	resp, err := node.queryCoord.GetQueryNodeDistribution(req.Context(), &querypb.GetQueryNodeDistributionRequest{
+	resp, err := node.mixCoord.GetQueryNodeDistribution(req.Context(), &querypb.GetQueryNodeDistributionRequest{
 		Base:   commonpbutil.NewMsgBase(),
 		NodeID: nodeID,
 	})
@@ -185,9 +191,22 @@ func (node *Proxy) GetQueryNodeDistribution(w http.ResponseWriter, req *http.Req
 		return
 	}
 	w.WriteHeader(http.StatusOK)
-	// skip marshal status to output
-	resp.Status = nil
-	bytes, err := json.Marshal(resp)
+
+	// Use string array for SealedSegmentIDs to prevent precision loss in JSON parsers.
+	// Large integers (int64) may be incorrectly rounded when parsed as double.
+	type distribution struct {
+		Channels         []string `json:"channel_names"`
+		SealedSegmentIDs []string `json:"sealed_segmentIDs"`
+	}
+
+	dist := distribution{
+		Channels: resp.ChannelNames,
+		SealedSegmentIDs: lo.Map(resp.SealedSegmentIDs, func(id int64, _ int) string {
+			return strconv.FormatInt(id, 10)
+		}),
+	}
+
+	bytes, err := json.Marshal(dist)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		w.Write([]byte(fmt.Sprintf(`{"msg": "failed to get query node distribution, %s"}`, err.Error())))
@@ -197,7 +216,7 @@ func (node *Proxy) GetQueryNodeDistribution(w http.ResponseWriter, req *http.Req
 }
 
 func (node *Proxy) SuspendQueryCoordBalance(w http.ResponseWriter, req *http.Request) {
-	resp, err := node.queryCoord.SuspendBalance(req.Context(), &querypb.SuspendBalanceRequest{
+	resp, err := node.mixCoord.SuspendBalance(req.Context(), &querypb.SuspendBalanceRequest{
 		Base: commonpbutil.NewMsgBase(),
 	})
 	if err != nil {
@@ -216,7 +235,7 @@ func (node *Proxy) SuspendQueryCoordBalance(w http.ResponseWriter, req *http.Req
 }
 
 func (node *Proxy) ResumeQueryCoordBalance(w http.ResponseWriter, req *http.Request) {
-	resp, err := node.queryCoord.ResumeBalance(req.Context(), &querypb.ResumeBalanceRequest{
+	resp, err := node.mixCoord.ResumeBalance(req.Context(), &querypb.ResumeBalanceRequest{
 		Base: commonpbutil.NewMsgBase(),
 	})
 	if err != nil {
@@ -234,6 +253,29 @@ func (node *Proxy) ResumeQueryCoordBalance(w http.ResponseWriter, req *http.Requ
 	w.Write([]byte(`{"msg": "OK"}`))
 }
 
+func (node *Proxy) CheckQueryCoordBalanceStatus(w http.ResponseWriter, req *http.Request) {
+	resp, err := node.mixCoord.CheckBalanceStatus(req.Context(), &querypb.CheckBalanceStatusRequest{
+		Base: commonpbutil.NewMsgBase(),
+	})
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(fmt.Sprintf(`{"msg": "failed to check balance status, %s"}`, err.Error())))
+		return
+	}
+
+	if !merr.Ok(resp.GetStatus()) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(fmt.Sprintf(`{"msg": "failed to check balance status, %s"}`, resp.GetStatus().GetReason())))
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	balanceStatus := "suspended"
+	if resp.IsActive {
+		balanceStatus = "active"
+	}
+	w.Write([]byte(fmt.Sprintf(`{"msg": "OK", "status": "%v"}`, balanceStatus)))
+}
+
 func (node *Proxy) SuspendQueryNode(w http.ResponseWriter, req *http.Request) {
 	err := req.ParseForm()
 	if err != nil {
@@ -248,7 +290,7 @@ func (node *Proxy) SuspendQueryNode(w http.ResponseWriter, req *http.Request) {
 		w.Write([]byte(fmt.Sprintf(`{"msg": "failed to suspend node, %s"}`, err.Error())))
 		return
 	}
-	resp, err := node.queryCoord.SuspendNode(req.Context(), &querypb.SuspendNodeRequest{
+	resp, err := node.mixCoord.SuspendNode(req.Context(), &querypb.SuspendNodeRequest{
 		Base:   commonpbutil.NewMsgBase(),
 		NodeID: nodeID,
 	})
@@ -281,7 +323,7 @@ func (node *Proxy) ResumeQueryNode(w http.ResponseWriter, req *http.Request) {
 		w.Write([]byte(fmt.Sprintf(`{"msg": "failed to resume node, %s"}`, err.Error())))
 		return
 	}
-	resp, err := node.queryCoord.ResumeNode(req.Context(), &querypb.ResumeNodeRequest{
+	resp, err := node.mixCoord.ResumeNode(req.Context(), &querypb.ResumeNodeRequest{
 		Base:   commonpbutil.NewMsgBase(),
 		NodeID: nodeID,
 	})
@@ -343,7 +385,7 @@ func (node *Proxy) TransferSegment(w http.ResponseWriter, req *http.Request) {
 			w.Write([]byte(fmt.Sprintf(`{"msg": "failed to transfer segment, %s"}`, err.Error())))
 			return
 		}
-		request.TargetNodeID = value
+		request.SegmentID = value
 	}
 
 	copyMode := req.FormValue("copy_mode")
@@ -359,7 +401,7 @@ func (node *Proxy) TransferSegment(w http.ResponseWriter, req *http.Request) {
 		request.CopyMode = value
 	}
 
-	resp, err := node.queryCoord.TransferSegment(req.Context(), request)
+	resp, err := node.mixCoord.TransferSegment(req.Context(), request)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		w.Write([]byte(fmt.Sprintf(`{"msg": "failed to transfer segment, %s"}`, err.Error())))
@@ -428,7 +470,7 @@ func (node *Proxy) TransferChannel(w http.ResponseWriter, req *http.Request) {
 		request.CopyMode = value
 	}
 
-	resp, err := node.queryCoord.TransferChannel(req.Context(), request)
+	resp, err := node.mixCoord.TransferChannel(req.Context(), request)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		w.Write([]byte(fmt.Sprintf(`{"msg": "failed to transfer channel, %s"}`, err.Error())))
@@ -465,7 +507,7 @@ func (node *Proxy) CheckQueryNodeDistribution(w http.ResponseWriter, req *http.R
 		w.Write([]byte(fmt.Sprintf(`{"msg": "failed to check whether query node has same distribution, %s"}`, err.Error())))
 		return
 	}
-	resp, err := node.queryCoord.CheckQueryNodeDistribution(req.Context(), &querypb.CheckQueryNodeDistributionRequest{
+	resp, err := node.mixCoord.CheckQueryNodeDistribution(req.Context(), &querypb.CheckQueryNodeDistributionRequest{
 		Base:         commonpbutil.NewMsgBase(),
 		SourceNodeID: source,
 		TargetNodeID: target,

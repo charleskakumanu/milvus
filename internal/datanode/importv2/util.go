@@ -28,15 +28,18 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/internal/datanode/metacache"
-	"github.com/milvus-io/milvus/internal/datanode/syncmgr"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/querycoordv2/params"
+	"github.com/milvus-io/milvus/internal/allocator"
+	"github.com/milvus-io/milvus/internal/flushcommon/metacache"
+	"github.com/milvus-io/milvus/internal/flushcommon/metacache/pkoracle"
+	"github.com/milvus-io/milvus/internal/flushcommon/syncmgr"
 	"github.com/milvus-io/milvus/internal/storage"
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/internal/util/function"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/metrics"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 func WrapTaskNotFoundError(taskID int64) error {
@@ -44,16 +47,14 @@ func WrapTaskNotFoundError(taskID int64) error {
 }
 
 func NewSyncTask(ctx context.Context,
+	allocator allocator.Interface,
 	metaCaches map[string]metacache.MetaCache,
 	ts uint64,
 	segmentID, partitionID, collectionID int64, vchannel string,
 	insertData *storage.InsertData,
 	deleteData *storage.DeleteData,
+	bm25Stats map[int64]*storage.BM25Stats,
 ) (syncmgr.Task, error) {
-	if params.Params.CommonCfg.EnableStorageV2.GetAsBool() {
-		return nil, merr.WrapErrImportFailed("storage v2 is not supported") // TODO: dyh, resolve storage v2
-	}
-
 	metaCache := metaCaches[vchannel]
 	if _, ok := metaCache.GetSegmentByID(segmentID); !ok {
 		metaCache.AddSegment(&datapb.SegmentInfo{
@@ -62,20 +63,15 @@ func NewSyncTask(ctx context.Context,
 			CollectionID:  collectionID,
 			PartitionID:   partitionID,
 			InsertChannel: vchannel,
-		}, func(info *datapb.SegmentInfo) *metacache.BloomFilterSet {
-			bfs := metacache.NewBloomFilterSet()
+		}, func(info *datapb.SegmentInfo) pkoracle.PkStat {
+			bfs := pkoracle.NewBloomFilterSet()
 			return bfs
-		})
+		}, metacache.NewBM25StatsFactory)
 	}
 
-	var serializer syncmgr.Serializer
-	var err error
-	serializer, err = syncmgr.NewStorageSerializer(
-		metaCache,
-		nil,
-	)
-	if err != nil {
-		return nil, err
+	segmentLevel := datapb.SegmentLevel_L1
+	if insertData == nil && deleteData != nil {
+		segmentLevel = datapb.SegmentLevel_L0
 	}
 
 	syncPack := &syncmgr.SyncPack{}
@@ -86,14 +82,24 @@ func NewSyncTask(ctx context.Context,
 		WithChannelName(vchannel).
 		WithSegmentID(segmentID).
 		WithTimeRange(ts, ts).
-		WithBatchSize(int64(insertData.GetRowNum()))
+		WithLevel(segmentLevel).
+		WithDataSource(metrics.BulkinsertDataSourceLabel).
+		WithBatchRows(int64(insertData.GetRowNum()))
+	if bm25Stats != nil {
+		syncPack.WithBM25Stats(bm25Stats)
+	}
 
-	return serializer.EncodeBuffer(ctx, syncPack)
+	task := syncmgr.NewSyncTask().
+		WithAllocator(allocator).
+		WithMetaCache(metaCache).
+		WithSchema(metaCache.Schema()). // TODO specify import schema if needed
+		WithSyncPack(syncPack)
+	return task, nil
 }
 
 func NewImportSegmentInfo(syncTask syncmgr.Task, metaCaches map[string]metacache.MetaCache) (*datapb.ImportSegmentInfo, error) {
 	segmentID := syncTask.SegmentID()
-	insertBinlogs, statsBinlog, deltaLog := syncTask.(*syncmgr.SyncTask).Binlogs()
+	insertBinlogs, statsBinlog, deltaLog, bm25Log := syncTask.(*syncmgr.SyncTask).Binlogs()
 	metaCache := metaCaches[syncTask.ChannelName()]
 	segment, ok := metaCache.GetSegmentByID(segmentID)
 	if !ok {
@@ -108,17 +114,23 @@ func NewImportSegmentInfo(syncTask syncmgr.Task, metaCaches map[string]metacache
 		ImportedRows: segment.FlushedRows(),
 		Binlogs:      lo.Values(insertBinlogs),
 		Statslogs:    lo.Values(statsBinlog),
+		Bm25Logs:     lo.Values(bm25Log),
 		Deltalogs:    deltaLogs,
 	}, nil
 }
 
-func PickSegment(segments []*datapb.ImportRequestSegment, vchannel string, partitionID int64) int64 {
+func PickSegment(segments []*datapb.ImportRequestSegment, vchannel string, partitionID int64) (int64, error) {
 	candidates := lo.Filter(segments, func(info *datapb.ImportRequestSegment, _ int) bool {
 		return info.GetVchannel() == vchannel && info.GetPartitionID() == partitionID
 	})
 
+	if len(candidates) == 0 {
+		return 0, fmt.Errorf("no candidate segments found for channel %s and partition %d",
+			vchannel, partitionID)
+	}
+
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	return candidates[r.Intn(len(candidates))].GetSegmentID()
+	return candidates[r.Intn(len(candidates))].GetSegmentID(), nil
 }
 
 func CheckRowsEqual(schema *schemapb.CollectionSchema, data *storage.InsertData) error {
@@ -151,18 +163,19 @@ func CheckRowsEqual(schema *schemapb.CollectionSchema, data *storage.InsertData)
 	return nil
 }
 
-func AppendSystemFieldsData(task *ImportTask, data *storage.InsertData) error {
-	idRange := task.req.GetAutoIDRange()
+func AppendSystemFieldsData(task *ImportTask, data *storage.InsertData, rowNum int) error {
 	pkField, err := typeutil.GetPrimaryFieldSchema(task.GetSchema())
 	if err != nil {
 		return err
 	}
-	rowNum := GetInsertDataRowCount(data, task.GetSchema())
 	ids := make([]int64, rowNum)
-	for i := 0; i < rowNum; i++ {
-		ids[i] = idRange.GetBegin() + int64(i)
+	start, _, err := task.allocator.Alloc(uint32(rowNum))
+	if err != nil {
+		return err
 	}
-	idRange.Begin += int64(rowNum)
+	for i := 0; i < rowNum; i++ {
+		ids[i] = start + int64(i)
+	}
 	if pkField.GetAutoID() {
 		switch pkField.GetDataType() {
 		case schemapb.DataType_Int64:
@@ -184,6 +197,80 @@ func AppendSystemFieldsData(task *ImportTask, data *storage.InsertData) error {
 			tss[i] = ts
 		}
 		data.Data[common.TimeStampField] = &storage.Int64FieldData{Data: tss}
+	}
+	return nil
+}
+
+func RunEmbeddingFunction(task *ImportTask, data *storage.InsertData) error {
+	if err := RunBm25Function(task, data); err != nil {
+		return err
+	}
+	if err := RunDenseEmbedding(task, data); err != nil {
+		return err
+	}
+	return nil
+}
+
+func RunDenseEmbedding(task *ImportTask, data *storage.InsertData) error {
+	schema := task.GetSchema()
+	if function.HasNonBM25Functions(schema.Functions, []int64{}) {
+		exec, err := function.NewFunctionExecutor(schema)
+		if err != nil {
+			return err
+		}
+		if err := exec.ProcessBulkInsert(data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func RunBm25Function(task *ImportTask, data *storage.InsertData) error {
+	fns := task.GetSchema().GetFunctions()
+	for _, fn := range fns {
+		runner, err := function.NewFunctionRunner(task.GetSchema(), fn)
+		if err != nil {
+			return err
+		}
+
+		if runner == nil {
+			continue
+		}
+
+		inputFieldIDs := lo.Map(runner.GetInputFields(), func(field *schemapb.FieldSchema, _ int) int64 { return field.GetFieldID() })
+		inputDatas := make([]any, 0, len(inputFieldIDs))
+		for _, inputFieldID := range inputFieldIDs {
+			inputDatas = append(inputDatas, data.Data[inputFieldID].GetDataRows())
+		}
+
+		outputFieldData, err := runner.BatchRun(inputDatas...)
+		if err != nil {
+			return err
+		}
+		for i, outputFieldID := range fn.OutputFieldIds {
+			outputField := typeutil.GetField(task.GetSchema(), outputFieldID)
+			// TODO: added support for vector output field only, scalar output field in function is not supported yet
+			switch outputField.GetDataType() {
+			case schemapb.DataType_FloatVector:
+				data.Data[outputFieldID] = outputFieldData[i].(*storage.FloatVectorFieldData)
+			case schemapb.DataType_BFloat16Vector:
+				data.Data[outputFieldID] = outputFieldData[i].(*storage.BFloat16VectorFieldData)
+			case schemapb.DataType_Float16Vector:
+				data.Data[outputFieldID] = outputFieldData[i].(*storage.Float16VectorFieldData)
+			case schemapb.DataType_BinaryVector:
+				data.Data[outputFieldID] = outputFieldData[i].(*storage.BinaryVectorFieldData)
+			case schemapb.DataType_SparseFloatVector:
+				sparseArray := outputFieldData[i].(*schemapb.SparseFloatArray)
+				data.Data[outputFieldID] = &storage.SparseFloatVectorFieldData{
+					SparseFloatArray: schemapb.SparseFloatArray{
+						Dim:      sparseArray.GetDim(),
+						Contents: sparseArray.GetContents(),
+					},
+				}
+			default:
+				return fmt.Errorf("unsupported output data type for embedding function: %s", outputField.GetDataType().String())
+			}
+		}
 	}
 	return nil
 }
@@ -240,9 +327,9 @@ func NewMetaCache(req *datapb.ImportRequest) map[string]metacache.MetaCache {
 			},
 			Schema: schema,
 		}
-		metaCache := metacache.NewMetaCache(info, func(segment *datapb.SegmentInfo) *metacache.BloomFilterSet {
-			return metacache.NewBloomFilterSet()
-		})
+		metaCache := metacache.NewMetaCache(info, func(segment *datapb.SegmentInfo) pkoracle.PkStat {
+			return pkoracle.NewBloomFilterSet()
+		}, metacache.NoneBm25StatsFactory)
 		metaCaches[channel] = metaCache
 	}
 	return metaCaches

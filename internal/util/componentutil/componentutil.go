@@ -26,9 +26,9 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/retry"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/retry"
 )
 
 // WaitForComponentStates wait for component's state to be one of the specific states
@@ -83,4 +83,18 @@ func WaitForComponentHealthy[T interface {
 	GetComponentStates(ctx context.Context, _ *milvuspb.GetComponentStatesRequest, opts ...grpc.CallOption) (*milvuspb.ComponentStates, error)
 }](ctx context.Context, client T, serviceName string, attempts uint, sleep time.Duration) error {
 	return WaitForComponentStates(ctx, client, serviceName, []commonpb.StateCode{commonpb.StateCode_Healthy}, attempts, sleep)
+}
+
+func CheckHealthRespWithErr(err error) *milvuspb.CheckHealthResponse {
+	if err != nil {
+		return CheckHealthRespWithErrMsg(err.Error())
+	}
+	return CheckHealthRespWithErrMsg()
+}
+
+func CheckHealthRespWithErrMsg(errMsg ...string) *milvuspb.CheckHealthResponse {
+	if len(errMsg) != 0 {
+		return &milvuspb.CheckHealthResponse{Status: merr.Success(), IsHealthy: false, Reasons: errMsg}
+	}
+	return &milvuspb.CheckHealthResponse{Status: merr.Success(), IsHealthy: true, Reasons: []string{}}
 }

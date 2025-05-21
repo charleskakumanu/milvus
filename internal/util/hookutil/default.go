@@ -50,17 +50,6 @@ func (d DefaultHook) After(ctx context.Context, result interface{}, err error, f
 	return nil
 }
 
-// MockAPIHook is a mock hook for api key verification, ONLY FOR TEST
-type MockAPIHook struct {
-	DefaultHook
-	MockErr error
-	User    string
-}
-
-func (m MockAPIHook) VerifyAPIKey(apiKey string) (string, error) {
-	return m.User, m.MockErr
-}
-
 func (d DefaultHook) Release() {}
 
 type DefaultExtension struct{}
@@ -69,4 +58,8 @@ var _ hook.Extension = (*DefaultExtension)(nil)
 
 func (d DefaultExtension) Report(info any) int {
 	return 0
+}
+
+func (d DefaultExtension) ReportRefused(ctx context.Context, req interface{}, resp interface{}, err error, fullMethod string) error {
+	return nil
 }

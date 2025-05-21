@@ -18,6 +18,7 @@ package datacoord
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -27,13 +28,17 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/metrics"
-	"github.com/milvus-io/milvus/pkg/util/indexparamcheck"
-	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/internal/util/vecindexmgr"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/metrics"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/tsoutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 // Response response interface for verification
@@ -67,7 +72,7 @@ func VerifyResponse(response interface{}, err error) error {
 	}
 }
 
-func FilterInIndexedSegments(handler Handler, mt *meta, segments ...*SegmentInfo) []*SegmentInfo {
+func FilterInIndexedSegments(handler Handler, mt *meta, skipNoIndexCollection bool, segments ...*SegmentInfo) []*SegmentInfo {
 	if len(segments) == 0 {
 		return nil
 	}
@@ -78,6 +83,12 @@ func FilterInIndexedSegments(handler Handler, mt *meta, segments ...*SegmentInfo
 
 	ret := make([]*SegmentInfo, 0)
 	for collection, segmentList := range collectionSegments {
+		// No segments will be filtered if there are no indices in the collection.
+		if skipNoIndexCollection && !mt.indexMeta.HasIndex(collection) {
+			ret = append(ret, segmentList...)
+			continue
+		}
+
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*2)
 		coll, err := handler.GetCollection(ctx, collection)
 		cancel()
@@ -192,16 +203,16 @@ func GetIndexType(indexParams []*commonpb.KeyValuePair) string {
 	return invalidIndex
 }
 
-func isFlatIndex(indexType string) bool {
-	return indexType == indexparamcheck.IndexFaissIDMap || indexType == indexparamcheck.IndexFaissBinIDMap
+func isNoTrainIndex(indexType string) bool {
+	return vecindexmgr.GetVecIndexMgrInstance().IsNoTrainIndex(indexType)
 }
 
-func isOptionalScalarFieldSupported(indexType string) bool {
-	return indexType == indexparamcheck.IndexHNSW
+func isMvSupported(indexType string) bool {
+	return vecindexmgr.GetVecIndexMgrInstance().IsMvSupported(indexType)
 }
 
 func isDiskANNIndex(indexType string) bool {
-	return indexType == indexparamcheck.IndexDISKANN
+	return vecindexmgr.GetVecIndexMgrInstance().IsDiskANN(indexType)
 }
 
 func parseBuildIDFromFilePath(key string) (UniqueID, error) {
@@ -272,4 +283,121 @@ func getBinLogIDs(segment *SegmentInfo, fieldID int64) []int64 {
 		}
 	}
 	return binlogIDs
+}
+
+func getTotalBinlogRows(segment *SegmentInfo, fieldID int64) int64 {
+	var total int64
+	for _, fieldBinLog := range segment.GetBinlogs() {
+		if fieldBinLog.GetFieldID() == fieldID {
+			for _, binLog := range fieldBinLog.GetBinlogs() {
+				total += binLog.EntriesNum
+			}
+		}
+	}
+	return total
+}
+
+func CheckCheckPointsHealth(meta *meta) error {
+	for channel, cp := range meta.GetChannelCheckpoints() {
+		collectionID := funcutil.GetCollectionIDFromVChannel(channel)
+		if collectionID == -1 {
+			log.RatedWarn(60, "can't parse collection id from vchannel, skip check cp lag", zap.String("vchannel", channel))
+			continue
+		}
+		if meta.GetCollection(collectionID) == nil {
+			log.RatedWarn(60, "corresponding the collection doesn't exists, skip check cp lag", zap.String("vchannel", channel))
+			continue
+		}
+		ts, _ := tsoutil.ParseTS(cp.Timestamp)
+		lag := time.Since(ts)
+		if lag > paramtable.Get().DataCoordCfg.ChannelCheckpointMaxLag.GetAsDuration(time.Second) {
+			return merr.WrapErrChannelCPExceededMaxLag(channel, fmt.Sprintf("checkpoint lag: %f(min)", lag.Minutes()))
+		}
+	}
+	return nil
+}
+
+func CheckAllChannelsWatched(meta *meta, channelManager ChannelManager) error {
+	collIDs := meta.ListCollections()
+	for _, collID := range collIDs {
+		collInfo := meta.GetCollection(collID)
+		if collInfo == nil {
+			log.Warn("collection info is nil, skip it", zap.Int64("collectionID", collID))
+			continue
+		}
+
+		for _, channelName := range collInfo.VChannelNames {
+			_, err := channelManager.FindWatcher(channelName)
+			if err != nil {
+				log.Warn("find watcher for channel failed", zap.Int64("collectionID", collID),
+					zap.String("channelName", channelName), zap.Error(err))
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func createStorageConfig() *indexpb.StorageConfig {
+	var storageConfig *indexpb.StorageConfig
+
+	if Params.CommonCfg.StorageType.GetValue() == "local" {
+		storageConfig = &indexpb.StorageConfig{
+			RootPath:    Params.LocalStorageCfg.Path.GetValue(),
+			StorageType: Params.CommonCfg.StorageType.GetValue(),
+		}
+	} else {
+		storageConfig = &indexpb.StorageConfig{
+			Address:           Params.MinioCfg.Address.GetValue(),
+			AccessKeyID:       Params.MinioCfg.AccessKeyID.GetValue(),
+			SecretAccessKey:   Params.MinioCfg.SecretAccessKey.GetValue(),
+			UseSSL:            Params.MinioCfg.UseSSL.GetAsBool(),
+			SslCACert:         Params.MinioCfg.SslCACert.GetValue(),
+			BucketName:        Params.MinioCfg.BucketName.GetValue(),
+			RootPath:          Params.MinioCfg.RootPath.GetValue(),
+			UseIAM:            Params.MinioCfg.UseIAM.GetAsBool(),
+			IAMEndpoint:       Params.MinioCfg.IAMEndpoint.GetValue(),
+			StorageType:       Params.CommonCfg.StorageType.GetValue(),
+			Region:            Params.MinioCfg.Region.GetValue(),
+			UseVirtualHost:    Params.MinioCfg.UseVirtualHost.GetAsBool(),
+			CloudProvider:     Params.MinioCfg.CloudProvider.GetValue(),
+			RequestTimeoutMs:  Params.MinioCfg.RequestTimeoutMs.GetAsInt64(),
+			GcpCredentialJSON: Params.MinioCfg.GcpCredentialJSON.GetValue(),
+		}
+	}
+
+	return storageConfig
+}
+
+func getSortStatus(sorted bool) string {
+	if sorted {
+		return "sorted"
+	}
+	return "unsorted"
+}
+
+func calculateIndexTaskSlot(segmentSize int64) int64 {
+	defaultSlots := Params.DataCoordCfg.IndexTaskSlotUsage.GetAsInt64()
+	if segmentSize > 512*1024*1024 {
+		taskSlot := max(segmentSize/512/1024/1024, 1) * defaultSlots
+		return max(taskSlot, 1)
+	} else if segmentSize > 100*1024*1024 {
+		return max(defaultSlots/4, 1)
+	} else if segmentSize > 10*1024*1024 {
+		return max(defaultSlots/16, 1)
+	}
+	return max(defaultSlots/64, 1)
+}
+
+func calculateStatsTaskSlot(segmentSize int64) int64 {
+	defaultSlots := Params.DataCoordCfg.StatsTaskSlotUsage.GetAsInt64()
+	if segmentSize > 512*1024*1024 {
+		taskSlot := max(segmentSize/512/1024/1024, 1) * defaultSlots
+		return max(taskSlot, 1)
+	} else if segmentSize > 100*1024*1024 {
+		return max(defaultSlots/2, 1)
+	} else if segmentSize > 10*1024*1024 {
+		return max(defaultSlots/4, 1)
+	}
+	return max(defaultSlots/8, 1)
 }
